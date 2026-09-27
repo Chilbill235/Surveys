@@ -6,12 +6,6 @@
             "maxDuration": 30
         }
     },
-    "crons": [
-        {
-            "path": "/api/maintenance/reconcile-deposits",
-            "schedule": "0 */6 * * *"
-        }
-    ],
     "headers": [
         {
             "source": "/(.*)",
