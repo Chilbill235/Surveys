@@ -218,6 +218,12 @@ Venmo, and crypto payouts are **not** sent automatically, so a pending request m
 never be described as paid. Payout-provider credentials, recipient eligibility, and
 manual review are still required before transfers can be enabled.
 
+Withdrawals are limited to **$1.00 – $10,000.00**. The floor and the ceiling live in
+`src/services/payoutOptions.js` as the single source of truth, and the server sends both
+in `GET /api/user/withdrawal-options`; the browser sets the amount box's `min` from that
+response rather than repeating the numbers. A limit stated in one place but enforced in
+another is how a user ends up submitting an amount the server then refuses.
+
 `GET /api/user/withdrawal-options` is the single source of truth for what can be paid
 out. It returns the supported methods, the crypto assets and their networks, the amount
 bounds, and a per-network hint describing what a valid address looks like. The browser
@@ -343,6 +349,29 @@ Two constraints the front end is built around:
   rule was ignoring the `hidden` attribute, because an author rule beats the user-agent
   `[hidden] { display: none }`. That is why the password label stayed visible during a
   password reset.
+
+### Live account updates
+
+`GET /api/user/updates?version=…` is polled by the page so a balance, a confirmed
+deposit, or a resolved withdrawal appears without a reload. It takes a `version` the
+client already holds and returns `304 Not Modified` when nothing has changed, so the
+common case — an idle visitor on the catalog — costs a conditional request rather than a
+full history payload.
+
+The version covers the latest deposit and withdrawal rows **and** the account's
+`token_version`, so a password change or a forced sign-out cannot be missed by a client
+that is only watching for payments. Any change returns refreshed balances, deposits, and
+withdrawals with `Cache-Control: no-store`, because a cached balance is a wrong balance.
+
+Polling is deliberately uneven. It is fast while a deposit is outstanding, since that is
+when the user is watching a timer, and slow when the account is quiet; failures back off
+rather than hammering a struggling server. Polling pauses while the tab is hidden and
+resyncs immediately on return, because a browser throttles timers in a background tab and
+returning to it would otherwise show a stale balance with no visible cause. A `304` is
+not repainted, so the live indicator does not flicker on every idle poll.
+
+The indicator above the balance states which of those is happening: live, waiting on a
+provider, stale, just credited, or failed.
 
 ### Two layouts, not one layout that shrinks
 

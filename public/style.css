@@ -387,6 +387,33 @@ h1, h2, h3, h4 { line-height: 1.15; text-wrap: balance; font-weight: 400; }
 .demo-balance-line { display: flex; align-items: baseline; gap: 5px; color: rgb(255 255 255 / 0.78); font-size: 0.68rem; }
 .demo-balance-line strong { color: var(--lime-400); font-size: 0.75rem; }
 
+/* Sync indicator.
+   Sits under the balances and reports whether the page is still current. Its meaning is
+   carried by the text, not by the dot: colour alone would be invisible to a colour-blind
+   user and meaningless in a high-contrast mode. The dot is decoration on top of a label
+   that already says everything. */
+.live-indicator {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    margin-top: 3px;
+    color: rgb(255 255 255 / 0.72);
+    font-size: 0.68rem;
+    line-height: 1.3;
+}
+.live-indicator::before {
+    content: "";
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--lime-400);
+    flex: none;
+}
+.live-indicator.is-waiting::before { background: var(--warning); }
+.live-indicator.is-waiting { color: rgb(255 255 255 / 0.85); }
+.live-indicator.is-stale { color: var(--danger); }
+.live-indicator.is-stale::before { background: var(--danger); }
+
 /* 5b. Mobile action bar ---------------------------------------------------- */
 
 /* The primary money actions. On wide screens these live in the header; on a narrow
@@ -1026,7 +1053,9 @@ textarea.form-control { min-height: 96px; resize: vertical; }
 .deposit-method-option:hover:not(:disabled) { border-color: var(--indigo-700); background: var(--indigo-050); }
 .deposit-method-option.is-active { border: 2px solid var(--indigo-700); padding: 9px 12px; background: var(--indigo-100); box-shadow: var(--shadow-sm); }
 .deposit-method-option:disabled { color: var(--faint); background: var(--surface-2); cursor: not-allowed; }
-.deposit-method-option:disabled span { color: var(--faint); }
+/* The unavailable reason is the whole point of the disabled card, so it stays at the normal
+   secondary-text contrast rather than the faint label colour used for the card title. */
+.deposit-method-option:disabled span { color: var(--muted); }
 
 #deposit-currency { min-height: 46px; font-weight: 700; }
 #deposit-submit { min-height: 50px; margin-top: 8px; font-size: var(--step-0); }
@@ -1176,6 +1205,11 @@ textarea.form-control { min-height: 96px; resize: vertical; }
 .receipt-meta { margin: 0 0 8px; color: var(--muted); font-size: var(--step--1); }
 .receipt-meta.is-strong { color: var(--heading); font-weight: 700; }
 .receipt-note { margin: 14px 0 0; color: var(--muted); font-size: var(--step--1); line-height: 1.55; }
+/* The live status line takes over the note while a deposit is outstanding. The colour states
+   which of the three things is happening, and the text already says it, so the colour is
+   reinforcement rather than the only signal. */
+.receipt-note.is-credited { color: var(--success); font-weight: 600; }
+.receipt-note.is-failed { color: var(--danger); font-weight: 600; }
 
 .receipt-countdown { margin: 0 0 12px; padding: 9px 12px; color: var(--heading); background: var(--surface); border: 1px solid var(--line-strong); border-left: 4px solid var(--indigo-700); border-radius: var(--r-sm); font-size: var(--step--1); font-weight: 700; font-variant-numeric: tabular-nums; }
 .receipt-countdown.is-expired { color: var(--danger); background: var(--danger-bg); border-color: color-mix(in srgb, var(--danger) 34%, transparent); border-left-color: var(--danger); }

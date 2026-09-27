@@ -1,6 +1,6 @@
 const { createHash } = require('node:crypto');
 const pool = require('../config/db');
-const { parseAmountInRange } = require('../services/money');
+const { parseAmountInRange, formatUsd } = require('../services/money');
 const {
     cryptoDestinations,
     fiatMethods,
@@ -403,7 +403,10 @@ async function requestWithdrawal(req, res) {
     });
     if (amount === null) {
         return res.status(400).json({
-            error: `Enter an amount between $${minimumWithdrawalUsd.toFixed(2)} and $${maximumWithdrawalUsd.toFixed(2)}.`,
+            // Grouped and cent-exact, so the message matches the hint on the amount box.
+            // Interpolating the raw numbers gave "$5.00 and $50000.00", and a user
+            // comparing that with the form had no way to tell which figure was the limit.
+            error: `Enter an amount between $${formatUsd(minimumWithdrawalUsd)} and $${formatUsd(maximumWithdrawalUsd)}.`,
         });
     }
 

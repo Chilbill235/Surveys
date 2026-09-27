@@ -29,6 +29,18 @@ const accountState = { balance: NaN };
 let depositStatusTimer;
 let depositHistorySignature = '';
 
+/**
+ * The deposit the instructions panel is currently showing, and its status line.
+ *
+ * Held as state rather than looked up on demand so the live sync can tell "this deposit
+ * confirmed" from "some other deposit on the account confirmed" -- the user only cares
+ * about the one in front of them.
+ */
+let activeDeposit = null;
+
+/** The most recent deposit rows the live sync received, reused by the status line. */
+let lastKnownDeposits = [];
+
 const cryptoCurrencyNames = {
     ada: 'Cardano (ADA)', avax: 'Avalanche (AVAX)', bch: 'Bitcoin Cash (BCH)',
     bnb: 'BNB (BNB)', btc: 'Bitcoin (BTC)', doge: 'Dogecoin (DOGE)',
@@ -141,6 +153,21 @@ document.addEventListener('DOMContentLoaded', () => {
             renderOffers();
         });
     });
+    // The narrow-screen action bar duplicates the header controls, because the header has
+    // to stay one row on a phone and the primary actions belong under the thumb. Each bar
+    // button forwards to its header counterpart, so the behaviour, the disabled state, and
+    // the sign-in label all have exactly one implementation.
+    //
+    // This was registered inside the sign-in handler rather than here, which meant the
+    // three buttons in the bottom bar did nothing at all until the visitor had signed in
+    // once -- and then registered a fresh listener on every subsequent sign-in. It is
+    // page-level wiring: it runs once, and the per-button state is `syncAccountControls`'s
+    // job, which is already called on load, on sign-in, and on sign-out.
+    document.querySelectorAll('[data-mirror]').forEach((barButton) => {
+        const target = document.getElementById(barButton.dataset.mirror);
+        if (target) barButton.addEventListener('click', () => target.click());
+    });
+
     document.querySelectorAll('[data-close]').forEach((button) => {
         button.addEventListener('click', () => document.getElementById(button.dataset.close).close());
     });
@@ -157,8 +184,7 @@ document.addEventListener('DOMContentLoaded', () => {
         window.clearInterval(depositStatusTimer);
         depositStatusTimer = undefined;
         depositHistorySignature = '';
-    });
-    document.getElementById('withdraw-dialog').addEventListener('close', () => {
+    });    document.getElementById('withdraw-dialog').addEventListener('close', () => {
         setFormMessage('withdraw-message', '');
     });
 
@@ -180,14 +206,272 @@ document.addEventListener('DOMContentLoaded', () => {
     loadOffers().then((loaded) => {
         if (loaded) showPageNotice();
     });
-    // A payment that confirmed while the tab was closed has no other way to announce
-    // itself, and the deposit dialog's poll only runs while that dialog is open.
-    announceMissedCredits();
+    // The page keeps itself current from here on. Seeded with the deposits that are already
+    // credited so the first sync does not re-announce a payment that happened before the
+    // page loaded, then started: the initial history read is what tells us which those are.
+    loadDepositHistory().finally(() => {
+        startLiveSync();
+        paintLiveIndicator();
+    });
 
     document.addEventListener('visibilitychange', () => {
-        if (!document.hidden) announceMissedCredits();
+        if (document.hidden) return;
+        // Coming back to the tab is the moment a stale page is most visible, so it syncs
+        // immediately instead of waiting out whatever remained of the interval.
+        paintLiveIndicator();
+        syncNow();
     });
+
+    // A session that goes away should stop the loop rather than keep failing against an
+    // endpoint with a dead token until the tab is closed.
+    window.addEventListener('pagehide', stopLiveSync);
 });
+
+function startLiveSync() {
+    window.clearTimeout(liveState.timer);
+    liveState.timer = undefined;
+    liveState.consecutiveFailures = 0;
+    if (!sessionStorage.getItem(accountTokenKey)) {
+        paintLiveIndicator();
+        return;
+    }
+    syncNow();
+}
+
+function stopLiveSync() {
+    window.clearTimeout(liveState.timer);
+    liveState.timer = undefined;
+}
+
+/* ---------------------------------------------------------------- live sync */
+
+/**
+ * Keeping the page current without a reload.
+ *
+ * The page used to poll only while the deposit dialog was open, plus a single check on
+ * load and on tab focus. So a payment that confirmed two minutes after the dialog was
+ * closed was never seen: the balance on the header was a number that changed at some point
+ * in the past, and the only way to find out was to refresh. That is the difference between
+ * "my money arrived" being an event and being a number.
+ *
+ * Server-Sent Events would be the obvious way to do this properly, and it is deliberately
+ * not used. This deploys to Vercel, where a request is a billed function invocation with a
+ * wall-clock ceiling: an SSE stream is one invocation held open for as long as the client
+ * listens, and every one of them occupies a slot against the concurrency limit for the
+ * whole time. A poll that answers 304 in a few dozen bytes and then waits is far cheaper and
+ * behaves identically for this use, where the state that changes is "a payment confirmed"
+ * -- an event that happens on the order of minutes, not milliseconds.
+ *
+ * The interval adapts rather than being fixed. While a deposit is outstanding the user is
+ * waiting on it, so it is asked every few seconds. When nothing is outstanding the page has
+ * nothing to announce, so it settles into a slower beat, and it stops entirely while the tab
+ * is hidden -- a background tab is the single biggest waste available here, and browsers
+ * already throttle timers in it, so the explicit check keeps the behaviour predictable.
+ * Coming back to the tab syncs immediately rather than waiting out the remaining interval.
+ */
+const liveState = {
+    timer: undefined,
+    version: '',
+    /** Set while a request is in flight, so two syncs cannot overlap. */
+    busy: false,
+    /** A deposit the user is waiting on, which is what justifies a fast interval. */
+    awaitingDeposit: false,
+    lastSyncedAt: 0,
+    consecutiveFailures: 0
+};
+
+/** How long to wait before the next check, given whether something is outstanding. */
+function liveIntervalMs() {
+    if (liveState.awaitingDeposit) return 5000;
+    if (liveState.consecutiveFailures > 0) {
+        // Back off when the server is unhappy. Retrying a failing endpoint at the normal
+        // rate turns a database blip into a burst of failing requests that keep it blipped.
+        return Math.min(120000, 10000 * 2 ** Math.min(4, liveState.consecutiveFailures - 1));
+    }
+    return 20000;
+}
+
+function scheduleLiveSync() {
+    window.clearTimeout(liveState.timer);
+    liveState.timer = window.setTimeout(() => { syncNow(); }, liveIntervalMs());
+}
+
+/**
+ * Polls once and applies anything that changed.
+ *
+ * Returns true when the server reported a change, so a caller that wants to know whether
+ * it is worth continuing (a form, a confirmation) can branch on it.
+ */
+async function syncNow() {
+    const token = sessionStorage.getItem(accountTokenKey);
+    if (!token || liveState.busy) return false;
+    if (document.hidden) {
+        // Nothing is rendered while hidden, so there is no reason to spend the request.
+        // Coming back triggers an immediate sync through the visibilitychange handler.
+        scheduleLiveSync();
+        return false;
+    }
+    liveState.busy = true;
+    try {
+        const response = await fetch(`/api/user/updates${liveState.version ? `?version=${encodeURIComponent(liveState.version)}` : ''}`, {
+            headers: { Authorization: `Bearer ${token}` },
+            cache: 'no-store'
+        });
+        if (response.status === 304) {
+            // The common case, and the reason this endpoint exists: nothing moved.
+            liveState.consecutiveFailures = 0;
+            liveState.lastSyncedAt = Date.now();
+            paintLiveIndicator();
+            return false;
+        }
+        if (!response.ok) throw new Error(`Sync failed (${response.status})`);
+
+        const payload = await response.json();
+        liveState.version = payload.version;
+        liveState.consecutiveFailures = 0;
+        liveState.lastSyncedAt = Date.now();
+        applyLiveUpdate(payload);
+        paintLiveIndicator();
+        return true;
+    } catch (error) {
+        liveState.consecutiveFailures += 1;
+        paintLiveIndicator();
+        return false;
+    } finally {
+        liveState.busy = false;
+        scheduleLiveSync();
+    }
+}
+
+/**
+ * Applies a change the server reported.
+ *
+ * Every step is conditional on the data having actually changed, so a sync that arrives
+ * while the user is typing in the amount field cannot move the cursor, re-render a list
+ * under the pointer, or replace a message they are reading.
+ */
+function applyLiveUpdate(payload) {
+    if (typeof payload.balance === 'string' && payload.balance !== accountState.balance) {
+        // `applyBalance` is the one place that writes the header and keeps the withdrawal
+        // ceiling in step, so the live path routes through it rather than repeating it. A
+        // live update that painted the header but left the withdrawal form capped at the
+        // old balance would let someone request more than they have.
+        applyBalance(payload.balance, payload.demoBalance ?? '0');
+        if (isDialogOpen('withdraw-dialog')) {
+            updateWithdrawFields();
+            updateWithdrawAmountHint();
+        }
+    }
+
+    const deposits = Array.isArray(payload.deposits) ? payload.deposits : [];
+    const withdrawals = Array.isArray(payload.withdrawals) ? payload.withdrawals : [];
+    // Kept so the deposit panel can read the status of the deposit it is showing without
+    // issuing its own request for it.
+    lastKnownDeposits = deposits;
+
+    // Whether a payment is still outstanding decides how fast the next check is, and it is
+    // also what the "waiting for payment" hint in the deposit panel reads from.
+    liveState.awaitingDeposit = deposits.some((item) => {
+        const status = String(item.status || '').toLowerCase();
+        return status !== 'confirmed' && status !== 'failed' && status !== 'expired';
+    });
+
+    if (isDialogOpen('deposit-dialog')) {
+        renderHistoryInto('deposit-history', deposits, 'deposit', 'No deposits yet.');
+        paintDepositStatus();
+    }
+    if (isDialogOpen('withdraw-dialog')) {
+        renderHistoryInto('withdrawal-history', withdrawals, 'withdrawal', 'No withdrawals yet.');
+    }
+
+    // A credit that happened with no dialog open is announced rather than silently
+    // redrawing a number, because the balance going up is the thing a user is waiting for
+    // and they should not have to be watching the header to notice it.
+    for (const item of deposits) {
+        const status = String(item.status || '').toLowerCase();
+        const credited = status === 'confirmed' || status === 'paid';
+        if (credited && !creditedDepositsSeen.has(item.id)) {
+            creditedDepositsSeen.add(item.id);
+            if (isDialogOpen('deposit-dialog')) showDepositSuccess(item);
+        }
+    }
+}
+
+/**
+ * Paints the live status of the deposit currently on screen.
+ *
+ * The instructions panel used to say one fixed sentence for the whole life of the deposit,
+ * which is the least useful sentence at the exact moment a user is staring at it: the money
+ * has not arrived, and nothing on the page has changed to say so. The status comes from the
+ * deposit rows the live sync already fetched, so it costs no extra request.
+ */
+function paintDepositStatus() {
+    if (!activeDeposit || !activeDeposit.note) return;
+    if (!isDialogOpen('deposit-dialog')) return;
+
+    const rows = lastKnownDeposits;
+    if (!rows.length) return;
+    const deposit = activeDeposit.id ? rows.find((item) => item.id === activeDeposit.id) : rows[0];
+    if (!deposit) return;
+
+    const status = String(deposit.status || '').toLowerCase();
+    const note = activeDeposit.note;
+    note.classList.remove('is-credited', 'is-failed');
+
+    if (status === 'confirmed' || status === 'paid') {
+        note.classList.add('is-credited');
+        note.textContent = `Credited to your balance on ${new Date(deposit.credited_at || deposit.created_at).toLocaleString()}.`;
+        return;
+    }
+    if (status === 'failed' || status === 'expired') {
+        note.classList.add('is-failed');
+        note.textContent = status === 'expired'
+            ? 'This address expired before the payment arrived. Start a new deposit to get a fresh address.'
+            : 'The provider reported this payment as failed. Nothing was credited; you can start a new deposit.';
+        return;
+    }
+    if (status === 'confirming') {
+        note.textContent = 'The payment arrived and is being confirmed on the network. This usually takes a few minutes.';
+        return;
+    }
+    note.textContent = 'Waiting for the payment to arrive. Your balance updates automatically once the provider confirms it.';
+}
+
+function isDialogOpen(id) {
+    const dialog = document.getElementById(id);
+    return Boolean(dialog && dialog.open);
+}
+
+/**
+ * Says how current the page is, without a spinner.
+ *
+ * A page that updates itself needs to be able to say it stopped: a "live" indicator that
+ * never acknowledges a failure is worse than none, because it tells the user the numbers
+ * are current when they may not be. It is only rendered once a session exists, since a
+ * logged-out visitor has nothing to sync.
+ */
+function paintLiveIndicator() {
+    const indicator = document.getElementById('live-indicator');
+    if (!indicator) return;
+    const token = sessionStorage.getItem(accountTokenKey);
+    if (!token) {
+        indicator.hidden = true;
+        return;
+    }
+    indicator.hidden = false;
+    const failing = liveState.consecutiveFailures > 0;
+    const waiting = liveState.awaitingDeposit;
+    indicator.classList.toggle('is-stale', failing);
+    indicator.classList.toggle('is-waiting', waiting && !failing);
+    if (failing) {
+        const seconds = Math.round((Date.now() - liveState.lastSyncedAt) / 1000);
+        indicator.textContent = seconds > 0
+            ? `Connection lost - last updated ${seconds}s ago`
+            : 'Connection lost - retrying';
+        return;
+    }
+    indicator.textContent = waiting ? 'Waiting for payment...' : 'Live';
+}
 
 /* ---------------------------------------------------------------- helpers */
 
@@ -596,16 +880,13 @@ async function connectAccount(event) {
         });
         sessionStorage.setItem(accountTokenKey, data.token);
         applyBalance(data.user.balance, data.user.demo_balance);
-    // The narrow-screen action bar duplicates the header controls, because the header
-    // has to stay one row on a phone and the primary actions belong under the thumb.
-    // Each bar button forwards to its header counterpart so the behaviour, the disabled
-    // state, and the sign-in label all have exactly one implementation.
-    document.querySelectorAll('[data-mirror]').forEach((barButton) => {
-        const target = document.getElementById(barButton.dataset.mirror);
-        if (target) barButton.addEventListener('click', () => target.click());
-    });
-
-    syncAccountControls();
+        // The bar and the header have to agree the moment a session exists, because the
+        // header controls were disabled for a signed-out visitor and the mirrored ones were
+        // disabled to match. `syncAccountControls` is what lifts both, and it also enables
+        // the live sync's indicator for the first time.
+        syncAccountControls();
+        paintLiveIndicator();
+        syncNow();
 
         document.getElementById('account-dialog').close();
         document.getElementById('account-password').value = '';
@@ -815,13 +1096,31 @@ async function loadDepositOptions() {
         const cryptoButton = document.querySelector('[data-deposit-method="crypto"]');
         stripeButton.disabled = !options.stripeAvailable;
         cryptoButton.disabled = !options.cryptoAvailable;
+        // A greyed-out card with no explanation is a dead end: the only way to find out why
+        // Card is unavailable was to guess. The reason is stated on the card itself, so the
+        // answer is where the question is asked.
+        describeDepositMethod(stripeButton, options.stripeAvailable
+            ? 'Visa, Mastercard, Apple Pay'
+            : 'Not configured on this deployment');
+        describeDepositMethod(cryptoButton, options.cryptoAvailable
+            ? `${options.cryptoCurrencies.length} ${options.cryptoCurrencies.length === 1 ? 'coin' : 'coins'} available`
+            : 'Not configured on this deployment');
 
         const currencySelect = document.getElementById('deposit-currency');
         const previous = currencySelect.value;
         currencySelect.replaceChildren(...options.cryptoCurrencies.map((currency) => {
             const option = document.createElement('option');
             option.value = currency;
-            option.textContent = cryptoCurrencyNames[currency] || currency.toUpperCase();
+            // The per-coin minimum is shown in the list itself. It used to be revealed only
+            // after choosing, by the hint under the amount box, so a user whose amount was
+            // below Bitcoin's floor picked the coin first and was then told it was too small.
+            const name = cryptoCurrencyNames[currency] || currency.toUpperCase();
+            const minimum = options.minimums?.[currency];
+            const maximum = options.maximums?.[currency];
+            const range = [];
+            if (Number.isFinite(minimum) && minimum > 0) range.push(`min ${formatBalance(minimum)}`);
+            if (Number.isFinite(maximum) && maximum > 0) range.push(`max ${formatBalance(maximum)}`);
+            option.textContent = range.length ? `${name} (${range.join(', ')})` : name;
             return option;
         }));
         if (options.cryptoCurrencies.includes(previous)) currencySelect.value = previous;
@@ -883,6 +1182,20 @@ async function loadDepositOptions() {
         copy.textContent = error.message;
         submit.disabled = true;
     }
+}
+
+/**
+ * Sets the second line of a payment-method card.
+ *
+ * The card's own `<span>` is reused rather than a new element created per load, so the
+ * descriptor is not rebuilt on every options refresh -- which matters because the refresh
+ * happens every time the dialog opens, and rebuilding a node the user may be reading is how
+ * a label ends up flickering.
+ */
+function describeDepositMethod(button, text) {
+    if (!button) return;
+    const target = button.querySelector('[data-method-detail]') || button.querySelector('span');
+    if (target) target.textContent = text;
 }
 
 function updateDepositFields() {
@@ -966,19 +1279,18 @@ async function createDeposit(event) {
         renderDepositInstructions(result);
         document.getElementById('deposit-form').hidden = true;
         await loadDepositHistory();
-        // Poll only while a deposit is unsettled, and stop as soon as one confirms. The
-        // previous version polled for as long as the dialog stayed open, issuing a
-        // history request every ten seconds even after the balance had been updated.
-        window.clearInterval(depositStatusTimer);
-        depositHistorySignature = '';
-        depositStatusTimer = window.setInterval(async () => {
-            const outcome = await loadDepositHistory();
-            if (outcome.settled && depositHistorySignature !== 'settled') {
-                depositHistorySignature = 'settled';
-                window.clearInterval(depositStatusTimer);
-                depositStatusTimer = undefined;
-            }
-        }, 10000);
+        // No interval is started here any more. The page-wide live sync already covers this
+        // case and does it better: it keeps the balance, both history lists, the header, and
+        // any other open dialog in step, it backs off when the server is unhealthy, and it
+        // stops while the tab is hidden. A second timer polling the same data on a different
+        // schedule was the reason the deposit panel could be up to ten seconds behind
+        // everything else on the page.
+        // The deposit is outstanding, so the sync should look again promptly rather than
+        // settling into the idle beat.
+        liveState.awaitingDeposit = true;
+        paintDepositStatus();
+        paintLiveIndicator();
+        scheduleLiveSync();
     } catch (error) {
         setFormMessage('deposit-message', error.message, 'error');
         updateDepositFields();
@@ -1074,6 +1386,9 @@ function renderDepositInstructions(result) {
 
     const note = document.createElement('p');
     note.className = 'receipt-note';
+    // Replaced by the live status as soon as one arrives, so the two are never both on
+    // screen saying different things about the same deposit.
+    note.id = 'deposit-status-note';
     note.textContent = 'Your balance updates automatically once the provider confirms the payment.';
 
     const again = document.createElement('button');
@@ -1084,6 +1399,9 @@ function renderDepositInstructions(result) {
 
     stage.append(details);
     instructions.append(heading, lead, stage, note, again);
+    // Tracked so the live sync can find this panel's note without another id lookup, and so
+    // it knows which deposit the status belongs to.
+    activeDeposit = { id: result.depositId || null, note };
     instructions.hidden = false;
 
     if (countdown) startCountdown();
@@ -1629,6 +1947,67 @@ function describeHistorySubtitle(item, kind) {
         : new Date(item.created_at).toLocaleDateString();
 }
 
+/**
+ * Renders one history row.
+ *
+ * Extracted from the loader so the live sync and the initial load draw the same thing. Two
+ * copies of this markup is how a row ends up showing "Refunded" in one place and "Failed"
+ * in the other.
+ */
+function buildHistoryRow(item, kind) {
+    const status = String(item.status || '').toLowerCase();
+
+    const row = document.createElement('div');
+    row.className = 'history-row';
+
+    const details = document.createElement('div');
+    const label = document.createElement('strong');
+    label.textContent = describeHistoryItem(item, kind);
+    const subtitle = document.createElement('span');
+    subtitle.textContent = describeHistorySubtitle(item, kind);
+    details.append(label, subtitle);
+
+    if (kind === 'deposit' && item.deposit_address && status !== 'confirmed') {
+        const address = document.createElement('code');
+        address.className = 'deposit-address history-address';
+        // A full address is 30-90 characters of unbreakable noise in a list, and
+        // it made each row several lines tall. Shortened for reading, with the
+        // whole value still on the element for hover and for anyone copying it.
+        address.textContent = shortenAddress(item.deposit_address);
+        address.title = item.deposit_address;
+        details.append(address);
+    }
+
+    const badge = document.createElement('span');
+    // "Refunded" is a different claim from "Failed": it tells the user the money is
+    // back, and it is only used when the ledger says so. The colour stays the
+    // failure colour because the request was still rejected.
+    const refunded = kind === 'withdrawal' && Boolean(item.refunded_at);
+    badge.className = `payment-status status-${refunded ? 'refunded' : status}`;
+    badge.textContent = refunded ? 'Refunded' : (statusLabels[status] || status);
+
+    row.append(details, badge);
+    return row;
+}
+
+/**
+ * Draws a history list from data already in hand.
+ *
+ * Used by the live sync, which receives the rows in the same response as the change that
+ * caused them, so rendering them here is what saves the second request.
+ */
+function renderHistoryInto(containerId, items, kind, emptyText) {
+    const container = document.getElementById(containerId);
+    if (!container) return;
+    if (!items.length) {
+        container.textContent = emptyText;
+        return;
+    }
+    const fragment = document.createDocumentFragment();
+    for (const item of items) fragment.append(buildHistoryRow(item, kind));
+    container.replaceChildren(fragment);
+}
+
 async function loadPaymentHistory(endpoint, containerId, kind) {
     const container = document.getElementById(containerId);
     container.textContent = 'Loading history...';
@@ -1662,37 +2041,7 @@ async function loadPaymentHistory(endpoint, containerId, kind) {
                 }
             }
 
-            const row = document.createElement('div');
-            row.className = 'history-row';
-
-            const details = document.createElement('div');
-            const label = document.createElement('strong');
-            label.textContent = describeHistoryItem(item, kind);
-            const subtitle = document.createElement('span');
-            subtitle.textContent = describeHistorySubtitle(item, kind);
-            details.append(label, subtitle);
-
-            if (kind === 'deposit' && item.deposit_address && status !== 'confirmed') {
-                const address = document.createElement('code');
-                address.className = 'deposit-address history-address';
-                // A full address is 30-90 characters of unbreakable noise in a list, and
-                // it made each row several lines tall. Shortened for reading, with the
-                // whole value still on the element for hover and for anyone copying it.
-                address.textContent = shortenAddress(item.deposit_address);
-                address.title = item.deposit_address;
-                details.append(address);
-            }
-
-            const badge = document.createElement('span');
-            // "Refunded" is a different claim from "Failed": it tells the user the money is
-            // back, and it is only used when the ledger says so. The colour stays the
-            // failure colour because the request was still rejected.
-            const refunded = kind === 'withdrawal' && Boolean(item.refunded_at);
-            badge.className = `payment-status status-${refunded ? 'refunded' : status}`;
-            badge.textContent = refunded ? 'Refunded' : (statusLabels[status] || status);
-
-            row.append(details, badge);
-            fragment.append(row);
+            fragment.append(buildHistoryRow(item, kind));
         }
         container.append(fragment);
 

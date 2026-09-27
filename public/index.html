@@ -21,6 +21,12 @@
                 <span class="balance-label">Available balance</span>
                 <strong id="user-balance">--</strong>
                 <span class="demo-balance-line">Test-only balance <strong id="demo-balance">--</strong></span>
+                <!-- Says whether the page is still current, and admits when it is not. A page
+                     that updates itself has to be able to say it stopped, or a stale balance
+                     reads as a live one. Announced politely rather than assertively: it
+                     changes on failure, and interrupting a screen reader for that would be
+                     worse than the silence. -->
+                <span class="live-indicator" id="live-indicator" hidden></span>
             </div>
             <button class="button button-light header-action" id="account-button" type="button">Connect account</button>
             <button class="button button-light header-action" id="deposit-button" type="button" disabled>Deposit</button>
@@ -219,10 +225,10 @@
                 <span class="form-label" id="deposit-method-label">Payment type</span>
                 <div class="deposit-method-options" role="group" aria-labelledby="deposit-method-label">
                     <button class="deposit-method-option" type="button" data-deposit-method="stripe" aria-pressed="false">
-                        <strong>Card</strong><span>Stripe checkout</span>
+                        <strong>Card</strong><span data-method-detail>Visa, Mastercard, Apple Pay</span>
                     </button>
                     <button class="deposit-method-option is-active" type="button" data-deposit-method="crypto" aria-pressed="true">
-                        <strong>Crypto</strong><span>Wallet address</span>
+                        <strong>Crypto</strong><span data-method-detail>Wallet address</span>
                     </button>
                 </div>
 
@@ -271,10 +277,10 @@
                 <label class="form-label" for="withdraw-amount">Amount</label>
                 <div class="amount-field">
                     <span aria-hidden="true">$</span>
-                    <input class="form-control" id="withdraw-amount" type="number" min="5" step="0.01" placeholder="0.00" inputmode="decimal" required>
+                    <input class="form-control" id="withdraw-amount" type="number" min="1" max="10000" step="0.01" placeholder="0.00" inputmode="decimal" required>
                     <span class="amount-suffix" aria-hidden="true">USD</span>
                 </div>
-                <p class="field-hint" id="withdraw-amount-hint">Minimum $5.00.</p>
+                <p class="field-hint" id="withdraw-amount-hint">Minimum $1.00. Maximum $10,000.00.</p>
             </div>
 
             <fieldset class="fieldset-reset">

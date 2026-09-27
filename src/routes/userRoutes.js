@@ -141,6 +141,102 @@ router.get('/balance', async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// Live updates
+// ---------------------------------------------------------------------------
+
+/**
+ * Whether anything the page shows has moved since the version the client last saw.
+ *
+ * The client polls this instead of re-reading the balance and both history lists, and the
+ * answer is normally "nothing changed" in about sixty bytes. That matters because the
+ * alternative is a poll that re-downloads every row the user can see several times a
+ * minute forever, which on a serverless function is a request count problem before it is
+ * a bandwidth one.
+ *
+ * The version is a string rather than a sequence number because it is derived from data
+ * this database already maintains. A monotonic counter would need a column, a write on
+ * every path that changes the balance, and a migration on any deployment that has not run
+ * it -- and a counter that misses a write is worse than no counter, because it reports
+ * "unchanged" when something moved. Timestamps cannot miss a write, and `updated_at` is
+ * already bumped by every write that can change what the page shows: a deposit being
+ * credited, a withdrawal being paid or refunded by an operator.
+ *
+ * Balance and `demo_balance` are part of the version rather than of the comparison,
+ * because a demo conversion credits `demo_balance` without touching a deposit or a
+ * withdrawal, and a header that said "unchanged" there would be lying.
+ *
+ * When something has changed the full histories come back, so the client does not need a
+ * second request to catch up.
+ */
+router.get('/updates', async (req, res) => {
+    const knownVersion = String(req.query.version || '').slice(0, 120);
+    try {
+        const result = await pool.query(
+            `SELECT u.balance, u.demo_balance, u.token_version,
+                    (SELECT COALESCE(MAX(updated_at)::TEXT, '') FROM deposits WHERE user_id = u.id) AS deposits_at,
+                    (SELECT COALESCE(MAX(updated_at)::TEXT, '') FROM withdrawals WHERE user_id = u.id) AS withdrawals_at
+             FROM users u
+             WHERE u.id = $1`,
+            [req.user.id]
+        );
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'User not found.' });
+        }
+
+        const row = result.rows[0];
+        const version = [row.deposits_at, row.withdrawals_at, row.balance, row.demo_balance, row.token_version].join('|');
+
+        // `no-store` is not optional here. A cached poll result would report "unchanged"
+        // after the deposit that just credited, which is the exact failure this endpoint
+        // exists to prevent.
+        res.set('Cache-Control', 'no-store');
+
+        if (knownVersion && knownVersion === version) {
+            // 304 is the honest status: the client's copy is current. It is smaller than
+            // an empty 200 body and intermediaries treat it as "revalidate", which is what
+            // it is.
+            return res.status(304).end();
+        }
+
+        const [deposits, withdrawals] = await Promise.all([
+            pool.query(
+                `SELECT id, amount, asset_code, currency_code, network, deposit_address,
+                        checkout_url, status, credited_at, created_at
+                 FROM deposits
+                 WHERE user_id = $1
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT $2`,
+                [req.user.id, HISTORY_PAGE_SIZE]
+            ),
+            pool.query(
+                `SELECT w.id, w.amount, w.payment_method, w.payment_address, w.asset_code, w.network,
+                        w.status, w.failure_reason, w.created_at, w.paid_at,
+                        r.created_at AS refunded_at
+                 FROM withdrawals w
+                 LEFT JOIN balance_transactions r
+                        ON r.transaction_type = 'refund'
+                        AND r.source_id = 'withdrawal:' || w.id::TEXT
+                        AND r.user_id = w.user_id
+                 WHERE w.user_id = $1
+                 ORDER BY w.created_at DESC
+                 LIMIT $2`,
+                [req.user.id, HISTORY_PAGE_SIZE]
+            )
+        ]);
+
+        return res.json({
+            version,
+            balance: row.balance,
+            demoBalance: row.demo_balance,
+            deposits: deposits.rows.map(withReceiptUrl),
+            withdrawals: withdrawals.rows
+        });
+    } catch (error) {
+        return sendDatabaseFailure(res, 'Updates Error', error);
+    }
+});
+
+// ---------------------------------------------------------------------------
 // Withdrawal history
 // ---------------------------------------------------------------------------
 

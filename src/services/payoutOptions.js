@@ -102,8 +102,20 @@ const fiatMethods = [
     { value: 'venmo', label: 'Venmo', hint: 'A Venmo handle (@username). Transfers are manually reviewed.' }
 ];
 
-const minimumWithdrawalUsd = 5.00;
-const maximumWithdrawalUsd = 50000.00;
+/**
+ * App-level withdrawal bounds, in USD.
+ *
+ * These are the floor and ceiling the request endpoint enforces, independent of what any
+ * provider or per-network limit says. A provider minimum above $1 (some networks quote more)
+ * is applied on top of this floor by the options endpoint, so the number here is the
+ * app's own rule and never the reason a request is refused for being too small.
+ *
+ * The ceiling is $10,000 rather than the balance itself: a request larger than the balance
+ * is refused for the more useful reason, and an explicit ceiling gives the amount box and
+ * the error message the same number to show.
+ */
+const minimumWithdrawalUsd = 1.00;
+const maximumWithdrawalUsd = 10000.00;
 
 /**
  * Finds asset configuration by ticker symbol.
