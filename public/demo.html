@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="theme-color" content="#131c4a" media="(prefers-color-scheme: dark)">
+    <meta name="theme-color" content="#2449d8" media="(prefers-color-scheme: light)">
+    <meta name="robots" content="noindex">
+    <title>Demo task | RewardZone</title>
+    <link rel="stylesheet" href="/style.css">
+    <script src="/demo.js" defer></script>
+</head>
+<body>
+    <header class="topbar">
+        <a class="brand" href="/" aria-label="RewardZone home">
+            <span class="brand-mark" aria-hidden="true">R</span>
+            <span>reward<span class="brand-light">zone</span></span>
+        </a>
+        <a class="button button-light" href="/offers">Back to offers</a>
+    </header>
+
+    <main class="demo-shell">
+        <p class="demo-banner">
+            <span>This is a test environment. Rewards here are simulated and have no cash value.</span>
+        </p>
+
+        <section class="demo-panel" aria-labelledby="demo-title">
+            <p class="eyebrow"><span class="eyebrow-dot" aria-hidden="true"></span> Test environment</p>
+            <h1 id="demo-title" class="display">Demo task</h1>
+            <p id="demo-copy" class="demo-copy">This task awards a test-only balance, not money.</p>
+
+            <div class="demo-progress" id="demo-progress" hidden>
+                <div class="demo-progress-track">
+                    <div class="demo-progress-bar" id="demo-progress-bar"></div>
+                </div>
+                <p class="demo-progress-label" id="demo-progress-label" role="status"></p>
+            </div>
+
+            <form id="demo-form">
+                <div id="demo-fields" class="demo-fields"></div>
+                <p id="demo-message" class="form-message" role="status"></p>
+                <button id="demo-submit" class="button button-accent" type="submit">Complete demo task</button>
+            </form>
+
+            <div id="demo-result" class="demo-result" role="status" hidden></div>
+            <p class="demo-disclaimer">The test-only balance cannot be withdrawn and is never converted to cash. Demo tasks are not available in production.</p>
+        </section>
+    </main>
+</body>
+</html>

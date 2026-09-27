@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="theme-color" content="#131c4a" media="(prefers-color-scheme: dark)">
+    <meta name="theme-color" content="#2449d8" media="(prefers-color-scheme: light)">
+    <meta name="robots" content="noindex">
+    <meta name="description" content="Status and receipt for a RewardZone deposit.">
+    <title>Deposit receipt | RewardZone</title>
+    <link rel="stylesheet" href="/style.css">
+    <script src="/deposit-receipt.js" defer></script>
+</head>
+<body>
+    <header class="topbar">
+        <a class="brand" href="/" aria-label="RewardZone home">
+            <span class="brand-mark" aria-hidden="true">R</span>
+            <span>reward<span class="brand-light">zone</span></span>
+        </a>
+        <div class="account-tools">
+            <a class="button button-light" href="/offers">Back to offers</a>
+        </div>
+    </header>
+
+    <main class="page-shell receipt-shell">
+        <!-- aria-live so a screen reader announces the credit the moment it lands, rather
+             than the user having to go looking for it. The page is the notification. -->
+        <section class="receipt-card" id="receipt-card" aria-labelledby="receipt-heading" aria-live="polite" aria-busy="true">
+            <p class="eyebrow"><span class="eyebrow-dot" aria-hidden="true"></span> Deposit receipt</p>
+
+            <div class="receipt-state" id="receipt-state">
+                <span class="receipt-state-mark" id="receipt-mark" aria-hidden="true"></span>
+                <h1 class="display" id="receipt-heading">Loading your deposit...</h1>
+                <p class="receipt-lead" id="receipt-lead">Checking the payment provider.</p>
+            </div>
+
+            <dl class="receipt-facts" id="receipt-facts" hidden></dl>
+
+            <div class="receipt-actions" id="receipt-actions" hidden>
+                <a class="button button-accent button-wide" href="/offers">Back to offers</a>
+                <a class="button button-light button-wide" id="receipt-copy-link" href="#">Copy this link</a>
+            </div>
+
+            <p class="fine-print" id="receipt-footnote" hidden></p>
+        </section>
+    </main>
+</body>
+</html>

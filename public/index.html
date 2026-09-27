@@ -1,0 +1,312 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="theme-color" content="#131c4a" media="(prefers-color-scheme: dark)">
+    <meta name="theme-color" content="#2449d8" media="(prefers-color-scheme: light)">
+    <meta name="description" content="Browse available offers and track your rewards.">
+    <title>Offers | RewardZone</title>
+    <link rel="stylesheet" href="/style.css">
+    <script src="/app.js" defer></script>
+</head>
+<body class="has-action-bar">
+    <header class="topbar">
+        <a class="brand" href="/" aria-label="RewardZone home">
+            <span class="brand-mark" aria-hidden="true">R</span>
+            <span>reward<span class="brand-light">zone</span></span>
+        </a>
+        <div class="account-tools">
+            <div class="balance-block" aria-live="polite">
+                <span class="balance-label">Available balance</span>
+                <strong id="user-balance">--</strong>
+                <span class="demo-balance-line">Test-only balance <strong id="demo-balance">--</strong></span>
+            </div>
+            <button class="button button-light header-action" id="account-button" type="button">Connect account</button>
+            <button class="button button-light header-action" id="deposit-button" type="button" disabled>Deposit</button>
+            <button class="button button-accent header-action" id="withdraw-button" type="button" disabled>Withdraw</button>
+        </div>
+    </header>
+
+    <main class="page-shell">
+        <section class="catalog-heading" aria-labelledby="page-title">
+            <div>
+                <p class="eyebrow"><span class="eyebrow-dot" aria-hidden="true"></span> Reward catalog</p>
+                <h1 id="page-title" class="display">Offers worth your time.</h1>
+                <p class="intro-copy">Connect an account to attribute completed offers to your balance. Every reward is credited only after the partner confirms it.</p>
+            </div>
+            <div class="catalog-note">
+                <span class="note-mark" aria-hidden="true">+</span>
+                <span>New offers added regularly</span>
+            </div>
+        </section>
+
+        <section class="catalog" aria-label="Available offers">
+            <div class="catalog-toolbar">
+                <div class="catalog-count">
+                    <span class="count-mark" aria-hidden="true"></span>
+                    <span id="offer-count">Loading offers</span>
+                </div>
+                <div class="catalog-filters">
+                    <label class="search-field">
+                        <span class="visually-hidden">Search offers</span>
+                        <span class="search-icon" aria-hidden="true"></span>
+                        <input id="offer-search" type="search" placeholder="Search offers" autocomplete="off">
+                    </label>
+                    <label class="sort-field">
+                        <span class="visually-hidden">Sort offers</span>
+                        <select id="offer-sort">
+                            <option value="featured">Featured</option>
+                            <option value="payout-high">Highest reward</option>
+                            <option value="payout-low">Lowest reward</option>
+                            <option value="title">Title A to Z</option>
+                        </select>
+                    </label>
+                </div>
+            </div>
+
+            <p id="page-message" class="page-message" role="status" hidden></p>
+
+            <div id="loading-skeletons" class="offer-grid" aria-hidden="true">
+                <article class="offer-card skeleton-card">
+                    <div class="skeleton-line is-short"></div>
+                    <div class="skeleton-line is-tall skeleton-title"></div>
+                    <div class="skeleton-line is-medium"></div>
+                    <div class="skeleton-block skeleton-footer"></div>
+                </article>
+                <article class="offer-card skeleton-card">
+                    <div class="skeleton-line is-short"></div>
+                    <div class="skeleton-line is-tall skeleton-title"></div>
+                    <div class="skeleton-line"></div>
+                    <div class="skeleton-block skeleton-footer"></div>
+                </article>
+                <article class="offer-card skeleton-card">
+                    <div class="skeleton-line is-medium"></div>
+                    <div class="skeleton-line is-tall skeleton-title"></div>
+                    <div class="skeleton-line is-short"></div>
+                    <div class="skeleton-block skeleton-footer"></div>
+                </article>
+            </div>
+
+            <div id="offer-grid" class="offer-grid" aria-live="polite" aria-busy="true"></div>
+        </section>
+    </main>
+
+    <footer class="site-footer">
+        <span class="site-footer-meta"><span class="footer-mark" aria-hidden="true"></span> RewardZone</span>
+        <nav aria-label="Footer">
+            <a href="/">Home</a>
+            <a href="/offers">Offers</a>
+        </nav>
+    </footer>
+
+    <!-- Primary actions for narrow screens. The header keeps the balance and the brand
+         on one row; the three money actions move here so they sit inside thumb reach
+         instead of at the top of a three-row header. Hidden on wide screens, where the
+         header carries the same controls. -->
+    <nav class="action-bar" aria-label="Account and payment actions">
+        <button class="action-bar-item" id="mobile-account-button" type="button" data-mirror="account-button">
+            <span class="action-bar-icon" aria-hidden="true">&#9679;</span>
+            <span class="action-bar-label">Account</span>
+        </button>
+        <button class="action-bar-item" id="mobile-deposit-button" type="button" data-mirror="deposit-button" disabled>
+            <span class="action-bar-icon action-bar-icon-plus" aria-hidden="true">&#43;</span>
+            <span class="action-bar-label">Deposit</span>
+        </button>
+        <button class="action-bar-item is-primary" id="mobile-withdraw-button" type="button" data-mirror="withdraw-button" disabled>
+            <span class="action-bar-icon action-bar-icon-arrow" aria-hidden="true">&#8593;</span>
+            <span class="action-bar-label">Withdraw</span>
+        </button>
+    </nav>
+
+    <!-- Account -->
+    <dialog class="dialog" id="account-dialog" aria-labelledby="account-title">
+        <form class="dialog-panel" id="account-form">
+            <div class="dialog-heading">
+                <div>
+                    <p class="eyebrow">Account</p>
+                    <h2 id="account-title">Welcome back</h2>
+                </div>
+                <button class="icon-button" type="button" data-close="account-dialog" aria-label="Close">&times;</button>
+            </div>
+
+            <div class="auth-mode" role="tablist" aria-label="Account access">
+                <button class="auth-mode-button is-active" type="button" role="tab" aria-selected="true" data-auth-mode="login">Sign in</button>
+                <button class="auth-mode-button" type="button" role="tab" aria-selected="false" data-auth-mode="register">Create account</button>
+            </div>
+
+            <label class="form-label" for="account-email">Email</label>
+            <input class="form-control" id="account-email" type="email" maxlength="254" autocomplete="email" required>
+
+            <label class="form-label" for="account-password" id="account-password-label">Password</label>
+            <input class="form-control" id="account-password" type="password" minlength="12" maxlength="128" autocomplete="current-password" required>
+            <p id="password-hint" class="field-hint" hidden>Use at least 12 characters.</p>
+
+            <p id="account-message" class="form-message" role="status"></p>
+            <button class="button button-accent button-wide" id="connect-submit" type="submit">Sign in</button>
+            <button class="link-button" id="forgot-password-link" type="button">Forgot password?</button>
+        </form>
+    </dialog>
+
+    <!-- Deposit credited -->
+    <dialog class="dialog dialog-receipt" id="deposit-success-dialog" aria-labelledby="deposit-success-title">
+        <div class="dialog-panel">
+            <div class="deposit-success">
+                <span class="confirmation-mark" aria-hidden="true"></span>
+                <p class="eyebrow"><span class="eyebrow-dot" aria-hidden="true"></span> Payment received</p>
+                <h2 class="display" id="deposit-success-title">Deposit credited</h2>
+                <p class="credited-amount" id="deposit-success-amount">$0.00</p>
+                <p class="receipt-lead" id="deposit-success-lead">Your balance has been updated.</p>
+
+                <dl class="receipt-facts" id="deposit-success-facts"></dl>
+
+                <p class="credited-balance">New balance <strong id="deposit-success-balance">--</strong></p>
+
+                <div class="receipt-actions">
+                    <a class="button button-accent button-wide" id="deposit-success-receipt" href="#">View receipt</a>
+                    <button class="button button-light button-wide" id="deposit-success-close" type="button">Done</button>
+                </div>
+            </div>
+        </div>
+    </dialog>
+
+    <!-- Deposit -->
+    <dialog class="dialog dialog-deposit" id="deposit-dialog" aria-labelledby="deposit-title">
+        <div class="dialog-panel">
+            <div class="dialog-heading">
+                <div>
+                    <p class="eyebrow">Deposit</p>
+                    <h2 id="deposit-title">Add funds</h2>
+                </div>
+                <button class="icon-button" type="button" data-close="deposit-dialog" aria-label="Close">&times;</button>
+            </div>
+
+            <div class="provider-notice" id="provider-notice">
+                <span class="provider-indicator" aria-hidden="true"></span>
+                <div>
+                    <strong id="deposit-provider-title">Checking payment providers</strong>
+                    <p id="deposit-provider-copy">Contacting the configured payment services...</p>
+                </div>
+            </div>
+
+            <p class="callout is-warning" id="callback-warning" hidden></p>
+
+            <form id="deposit-form" class="deposit-form" novalidate>
+                <div class="amount-block">
+                    <div class="amount-block-head">
+                        <label class="form-label" for="deposit-amount">Amount to add</label>
+                        <button class="max-button" id="deposit-max" type="button">Max</button>
+                    </div>
+                    <div class="amount-field deposit-amount-field">
+                        <span aria-hidden="true">$</span>
+                        <input class="form-control" id="deposit-amount" type="number" min="1" max="5000" step="0.01" value="10.00" inputmode="decimal" required>
+                        <span class="amount-suffix" aria-hidden="true">USD</span>
+                    </div>
+                    <div class="amount-presets" role="group" aria-label="Quick amount choices">
+                        <button type="button" data-deposit-amount="5">$5</button>
+                        <button type="button" data-deposit-amount="10">$10</button>
+                        <button type="button" data-deposit-amount="25">$25</button>
+                        <button type="button" data-deposit-amount="50">$50</button>
+                    </div>
+                    <p class="field-hint" id="deposit-amount-hint">Minimum $1.00. Maximum $5,000.00.</p>
+                </div>
+
+                <span class="form-label" id="deposit-method-label">Payment type</span>
+                <div class="deposit-method-options" role="group" aria-labelledby="deposit-method-label">
+                    <button class="deposit-method-option" type="button" data-deposit-method="stripe" aria-pressed="false">
+                        <strong>Card</strong><span>Stripe checkout</span>
+                    </button>
+                    <button class="deposit-method-option is-active" type="button" data-deposit-method="crypto" aria-pressed="true">
+                        <strong>Crypto</strong><span>Wallet address</span>
+                    </button>
+                </div>
+
+                <div id="crypto-deposit-fields" class="field-group" hidden>
+                    <label class="form-label" for="deposit-currency">Pay with</label>
+                    <select class="form-control" id="deposit-currency"></select>
+                    <p class="form-note">You will be shown a deposit address and an exact amount. Send only that asset on that network.</p>
+                </div>
+
+                <p id="deposit-message" class="form-message" role="status"></p>
+                <button id="deposit-submit" class="button button-accent button-wide" type="submit">Continue to secure checkout</button>
+                <p class="fine-print" id="deposit-provider-fine-print" hidden></p>
+            </form>
+
+            <div id="deposit-instructions" class="deposit-receipt" hidden></div>
+
+            <h3 class="history-title">Recent deposits</h3>
+            <div id="deposit-history" class="receipt-list" aria-live="polite">Loading deposit history...</div>
+        </div>
+    </dialog>
+
+    <!-- Withdraw -->
+    <dialog class="dialog dialog-withdraw" id="withdraw-dialog" aria-labelledby="withdraw-title">
+        <form class="dialog-panel" id="withdraw-form" novalidate>
+            <div class="dialog-heading">
+                <div>
+                    <p class="eyebrow">Payout</p>
+                    <h2 id="withdraw-title">Request a withdrawal</h2>
+                </div>
+                <button class="icon-button" type="button" data-close="withdraw-dialog" aria-label="Close">&times;</button>
+            </div>
+
+            <div class="balance-card">
+                <div>
+                    <span class="balance-card-label">Available to withdraw</span>
+                    <strong id="withdraw-available">--</strong>
+                </div>
+                <button class="max-button" id="withdraw-max" type="button">Withdraw all</button>
+            </div>
+
+            <div class="callout is-warning">
+                <span>Requests are reviewed manually and are <strong>not sent automatically</strong>. Your balance is held as soon as you submit, and funds leave after an operator pays the request.</span>
+            </div>
+
+            <div class="amount-block">
+                <label class="form-label" for="withdraw-amount">Amount</label>
+                <div class="amount-field">
+                    <span aria-hidden="true">$</span>
+                    <input class="form-control" id="withdraw-amount" type="number" min="5" step="0.01" placeholder="0.00" inputmode="decimal" required>
+                    <span class="amount-suffix" aria-hidden="true">USD</span>
+                </div>
+                <p class="field-hint" id="withdraw-amount-hint">Minimum $5.00.</p>
+            </div>
+
+            <fieldset class="fieldset-reset">
+                <legend class="form-label legend-label">Payment method</legend>
+                <div class="choice-grid" id="withdraw-method-options" role="group"></div>
+            </fieldset>
+
+            <div id="crypto-withdraw-fields" class="field-group" hidden>
+                <p class="form-label legend-label" id="withdraw-asset-label">Crypto asset</p>
+                <div class="choice-grid" id="withdraw-asset-options" role="group" aria-labelledby="withdraw-asset-label"></div>
+
+                <label class="form-label" for="withdraw-network">Network</label>
+                <select class="form-control" id="withdraw-network" required></select>
+                <p class="field-hint" id="withdraw-network-hint"></p>
+            </div>
+
+            <div class="field-group">
+                <label class="form-label" for="withdraw-address" id="withdraw-address-label">Payment destination</label>
+                <input class="form-control" id="withdraw-address" type="text" maxlength="254" autocomplete="off" spellcheck="false" placeholder="Email or wallet address" required>
+                <p class="field-hint" id="withdraw-address-hint"></p>
+                <div id="withdraw-tag-field" hidden>
+                    <label class="form-label" for="withdraw-tag">Destination tag</label>
+                    <input class="form-control" id="withdraw-tag" type="text" inputmode="numeric" maxlength="32" autocomplete="off" spellcheck="false" placeholder="Required on this network">
+                    <p class="field-hint">Some chains, including XRP Ledger, route by a tag as well as by address.</p>
+                </div>
+            </div>
+
+            <dl class="withdraw-summary" id="withdraw-summary" hidden></dl>
+
+            <p id="withdraw-message" class="form-message" role="status"></p>
+            <button class="button button-accent button-wide button-lg" id="withdraw-submit" type="submit">Submit request</button>
+
+            <h3 class="history-title">Recent requests</h3>
+            <div id="withdrawal-history" class="receipt-list" aria-live="polite">Loading withdrawal history...</div>
+        </form>
+
+        <div id="withdraw-confirmation" class="confirmation" hidden></div>
+    </dialog>
+</body>
+</html>

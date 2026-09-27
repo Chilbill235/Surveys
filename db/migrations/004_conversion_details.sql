@@ -1,0 +1,6 @@
+BEGIN;
+
+ALTER TABLE conversions
+    ADD COLUMN IF NOT EXISTS details JSONB NOT NULL DEFAULT '{}'::jsonb;
+
+COMMIT;

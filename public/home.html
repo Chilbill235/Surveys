@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="theme-color" content="#131c4a" media="(prefers-color-scheme: dark)">
+    <meta name="theme-color" content="#2449d8" media="(prefers-color-scheme: light)">
+    <meta name="description" content="Find offers and earn rewards with RewardZone.">
+    <title>RewardZone | Home</title>
+    <link rel="stylesheet" href="/style.css">
+    <script src="/home.js" defer></script>
+</head>
+<body>
+    <header class="topbar">
+        <a class="brand" href="/" aria-label="RewardZone home">
+            <span class="brand-mark" aria-hidden="true">R</span>
+            <span>reward<span class="brand-light">zone</span></span>
+        </a>
+        <nav class="home-nav" aria-label="Main navigation">
+            <a class="button button-light" href="/offers">Browse offers</a>
+        </nav>
+    </header>
+
+    <main class="home-shell">
+        <section class="home-hero" aria-labelledby="home-title">
+            <p class="eyebrow"><span class="eyebrow-dot" aria-hidden="true"></span> RewardZone</p>
+            <h1 id="home-title" class="display">Make every offer count.</h1>
+            <p class="home-copy">Discover available offers, complete them with our partners, and follow your rewards from one place. Funds are only credited after a partner confirms the conversion.</p>
+            <a class="home-cta" href="/offers">Explore offers <span aria-hidden="true">&#8594;</span></a>
+        </section>
+
+        <section class="home-stats" aria-label="Platform summary">
+            <div class="home-stat">
+                <strong id="stat-offers">--</strong>
+                <span>Offers in the catalog</span>
+            </div>
+            <div class="home-stat">
+                <strong id="stat-best">--</strong>
+                <span>Highest available reward</span>
+            </div>
+            <div class="home-stat">
+                <strong id="stat-surveys">--</strong>
+                <span>Quick surveys</span>
+            </div>
+            <div class="home-stat">
+                <strong>$5.00</strong>
+                <span>Minimum withdrawal</span>
+            </div>
+        </section>
+
+        <section class="home-offers" aria-labelledby="home-offers-title">
+            <div class="home-section-heading">
+                <div>
+                    <p class="eyebrow">From the catalog</p>
+                    <h2 id="home-offers-title" class="display">Available offers</h2>
+                </div>
+                <a class="home-text-link" href="/offers">View all offers <span aria-hidden="true">&#8594;</span></a>
+            </div>
+            <p id="home-offer-count" class="home-offer-count" role="status">Loading offers...</p>
+            <div id="home-offers" class="home-offer-grid" aria-live="polite"></div>
+        </section>
+    </main>
+
+    <footer class="site-footer">
+        <span class="site-footer-meta"><span class="footer-mark" aria-hidden="true"></span> RewardZone</span>
+        <nav aria-label="Footer">
+            <a href="/">Home</a>
+            <a href="/offers">Offers</a>
+        </nav>
+    </footer>
+</body>
+</html>
