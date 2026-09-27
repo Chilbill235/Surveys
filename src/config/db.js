@@ -35,36 +35,89 @@ const MAX_POOL_MAX = 200;
 const IDLE_TIMEOUT_MS = 30_000;
 const CONNECTION_TIMEOUT_MS = 5_000;
 
+/**
+ * The individual variables `pg` reads when `connectionString` is undefined.
+ * A deployment using these instead of a full URL is not misconfigured, and
+ * must not be treated as one.
+ */
+const INDIVIDUAL_PG_VARS = Object.freeze([
+    'PGHOST', 'PGDATABASE', 'PGUSER', 'PGPASSWORD', 'PGPORT',
+]);
+
 // ---------------------------------------------------------------------------
 // Configuration resolution
 // ---------------------------------------------------------------------------
 
 /**
- * Resolves the connection string, or fails loudly at startup.
+ * Resolves the connection string, or explains clearly why it could not.
  *
- * The whole point of loading `dotenv` above is to avoid the silent
- * `connectionString: undefined` that `pg` resolves to a local socket. But
- * loading `.env` does not guarantee the variable is *in* it. Without this
- * check, a missing or empty `DATABASE_URL` still produces the same
- * ECONNREFUSED-against-localhost failure the load was meant to prevent, and the
- * failure now looks like a code bug rather than a configuration one because the
- * environment "was loaded".
+ * The original version of this function threw at module load when
+ * DATABASE_URL was absent. That is the correct instinct -- the whole point of
+ * loading `dotenv` above is to avoid the silent `connectionString: undefined`
+ * that `pg` resolves to a local socket -- but it is the wrong mechanism.
+ * `pg` itself accepts two sources of connection information:
  *
- * Throwing at module load turns that into a startup crash with a message that
- * names the variable. A process that cannot reach its database has no useful
- * work to do, so failing before the HTTP server binds is strictly better than
- * failing on the first request.
+ *   1. `connectionString` (from DATABASE_URL), or
+ *   2. the individual `PGHOST` / `PGDATABASE` / `PGUSER` / `PGPASSWORD` /
+ *      `PGPORT` variables.
+ *
+ * A deployment that uses source 2 and never sets DATABASE_URL is not
+ * misconfigured; it is just not using the form this file expects. Throwing at
+ * module load in that case crashes the entire app -- including the public
+ * offer catalog, which does not even need to know the connection failed --
+ * which is worse than the error the pool would have produced on its own.
+ *
+ * So the check is now:
+ *   - Return the URL when it is present.
+ *   - Return `undefined` and let `pg` read the individual variables when any
+ *     of them is set.
+ *   - Otherwise log one explicit, actionable error and still return
+ *     `undefined`. The pool will fail on the first query with ECONNREFUSED
+ *     against localhost, but the log line above it names the actual problem,
+ *     and the app does not crash on startup.
+ *
+ * `STRICT_DATABASE_URL=true` restores the fail-fast behaviour for deployments
+ * that want the crash. It is opt-in rather than the default because a process
+ * that cannot reach its database is not useful, but a process that will not
+ * start is strictly worse: the failure is silent to the operator (no HTTP
+ * response at all, only a startup log) and the app is unreachable for every
+ * request, including health checks and the public pages that never touch the
+ * database.
  */
 function resolveConnectionString() {
     const url = process.env.DATABASE_URL;
-    if (typeof url !== 'string' || url.trim() === '') {
-        throw new Error(
-            'DATABASE_URL is not set. Set it in the environment (or in .env before startup). ' +
-            'Without it, pg falls back to a local socket and every request fails with ' +
-            'ECONNREFUSED against localhost.'
-        );
+    if (typeof url === 'string' && url.trim() !== '') {
+        return url.trim();
     }
-    return url.trim();
+
+    // `pg` will build the connection from these when `connectionString` is
+    // undefined. If any is present, the deployment is configured by a form
+    // this file does not need to understand; step aside and let `pg` handle
+    // it exactly as it did before this check existed.
+    const hasIndividualVars = INDIVIDUAL_PG_VARS.some((name) => {
+        const value = process.env[name];
+        return typeof value === 'string' && value.length > 0;
+    });
+    if (hasIndividualVars) {
+        return undefined;
+    }
+
+    const message =
+        'DATABASE_URL is not set and no individual PG* variables ' +
+        `(${INDIVIDUAL_PG_VARS.join(', ')}) are present. pg will fall back to a ` +
+        'local socket and every query will fail with ECONNREFUSED against ' +
+        'localhost. Set DATABASE_URL in the environment.';
+
+    if (process.env.STRICT_DATABASE_URL === 'true') {
+        throw new Error(message);
+    }
+
+    // Logged once at module load. Every subsequent query failure will produce
+    // the ECONNREFUSED that `pg` emits, which is the symptom; this line is the
+    // cause, and having it appear exactly once at the top of the log makes it
+    // findable.
+    console.error(message);
+    return undefined;
 }
 
 /**
