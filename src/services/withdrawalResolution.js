@@ -1,0 +1,213 @@
+const pool = require('../config/db');
+
+/**
+ * The terminal states a withdrawal can be moved to, and which of them keep the money.
+ *
+ * The balance is debited when the request is stored, so a withdrawal that stops short of
+ * `paid` and is not refunded leaves the user short by exactly that amount with no record
+ * of why. `resolveWithdrawal` is the only thing that closes a withdrawal, and it is the
+ * only place either of these two writes happens.
+ */
+const terminalStatuses = new Set(['paid', 'failed', 'cancelled']);
+
+/** Statuses a withdrawal may still be resolved from. */
+const resolvableStatuses = new Set(['pending', 'processing']);
+
+/** Withdrawal statuses that mean the funds left the platform and must never be refunded. */
+const settledStatuses = new Set(['paid']);
+
+/**
+ * Marks a withdrawal as sent, recording the provider reference that proves it.
+ *
+ * The reference is required rather than optional. A `paid` withdrawal with no reference
+ * cannot be reconciled against a provider dashboard or a bank statement later, which is
+ * the only reason to keep the row at all; accepting an empty one would manufacture
+ * exactly the unprovable record this is meant to prevent.
+ *
+ * Returns `{ changed: false, reason }` rather than throwing when the withdrawal is already
+ * in a state it cannot move out of, because a retried operator action and a contradictory
+ * one are different problems and the caller needs to tell them apart.
+ *
+ * Must be called with a client that already has an open transaction.
+ */
+async function markWithdrawalPaid(client, withdrawalId, providerReference) {
+    const reference = String(providerReference || '').trim();
+    if (!reference) {
+        return { changed: false, reason: 'missing-reference' };
+    }
+    if (reference.length > 200) {
+        return { changed: false, reason: 'reference-too-long' };
+    }
+
+    const claimed = await client.query(
+        `UPDATE withdrawals
+         SET status = 'paid', provider_reference = $1, paid_at = NOW(), failure_reason = NULL, updated_at = NOW()
+         WHERE id = $2 AND status = ANY($3)
+         RETURNING id, user_id, amount, status`,
+        [reference, withdrawalId, [...resolvableStatuses]]
+    );
+    if (claimed.rows.length === 0) {
+        return { changed: false, reason: await describeUnclaimable(client, withdrawalId) };
+    }
+    return { changed: true, withdrawal: claimed.rows[0] };
+}
+
+/**
+ * Closes a withdrawal that will not be paid and returns the money to the balance.
+ *
+ * The refund is a positive balance write plus a `refund` ledger row keyed on the
+ * withdrawal, both inside the caller's transaction. The ledger row is what makes a second
+ * refund impossible: the unique key on `(transaction_type, source_id)` turns a repeat
+ * into a conflict, and a conflict is treated as a failure that rolls the whole refund
+ * back rather than as a no-op, because a balance that moved with no matching ledger row
+ * is the unrecoverable version of this bug.
+ *
+ * A `paid` withdrawal is refused outright. Once funds have left, "give the money back" is
+ * not a database operation, and quietly crediting the balance for a payment that really
+ * was made would invent money out of nothing.
+ *
+ * Must be called with a client that already has an open transaction.
+ */
+async function refundWithdrawal(client, withdrawalId, reason) {
+    const settled = await client.query(
+        `SELECT id, user_id, amount, status, provider_reference
+         FROM withdrawals WHERE id = $1 FOR UPDATE`,
+        [withdrawalId]
+    );
+    if (settled.rows.length === 0) {
+        return { changed: false, reason: 'not-found' };
+    }
+    const withdrawal = settled.rows[0];
+    if (settledStatuses.has(withdrawal.status)) {
+        return { changed: false, reason: 'already-paid', withdrawal };
+    }
+    if (terminalStatuses.has(withdrawal.status)) {
+        return { changed: false, reason: 'already-resolved', withdrawal };
+    }
+
+    const failureReason = String(reason || '').trim().slice(0, 500) || 'Withdrawal rejected on review';
+
+    const closed = await client.query(
+        `UPDATE withdrawals
+         SET status = 'failed', failure_reason = $1, updated_at = NOW()
+         WHERE id = $2 AND status = ANY($3)
+         RETURNING id, user_id, amount, status`,
+        [failureReason, withdrawalId, [...resolvableStatuses]]
+    );
+    if (closed.rows.length === 0) {
+        return { changed: false, reason: 'already-resolved', withdrawal };
+    }
+
+    const balanceUpdate = await client.query(
+        'UPDATE users SET balance = balance + $1 WHERE id = $2 RETURNING balance',
+        [withdrawal.amount, withdrawal.user_id]
+    );
+    if (balanceUpdate.rowCount !== 1) {
+        throw new Error(`Withdrawal ${withdrawalId} was closed but user ${withdrawal.user_id} could not be refunded.`);
+    }
+
+    const ledgerInsert = await client.query(
+        `INSERT INTO balance_transactions (user_id, amount, transaction_type, source_id, description)
+         VALUES ($1, $2, 'refund', $3, $4)
+         RETURNING id`,
+        [withdrawal.user_id, withdrawal.amount, refundSourceId(withdrawalId), failureReason]
+    );
+    if (ledgerInsert.rowCount !== 1) {
+        throw new Error(`Withdrawal ${withdrawalId} conflicts with an existing refund ledger entry.`);
+    }
+
+    return {
+        changed: true,
+        withdrawal: closed.rows[0],
+        refunded: withdrawal.amount,
+        balance: balanceUpdate.rows[0].balance
+    };
+}
+
+/**
+ * The ledger source id for a withdrawal refund.
+ *
+ * Keyed on the withdrawal id and nothing else, so the second refund attempt collides with
+ * the first rather than creating a second credit. Exported for the audit tooling and the
+ * tests, which both need to name the same row.
+ */
+function refundSourceId(withdrawalId) {
+    return `withdrawal:${withdrawalId}`;
+}
+
+/**
+ * Why a withdrawal could not be claimed, for the caller's message.
+ *
+ * The row is read rather than inferred because the three cases look identical from the
+ * UPDATE alone, and "already paid" must not be reported as "not found".
+ */
+async function describeUnclaimable(client, withdrawalId) {
+    const current = await client.query('SELECT status FROM withdrawals WHERE id = $1', [withdrawalId]);
+    if (current.rows.length === 0) return 'not-found';
+    return `already-${current.rows[0].status}`;
+}
+
+/**
+ * Runs one withdrawal resolution in its own transaction.
+ *
+ * Both operations above assume a transaction and both make two writes that must agree
+ * with each other, so neither is safe to run outside one. Wrapping them here means the
+ * route and the CLI get the same guarantee rather than each remembering to open one.
+ */
+async function withTransaction(work) {
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const result = await work(client);
+        await client.query('COMMIT');
+        return result;
+    } catch (error) {
+        await client.query('ROLLBACK').catch(() => {});
+        throw error;
+    } finally {
+        client.release();
+    }
+}
+
+/** Sends a withdrawal. `withdrawalId` is coerced so a route param cannot reach SQL as-is. */
+function sendWithdrawal(withdrawalId, providerReference) {
+    return withTransaction((client) => markWithdrawalPaid(client, Number(withdrawalId), providerReference));
+}
+
+/** Closes a withdrawal and refunds the balance. */
+function reverseWithdrawal(withdrawalId, reason) {
+    return withTransaction((client) => refundWithdrawal(client, Number(withdrawalId), reason));
+}
+
+/**
+ * Withdrawals still awaiting a decision, for the operator screen.
+ *
+ * Ordered oldest first on purpose: a request that has been waiting longest is the one a
+ * user is most likely to have chased, and an operator working top-down by recency keeps
+ * deferring the same requests.
+ */
+async function listUnresolvedWithdrawals({ limit = 50 } = {}) {
+    const result = await pool.query(
+        `SELECT w.id, w.user_id, u.email, w.amount, w.payment_method, w.payment_address,
+                w.asset_code, w.network, w.status, w.created_at
+         FROM withdrawals w
+         JOIN users u ON u.id = w.user_id
+         WHERE w.status = ANY($1)
+         ORDER BY w.created_at ASC
+         LIMIT $2`,
+        [[...resolvableStatuses], limit]
+    );
+    return result.rows;
+}
+
+module.exports = {
+    markWithdrawalPaid,
+    refundWithdrawal,
+    sendWithdrawal,
+    reverseWithdrawal,
+    listUnresolvedWithdrawals,
+    refundSourceId,
+    resolvableStatuses,
+    terminalStatuses,
+    settledStatuses
+};

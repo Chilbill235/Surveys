@@ -10,6 +10,7 @@ const app = require('../src/app');
 const pool = require('../src/config/db');
 const { reconcilePendingDeposits } = require('../src/services/depositReconciliation');
 const { creditConfirmedDeposit } = require('../src/services/depositCredit');
+const { markWithdrawalPaid, refundWithdrawal, refundSourceId } = require('../src/services/withdrawalResolution');
 const { resetCryptoDepositOptionsCache } = require('../src/controllers/paymentController');
 const { registerOrExplain } = require('./helpers/register');
 
@@ -385,6 +386,7 @@ test('the IPN log records arrivals and refusals so delivery can be told from rej
     const ipnLog = require('../src/services/ipnLog');
     const priorNowIpn = process.env.NOWPAYMENTS_IPN_SECRET;
     const priorCron = process.env.CRON_SECRET;
+    const priorEnvironment = process.env.NODE_ENV;
     const originalConnect = pool.connect;
     const secret = 'ipn-diagnostics-secret';
     process.env.NOWPAYMENTS_IPN_SECRET = secret;
@@ -449,14 +451,17 @@ test('the IPN log records arrivals and refusals so delivery can be told from rej
         // A wrong secret must not disclose the endpoint in production, where the secret
         // is the only gate. Outside production the gate is loopback, so this asserts the
         // production contract explicitly.
-        const priorEnvironment = process.env.NODE_ENV;
         process.env.NODE_ENV = 'production';
         const denied = await fetch(`${origin}/api/maintenance/ipn-diagnostics?secret=wrong`);
         assert.equal(denied.status, 404);
-        process.env.NODE_ENV = priorEnvironment === undefined ? 'test' : priorEnvironment;
 
         // Outside production the endpoint is reachable from loopback with no secret,
-        // which is the whole point of having it at all.
+        // which is the whole point of having it at all. NODE_ENV is set explicitly for
+        // each half rather than restored from the ambient value in between, because this
+        // project's .env sets it to `production` and a run inherits that: restoring it
+        // after the production check made this assertion test the production gate while
+        // claiming to test the development one.
+        process.env.NODE_ENV = 'test';
         const local = await fetch(`${origin}/api/maintenance/ipn-diagnostics`);
         assert.equal(local.status, 200);
         await local.json();
@@ -471,6 +476,8 @@ test('the IPN log records arrivals and refusals so delivery can be told from rej
     } finally {
         pool.connect = originalConnect;
         ipnLog.reset();
+        if (priorEnvironment === undefined) delete process.env.NODE_ENV;
+        else process.env.NODE_ENV = priorEnvironment;
         if (priorNowIpn === undefined) delete process.env.NOWPAYMENTS_IPN_SECRET;
         else process.env.NOWPAYMENTS_IPN_SECRET = priorNowIpn;
         if (priorCron === undefined) delete process.env.CRON_SECRET;
@@ -1948,5 +1955,232 @@ test('production click tracking requires configured proxy checks', async () => {
         else process.env.PROXYCHECK_KEY = priorProxyKey;
         if (priorJwtSecret === undefined) delete process.env.JWT_SECRET;
         else process.env.JWT_SECRET = priorJwtSecret;
+    }
+});
+
+/**
+ * A withdrawal client that records the writes instead of performing them.
+ *
+ * The refund is two writes that must agree with each other, so the tests need to see both
+ * and to be able to break either one. `failLedger` makes the ledger write conflict, which
+ * is the case where the balance has already moved and has to be rolled back with it.
+ */
+function withdrawalClient({ status = 'pending', amount = '500.00', userId = 3, failLedger = false, balance = 0 } = {}) {
+    const state = { balance, closed: null, ledger: [], paid: null };
+    const client = {
+        state,
+        query: async (query, params = []) => {
+            const normalized = query.replace(/\s+/g, ' ').trim();
+            if (/SELECT id, user_id, amount, status, provider_reference[\s\S]*FROM withdrawals/i.test(normalized)) {
+                if (status === 'missing') return { rows: [] };
+                return { rows: [{ id: params[0], user_id: userId, amount, status, provider_reference: null }] };
+            }
+            if (normalized.startsWith('SELECT status FROM withdrawals')) {
+                return { rows: [{ status }] };
+            }
+            if (/UPDATE withdrawals SET status = 'paid'/i.test(normalized)) {
+                if (status !== 'pending' && status !== 'processing') return { rows: [], rowCount: 0 };
+                state.paid = params[0];
+                return { rows: [{ id: params[1], user_id: userId, amount, status: 'paid' }], rowCount: 1 };
+            }
+            if (/UPDATE withdrawals SET status = 'failed'/i.test(normalized)) {
+                if (status !== 'pending' && status !== 'processing') return { rows: [], rowCount: 0 };
+                state.closed = params[0];
+                return { rows: [{ id: params[1], user_id: userId, amount, status: 'failed' }], rowCount: 1 };
+            }
+            if (normalized.startsWith('UPDATE users SET balance = balance +')) {
+                state.balance += Number(params[0]);
+                return { rows: [{ balance: state.balance }], rowCount: 1 };
+            }
+            if (/INSERT INTO balance_transactions/i.test(normalized)) {
+                if (failLedger) return { rows: [], rowCount: 0 };
+                state.ledger.push(params.slice());
+                return { rows: [{ id: 1 }], rowCount: 1 };
+            }
+            throw new Error(`Unexpected query: ${normalized}`);
+        }
+    };
+    return client;
+}
+
+test('a rejected withdrawal returns the money and records why', async () => {
+    const client = withdrawalClient({ amount: '500.00', balance: 100 });
+
+    const result = await refundWithdrawal(client, 12, 'PayPal account could not be verified');
+
+    assert.equal(result.changed, true);
+    assert.equal(result.refunded, '500.00');
+    // The user had 100 and requested 500, so the refund puts them back at 600: the debit
+    // taken at request time is what the refund reverses.
+    assert.equal(client.state.balance, 600);
+    assert.equal(client.state.closed, 'PayPal account could not be verified');
+    assert.deepEqual(client.state.ledger[0], [3, '500.00', refundSourceId(12), 'PayPal account could not be verified']);
+});
+
+test('a refund that cannot be written to the ledger aborts rather than crediting alone', async () => {
+    const client = withdrawalClient({ failLedger: true });
+
+    await assert.rejects(
+        () => refundWithdrawal(client, 12, 'test'),
+        /conflicts with an existing refund ledger entry/
+    );
+    // The balance write happened first, so the only thing standing between this and a user
+    // credited twice is the throw: the caller's rollback is what undoes it.
+    assert.equal(client.state.balance, 500);
+});
+
+test('a paid withdrawal is never refunded', async () => {
+    const client = withdrawalClient({ status: 'paid' });
+
+    const result = await refundWithdrawal(client, 12, 'too late');
+
+    assert.equal(result.changed, false);
+    assert.equal(result.reason, 'already-paid');
+    assert.equal(client.state.balance, 0);
+    assert.equal(client.state.closed, null);
+});
+
+test('an already-resolved withdrawal is not refunded a second time', async () => {
+    const client = withdrawalClient({ status: 'failed' });
+
+    const result = await refundWithdrawal(client, 12, 'again');
+
+    assert.equal(result.changed, false);
+    assert.equal(result.reason, 'already-resolved');
+    assert.equal(client.state.balance, 0);
+    assert.equal(client.state.ledger.length, 0);
+});
+
+test('refunding a withdrawal that does not exist reports it instead of crediting nobody', async () => {
+    const client = withdrawalClient({ status: 'missing' });
+
+    const result = await refundWithdrawal(client, 999, 'test');
+
+    assert.equal(result.changed, false);
+    assert.equal(result.reason, 'not-found');
+});
+
+test('marking a withdrawal paid requires the reference that proves it', async () => {
+    const client = withdrawalClient();
+
+    const missing = await markWithdrawalPaid(client, 12, '   ');
+    assert.deepEqual(missing, { changed: false, reason: 'missing-reference' });
+
+    const marked = await markWithdrawalPaid(client, 12, 'pp-9f2c');
+    assert.equal(marked.changed, true);
+    assert.equal(marked.withdrawal.status, 'paid');
+    assert.equal(client.state.paid, 'pp-9f2c');
+});
+
+test('a withdrawal already marked paid is not marked paid again', async () => {
+    const client = withdrawalClient({ status: 'paid' });
+
+    const result = await markWithdrawalPaid(client, 12, 'pp-9f2c');
+
+    assert.equal(result.changed, false);
+    assert.equal(result.reason, 'already-paid');
+    assert.equal(client.state.paid, null);
+});
+test('withdrawal review endpoints resolve a request and refuse to do it twice', async () => {
+    const priorEnvironment = process.env.NODE_ENV;
+    const priorSecret = process.env.CRON_SECRET;
+    process.env.NODE_ENV = 'test';
+    process.env.CRON_SECRET = 'withdrawal-cron-secret';
+    const originalConnect = pool.connect;
+
+    let withdrawalStatus = 'pending';
+    let balance = 0;
+    const ledger = [];
+    pool.connect = async () => ({
+        query: async (query, params = []) => {
+            const normalized = query.replace(/\s+/g, ' ').trim();
+            if (/^(BEGIN|COMMIT|ROLLBACK)$/i.test(normalized)) return { rows: [] };
+            if (/SELECT w.id, w.user_id, u.email/.test(normalized)) {
+                return { rows: withdrawalStatus === 'pending'
+                    ? [{ id: 12, user_id: 1, email: 'a@b.test', amount: '500.00', payment_method: 'paypal',
+                        payment_address: 'me@example.test', asset_code: null, network: null, status: withdrawalStatus, created_at: new Date() }]
+                    : [] };
+            }
+            if (/SELECT id, user_id, amount, status, provider_reference/.test(normalized)) {
+                return { rows: [{ id: 12, user_id: 1, amount: '500.00', status: withdrawalStatus, provider_reference: null }] };
+            }
+            if (normalized.startsWith('SELECT status FROM withdrawals')) {
+                return { rows: [{ status: withdrawalStatus }] };
+            }
+            if (/UPDATE withdrawals SET status = 'failed'/.test(normalized)) {
+                const claimed = withdrawalStatus === 'pending' || withdrawalStatus === 'processing';
+                withdrawalStatus = 'failed';
+                return claimed
+                    ? { rows: [{ id: 12, user_id: 1, amount: '500.00', status: 'failed' }], rowCount: 1 }
+                    : { rows: [], rowCount: 0 };
+            }
+            if (normalized.startsWith('UPDATE users SET balance = balance +')) {
+                balance += Number(params[0]);
+                return { rows: [{ balance: String(balance) }], rowCount: 1 };
+            }
+            if (/INSERT INTO balance_transactions/i.test(normalized)) {
+                if (ledger.includes(params[2])) return { rows: [], rowCount: 0 };
+                ledger.push(params[2]);
+                return { rows: [{ id: 1 }], rowCount: 1 };
+            }
+            throw new Error(`Unexpected query: ${normalized}`);
+        },
+        release: () => {}
+    });
+
+    try {
+        const listed = await fetch(`${origin}/api/maintenance/withdrawals?secret=withdrawal-cron-secret`);
+        assert.equal(listed.status, 200);
+        const { withdrawals } = await listed.json();
+        assert.equal(withdrawals.length, 1);
+        assert.equal(withdrawals[0].id, 12);
+
+        // A refund with no reason is refused: the reason is what the user reads in their
+        // withdrawal history, so an unexplained rejection is not a usable outcome.
+        const unexplained = await fetch(`${origin}/api/maintenance/withdrawals/12/refund?secret=withdrawal-cron-secret`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: '{}'
+        });
+        assert.equal(unexplained.status, 400);
+
+        const refunded = await fetch(`${origin}/api/maintenance/withdrawals/12/refund?secret=withdrawal-cron-secret`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ reason: 'PayPal account could not be verified' })
+        });
+        assert.equal(refunded.status, 200);
+        const refundBody = await refunded.json();
+        assert.equal(refundBody.refunded, '500.00');
+        assert.equal(balance, 500);
+        assert.deepEqual(ledger, ['withdrawal:12']);
+
+        // Repeating it must not credit the balance twice, and must not claim success.
+        const repeated = await fetch(`${origin}/api/maintenance/withdrawals/12/refund?secret=withdrawal-cron-secret`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ reason: 'again' })
+        });
+        assert.equal(repeated.status, 409);
+        assert.equal(balance, 500);
+
+        // A paid withdrawal is the one case that must never be reversible here.
+        withdrawalStatus = 'paid';
+        const afterPaid = await fetch(`${origin}/api/maintenance/withdrawals/12/refund?secret=withdrawal-cron-secret`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ reason: 'too late' })
+        });
+        assert.equal(afterPaid.status, 409);
+        assert.equal(balance, 500);
+
+        const wrongSecret = await fetch(`${origin}/api/maintenance/withdrawals/12/paid?secret=wrong`, { method: 'POST' });
+        assert.equal(wrongSecret.status, 403);
+    } finally {
+        pool.connect = originalConnect;
+        if (priorEnvironment === undefined) delete process.env.NODE_ENV;
+        else process.env.NODE_ENV = priorEnvironment;
+        if (priorSecret === undefined) delete process.env.CRON_SECRET;
+        else process.env.CRON_SECRET = priorSecret;
     }
 });

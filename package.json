@@ -8,6 +8,7 @@
     "test": "node --test",
     "migrate": "node scripts/migrate.js",
     "reconcile": "node scripts/reconcile-deposits.js",
+    "audit:balance": "node scripts/audit-balance.js",
     "vercel-build": "node scripts/vercel-build.js",
     "seed:demo": "node scripts/seed-demo-offers.js",
     "check:frontend": "node scripts/check-frontend.js",

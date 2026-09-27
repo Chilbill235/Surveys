@@ -2,12 +2,14 @@ const express = require('express');
 const { timingSafeEqual } = require('node:crypto');
 const router = express.Router();
 const { reconcilePendingDeposits } = require('../services/depositReconciliation');
+const { listUnresolvedWithdrawals, sendWithdrawal, reverseWithdrawal } = require('../services/withdrawalResolution');
 const ipnLog = require('../services/ipnLog');
 const nowPayments = require('../services/nowPayments');
 const { resolvePublicBaseUrl, isPubliclyReachable } = require('../services/publicBaseUrl');
 
 const routePath = '/api/maintenance/reconcile-deposits';
 const ipnDiagnosticsPath = '/api/maintenance/ipn-diagnostics';
+const withdrawalsPath = '/api/maintenance/withdrawals';
 
 /** True when the request came from this machine. */
 function isLoopbackRequest(req) {
@@ -162,8 +164,110 @@ function handleIpnDiagnostics(req, res) {
 router.get(ipnDiagnosticsPath, handleIpnDiagnostics);
 router.post(ipnDiagnosticsPath, handleIpnDiagnostics);
 
+
+/**
+ * Withdrawal review: the operator side of a request the user has already been charged for.
+ *
+ * The balance is debited the moment a withdrawal is requested, so a request that is never
+ * resolved -- rejected, or actually sent to the destination -- leaves the user short by
+ * that amount and the row sitting in `pending` forever. Before these endpoints existed the
+ * only way out was to edit the table by hand, which is how a withdrawal ends up marked
+ * `failed` with the money still debited: the status says one thing and the ledger another,
+ * and nothing in the app can detect or repair it.
+ *
+ * Both actions are single-shot and order-dependent, and the state they act on is the only
+ * record that the money moved, so a repeat is reported rather than repeated. `409` is used
+ * for "already in a state that cannot move" because the request was understood and the
+ * answer is genuinely about the current state, and a `200` there would read as success.
+ */
+const withdrawalIdPattern = /^\d+$/;
+
+function withdrawalId(req) {
+    const id = String(req.params.id || '');
+    return withdrawalIdPattern.test(id) ? id : null;
+}
+
+async function handleListWithdrawals(req, res) {
+    if (!enforceAccess(req, res)) return;
+    try {
+        return res.json({ ok: true, withdrawals: await listUnresolvedWithdrawals() });
+    } catch (error) {
+        console.error('Could not list withdrawals:', error.message);
+        return res.status(500).json({ ok: false, error: 'Could not list withdrawals.' });
+    }
+}
+
+/** Maps the service's refusal reasons onto a status and a message an operator can act on. */
+function describeRefusal(result) {
+    if (result.reason === 'not-found') {
+        return { status: 404, error: 'No such withdrawal.' };
+    }
+    if (result.reason === 'already-paid') {
+        return { status: 409, error: 'That withdrawal is already marked as paid; it cannot be reversed here.' };
+    }
+    if (result.reason === 'missing-reference') {
+        return { status: 400, error: 'A provider reference is required to mark a withdrawal as paid.' };
+    }
+    if (result.reason === 'reference-too-long') {
+        return { status: 400, error: 'That provider reference is too long.' };
+    }
+    return {
+        status: 409,
+        error: `That withdrawal is already ${String(result.reason).replace(/^already-/, '')}.`
+    };
+}
+
+async function handleMarkPaid(req, res) {
+    if (!enforceAccess(req, res)) return;
+    const id = withdrawalId(req);
+    if (!id) return res.status(404).json({ error: 'No such withdrawal.' });
+
+    try {
+        const result = await sendWithdrawal(id, req.body?.providerReference);
+        if (!result.changed) {
+            const refusal = describeRefusal(result);
+            return res.status(refusal.status).json({ ok: false, error: refusal.error });
+        }
+        return res.json({ ok: true, withdrawal: result.withdrawal });
+    } catch (error) {
+        console.error(`Could not mark withdrawal ${id} paid:`, error.message);
+        return res.status(500).json({ ok: false, error: 'Could not update the withdrawal.' });
+    }
+}
+
+async function handleRefund(req, res) {
+    if (!enforceAccess(req, res)) return;
+    const id = withdrawalId(req);
+    if (!id) return res.status(404).json({ error: 'No such withdrawal.' });
+
+    const reason = String(req.body?.reason || '').trim();
+    if (!reason) {
+        // The reason is written to the user's withdrawal history, so it is required rather
+        // than defaulted: "rejected" with no explanation is the version that generates a
+        // support ticket.
+        return res.status(400).json({ ok: false, error: 'A reason is required so the user can see why.' });
+    }
+
+    try {
+        const result = await reverseWithdrawal(id, reason);
+        if (!result.changed) {
+            const refusal = describeRefusal(result);
+            return res.status(refusal.status).json({ ok: false, error: refusal.error });
+        }
+        return res.json({ ok: true, withdrawal: result.withdrawal, refunded: result.refunded, balance: result.balance });
+    } catch (error) {
+        console.error(`Could not refund withdrawal ${id}:`, error.message);
+        return res.status(500).json({ ok: false, error: 'Could not refund the withdrawal.' });
+    }
+}
+
+router.get(withdrawalsPath, handleListWithdrawals);
+router.post(`${withdrawalsPath}/:id/paid`, handleMarkPaid);
+router.post(`${withdrawalsPath}/:id/refund`, handleRefund);
+
 module.exports = router;
 module.exports.routePath = routePath;
 module.exports.ipnDiagnosticsPath = ipnDiagnosticsPath;
+module.exports.withdrawalsPath = withdrawalsPath;
 module.exports.secretsMatch = secretsMatch;
 module.exports.callerAllowed = callerAllowed;
