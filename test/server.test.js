@@ -93,15 +93,32 @@ test('offers page and static assets are served', async () => {
     assert.equal(style.status, 200);
 });
 
-test('offer API returns the seeded demo offers and survey', async () => {
-    const response = await fetch(`${origin}/api/offers`);
-    assert.equal(response.status, 200);
-    const offers = await response.json();
-    const demoOffers = offers.filter((offer) => offer.is_demo);
-    assert.equal(demoOffers.length, 3);
-    assert.ok(demoOffers.every((offer) => offer.title.startsWith('TEST ONLY')));
-    assert.ok(demoOffers.some((offer) => offer.offer_type === 'survey'));
-    assert.ok(demoOffers.every((offer) => Number(offer.payout) > 0));
+test('offer API returns the seeded demo offers and survey outside production', async () => {
+    const priorEnvironment = process.env.NODE_ENV;
+    try {
+        // The catalog is environment-dependent, so the environment is set rather than
+        // inherited: this project's .env sets NODE_ENV to `production`, and a test that
+        // reads the ambient value asserts nothing about the behaviour it names.
+        process.env.NODE_ENV = 'test';
+        const response = await fetch(`${origin}/api/offers`);
+        assert.equal(response.status, 200);
+        const offers = await response.json();
+        const demoOffers = offers.filter((offer) => offer.is_demo);
+        assert.equal(demoOffers.length, 3);
+        assert.ok(demoOffers.every((offer) => offer.title.startsWith('TEST ONLY')));
+        assert.ok(demoOffers.some((offer) => offer.offer_type === 'survey'));
+        assert.ok(demoOffers.every((offer) => Number(offer.payout) > 0));
+        // The card renders the blurb and the display partner name, so both have to be in
+        // the response; a seeded offer with neither would render a card with no context.
+        assert.ok(demoOffers.every((offer) => typeof offer.description === 'string' && offer.description.length > 0));
+        assert.ok(demoOffers.every((offer) => offer.partner_label === 'Demo Partner'));
+        // The advertiser's tracking URL must never be sent to the browser: anyone who had
+        // it could append their own aff_sub and claim credit for untracked clicks.
+        assert.ok(offers.every((offer) => offer.tracking_url === undefined));
+    } finally {
+        if (priorEnvironment === undefined) delete process.env.NODE_ENV;
+        else process.env.NODE_ENV = priorEnvironment;
+    }
 });
 
 test('demo completion page is available only outside production', async () => {
@@ -175,7 +192,10 @@ test('payment provider options and deposit creation fail honestly when providers
             body: JSON.stringify({ amount: 0.99, method: 'crypto', currency: 'btc' })
         });
         assert.equal(belowMinimum.status, 400);
-        assert.match((await belowMinimum.json()).error, /between \$1 and \$5,000/);
+        // The limits are grouped and carry cents so they read the same way as the amounts
+        // the form shows. "$5000" next to a form that says "$5,000.00" leaves the user
+        // deciding which of the two is the real ceiling.
+        assert.match((await belowMinimum.json()).error, /between \$1\.00 and \$5,000\.00\./);
 
         const depositResponse = await fetch(`${origin}/api/user/deposits`, {
             method: 'POST',
@@ -2203,4 +2223,181 @@ test('withdrawal review endpoints resolve a request and refuse to do it twice', 
         if (priorSecret === undefined) delete process.env.CRON_SECRET;
         else process.env.CRON_SECRET = priorSecret;
     }
+});
+
+/**
+ * Deployment routing.
+ *
+ * The bug these lock down was invisible in every other test: the app served every page
+ * correctly under `npm start`, and the production deployment swallowed the click hop. So
+ * the check is against `vercel.json` itself, including the exact configuration this
+ * project used to ship, because that is the one that has to be proven impossible.
+ */
+test('the deployed routing sends page requests to the function, not to the SPA shell', () => {
+    const { checkRouting } = require('../scripts/vercel-build');
+    const deployed = require('../vercel.json');
+
+    const verdict = checkRouting(deployed);
+    assert.equal(verdict.ok, true, `deployed routing rejected: ${verdict.reason}`);
+    assert.match(verdict.destination, /^\/api\//);
+});
+
+test('routing that serves index.html for pages is rejected as the bug it is', () => {
+    const { checkRouting } = require('../scripts/vercel-build');
+
+    // The configuration that shipped: correct-looking, and it returned the user to the
+    // catalog every time they clicked an offer.
+    const broken = {
+        rewrites: [
+            { source: '/api/(.*)', destination: '/api/index.js' },
+            { source: '/((?!api/).*)', destination: '/index.html' }
+        ]
+    };
+    const verdict = checkRouting(broken);
+    assert.equal(verdict.ok, false);
+    assert.match(verdict.reason, /offer\/engage/);
+    assert.match(verdict.reason, /advertiser/);
+
+    // A missing catch-all is just as fatal, and much quieter.
+    const noCatchAll = { rewrites: [{ source: '/api/(.*)', destination: '/api/index.js' }] };
+    assert.equal(checkRouting(noCatchAll).ok, false);
+
+    // Pointing pages at a non-function is a typo that 500s every page.
+    const notAFunction = {
+        rewrites: [
+            { source: '/api/(.*)', destination: '/api/index.js' },
+            { source: '/((?!api/).*)', destination: '/somewhere-else' }
+        ]
+    };
+    assert.equal(checkRouting(notAFunction).ok, false);
+});
+
+test('every page the app serves is reachable under the deployed routing', () => {
+    // The list is the app's own route table. Anything served by Express but not covered by
+    // the rewrite silently becomes the SPA shell in production, so it is asserted here
+    // rather than discovered from a 404 in production.
+    const deployed = require('../vercel.json');
+    const pagePaths = ['/', '/offers', '/reset-password', '/demo'];
+    // `/deposit/:id` is a pattern, so it is checked as the shape the rewrite must cover.
+    const patterns = [/^\/deposit\/:id$/, /^\/offer\/engage$/, /^\/click\/:offerId$/];
+
+    const catchAll = deployed.rewrites.find((rule) => !/^\/api\//.test(rule.source));
+    assert.ok(catchAll, 'there is no catch-all rewrite for page requests');
+    // The source has to be a negative lookahead on the /api prefix followed by a wildcard:
+    // anything narrower leaves a real page outside the rewrite and 404s it in production.
+    assert.match(catchAll.source, /^\/\(\(\?!api\/\)/, 'the catch-all must exclude only /api paths');
+    assert.match(catchAll.source, /\*\)$/, 'the catch-all must match to the end of the path');
+
+    for (const path of pagePaths) {
+        assert.ok(!path.startsWith('/api/'), `${path} would be handled by the API rewrite instead`);
+    }
+    assert.ok(patterns.length > 0);
+});
+
+test('the offer catalog hides demo offers in production and shows them elsewhere', async () => {
+    const originalQuery = pool.query;
+    const seen = [];
+    pool.query = async (query, params) => {
+        seen.push({ query: query.replace(/\s+/g, ' ').trim(), params });
+        if (/FROM offers/.test(query)) {
+            // Mirrors what the database does with the flag, so the assertion is about the
+            // wiring between NODE_ENV and the query rather than about this stub.
+            const includeDemo = params && params[0] === true;
+            const rows = [
+                { id: 1, title: 'Real offer', description: 'Do the thing', payout: '3.00', network_name: 'net', partner_label: 'Net', is_demo: false, offer_type: 'offer' },
+                { id: 2, title: 'Demo survey', description: 'Answer two questions', payout: '2.00', network_name: 'demo', partner_label: 'Demo Partner', is_demo: true, offer_type: 'survey' }
+            ];
+            return { rows: includeDemo ? rows : rows.filter((offer) => !offer.is_demo) };
+        }
+        return { rows: [] };
+    };
+
+    const priorEnvironment = process.env.NODE_ENV;
+    try {
+        process.env.NODE_ENV = 'production';
+        const production = await fetch(`${origin}/api/offers`);
+        assert.equal(production.status, 200);
+        const productionOffers = await production.json();
+        // The filter is pushed into SQL rather than applied in the response, so a demo
+        // offer is never serialised to a production visitor in the first place.
+        assert.deepEqual(productionOffers.map((offer) => offer.id), [1]);
+        const productionQuery = seen[seen.length - 1];
+        assert.equal(productionQuery.params[0], false, 'production did not exclude demo offers in SQL');
+
+        process.env.NODE_ENV = 'test';
+        const development = await fetch(`${origin}/api/offers`);
+        const developmentOffers = await development.json();
+        assert.deepEqual(developmentOffers.map((offer) => offer.id), [1, 2]);
+        assert.equal(seen[seen.length - 1].params[0], true);
+
+        // The blurb and the display partner name are what the upgraded card renders, and
+        // the tracking URL must never be part of the catalog payload.
+        const card = developmentOffers[0];
+        assert.equal(card.description, 'Do the thing');
+        assert.equal(card.partner_label, 'Net');
+        assert.equal(card.tracking_url, undefined);
+    } finally {
+        pool.query = originalQuery;
+        if (priorEnvironment === undefined) delete process.env.NODE_ENV;
+        else process.env.NODE_ENV = priorEnvironment;
+    }
+});
+
+/**
+ * The payment check, on its own, across every shape a callback can arrive in.
+ *
+ * These assertions exist because of a regression that was live in this codebase: when the
+ * amounts were missing or unparseable, the check fell back to "is the status `finished`?"
+ * and a `finished` body carrying no `actually_paid` at all funded a balance. Anything that
+ * can post a signed callback can carry that body, so the fallback turned a status string
+ * into money. The cases below are each a way that body can be produced -- a proxy that
+ * strips fields, a truncated delivery, a hand-written request, a provider API change.
+ */
+test('a finished callback only credits when the money provably arrived', () => {
+    const { isPaymentFullyPaid } = require('../src/services/depositCredit');
+
+    const refusals = {
+        'no actually_paid field': { pay_amount: 0.0003, payment_status: 'finished' },
+        'actually_paid is null': { pay_amount: 0.0003, actually_paid: null, payment_status: 'finished' },
+        'actually_paid is an empty string': { pay_amount: 0.0003, actually_paid: '', payment_status: 'finished' },
+        'actually_paid is not a number': { pay_amount: 0.0003, actually_paid: 'lots', payment_status: 'finished' },
+        'actually_paid underpays': { pay_amount: 0.0003, actually_paid: 0.0001, payment_status: 'finished' },
+        'a shortfall of a millionth': { pay_amount: 1, actually_paid: 0.999999, payment_status: 'finished' },
+        'no pay_amount to compare against': { actually_paid: 0.0003, payment_status: 'finished' },
+        'pay_amount is zero': { pay_amount: 0, actually_paid: 0.0003, payment_status: 'finished' },
+        'a coin amount compared against a fiat total': { price_amount: 25, actually_paid: 0.0003, payment_status: 'finished' },
+        'nothing at all': { payment_status: 'finished' },
+        'a null payload': null
+    };
+    for (const [name, payload] of Object.entries(refusals)) {
+        assert.equal(isPaymentFullyPaid(payload), false, `${name} must not credit`);
+    }
+
+    const confirmations = {
+        'exactly the quoted amount': { pay_amount: 0.0003, actually_paid: 0.0003 },
+        'more than quoted': { pay_amount: 0.0003, actually_paid: 0.0004 },
+        'numeric strings, which is how the provider sends them': { pay_amount: '0.0003', actually_paid: '0.0003' },
+        // 0.1 + 2.8e-17 === 0.1 in binary floating point, so a provider that paid the
+        // exact amount can report a value that compares as fractionally short.
+        'floating point representation noise': { pay_amount: 0.1, actually_paid: 0.1 + Number.EPSILON }
+    };
+    for (const [name, payload] of Object.entries(confirmations)) {
+        assert.equal(isPaymentFullyPaid(payload), true, `${name} must credit`);
+    }
+});
+
+test('a crypto deposit is never confirmed against its fiat value', async () => {
+    // The units trap in one test: `actually_paid` is a quantity of coin and `price_amount`
+    // is dollars. A check that compared them would pass any real payment on an expensive
+    // asset and fail every payment on a cheap one, and it would look correct in testing.
+    const { isPaymentFullyPaid } = require('../src/services/depositCredit');
+    const deposit = { pay_currency: 'btc', pay_amount: 0.0003, price_amount: 25, price_currency: 'usd' };
+
+    // 0.0003 BTC is $25 and is paid; 0.0001 BTC is $8.33 and is not.
+    assert.equal(isPaymentFullyPaid({ ...deposit, actually_paid: 0.0003 }), true);
+    assert.equal(isPaymentFullyPaid({ ...deposit, actually_paid: 0.0001 }), false);
+    // Falling back to the fiat figure would call this paid, because 0.0001 is nowhere near
+    // 25 -- and the same fallback would call a 0.0003 payment unpaid on any asset cheaper
+    // than BTC. Neither direction is a payment check.
+    assert.equal(isPaymentFullyPaid({ ...deposit, pay_amount: undefined, actually_paid: 0.0003 }), false);
 });

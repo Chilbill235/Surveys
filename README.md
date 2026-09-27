@@ -22,12 +22,61 @@ on Vercel and reached at a real public URL instead of localhost.
      `checkout.session.completed` and `checkout.session.async_payment_succeeded`.
    - NOWPayments IPN: the app sends `https://<your-domain>/api/payments/nowpayments/ipn`
      as `ipn_callback_url`.
-6. Add a `CRON_SECRET` variable. `vercel.json` schedules a job every 6 hours that
-   re-checks pending deposits against the provider and credits any the provider
-   reports as finished, so one lost webhook cannot strand funds.
+6. Add a `CRON_SECRET` variable. `vercel.json` schedules a job that re-checks pending
+   deposits against the provider and credits any the provider reports as finished, so one
+   lost webhook cannot strand funds. The schedule is daily, which every plan allows; a
+   sub-daily schedule (`0 */6 * * *`) is rejected outright on Hobby and fails the deploy.
 
 `TRUST_PROXY` defaults to `true` on Vercel so per-IP rate limiting sees the real
 client address from `X-Forwarded-For`.
+
+### How requests are routed
+
+`vercel.json` is where this app most easily breaks, because every page and the click
+tracking hop are served by the function, not by static files.
+
+| Request | Handled by |
+| --- | --- |
+| `/api/**` | the function (`api/index.js` -> `src/app.js`) |
+| `/style.css`, `/*.js`, `/*.html` | Vercel's static files, served before any rewrite |
+| `/`, `/offers`, `/reset-password`, `/deposit/:id`, `/demo` | the function, which picks the right page |
+| **`/offer/engage`** | the function — this is the redirect to the advertiser |
+| everything else | the function, which answers 404 |
+
+The rewrite is `/((?!api/).*)` -> `/api/index.js`. It must **not** point at `index.html`.
+
+That is the single highest-impact mistake available in this file, and it was the one that
+shipped. Rewriting every non-API path to `index.html` is the standard SPA configuration and
+it looks completely reasonable, but `/offer/engage` is not under `/api` — so the advertiser
+redirect was swallowed, every user who clicked an offer landed back on the offers page, and
+nothing anywhere reported an error. The same rewrite also broke `/` (the home page became
+the catalog), `/reset-password` (password reset could never load its form), and
+`/deposit/:id` (no receipt). The tests could not catch it, because under `npm start` Express
+serves all of them correctly and `vercel.json` is not consulted.
+
+`npm run vercel-build` now parses `vercel.json` and fails the build if the catch-all points
+at `index.html`, is missing, or does not target a function. `test/server.test.js` asserts
+the same rule against the configuration that actually ships, and against the broken one.
+
+Static assets are served by the CDN because Vercel checks the filesystem before applying
+`rewrites`, so the function only handles requests that are genuinely not files.
+
+### The Content-Security-Policy
+
+It is set in `vercel.json` rather than in Express, so it also covers the files Vercel serves
+from its own CDN — those never reach the application. `src/app.js` therefore runs helmet
+with `contentSecurityPolicy: false`, and with `frameguard: false`:
+
+- `frame-ancestors 'self' https:` allows embedding over https, and `X-Frame-Options:
+  SAMEORIGIN` (helmet's default) would silently block that while appearing to be a security
+  improvement. It also cannot express "any https origin" at all, so `frame-ancestors` is
+  the only control that means what it says.
+- `script-src 'self'` is accurate: every page loads an external script and there are no
+  inline scripts, inline event handlers, or `eval` anywhere in `public/`. `check:frontend`
+  fails the build if that stops being true.
+- `style-src 'self' 'unsafe-inline'` is required because the deposit QR and the staggered
+  card animation set CSS custom properties through CSSOM.
+
 
 ## Environment variables
 
@@ -94,6 +143,17 @@ A balance is credited **only** after a provider confirms the payment, and only o
 - **Only the provider's terminal success state credits a balance.** For NOWPayments that
   is `finished`; the IPN and the reconciler share one status table so a deposit cannot be
   credited by one path while the other would still have refused it.
+- **A terminal status is a claim, not evidence.** A `finished` callback also has to report
+  `actually_paid` covering `pay_amount` — the amount the customer was quoted — before the
+  credit happens. Either field missing means the confirmation cannot be established, and
+  the callback is refused rather than credited on the strength of its status string. This
+  matters more than it looks: the check once fell back to "trust `finished` when the
+  numbers are missing", which meant any `finished` body with no `actually_paid` funded a
+  balance, and a truncated or hand-written callback is exactly what that produces. The
+  comparison is against `pay_amount` and never against `price_amount`, because
+  `actually_paid` is a quantity of coin and `price_amount` is dollars; comparing them is a
+  units error whose verdict changes with the price of the asset. The tolerance is
+  relative, so it absorbs floating-point noise without accepting a real shortfall.
 - `npm run reconcile` re-checks pending deposits against the provider API and credits
   those reported as finished: `npm run reconcile`, `npm run reconcile -- --deposit=15`,
   or `npm run reconcile -- --limit=50`. It covers **both** providers: a card deposit is
@@ -224,6 +284,29 @@ Two schema rules make most of those checks structural rather than hopeful:
   the rows that explain `balance`. Without it, "my balance equals the sum of my ledger" is
   false by construction and cannot be checked.
 
+## The catalog
+
+`GET /api/offers` is the whole product surface for a first-time visitor, and it answers with
+`id, title, description, payout, network_name, partner_label, is_demo, offer_type`.
+
+- **Demo offers are excluded in production, in SQL.** Every demo offer is a dead end
+  otherwise: a demo click redirects to `/demo`, which is 404 in production. Serving them
+  meant production advertised "Take survey" cards that could only ever lead to a 404.
+- **`tracking_url` is never sent.** With it, anyone could append their own `aff_sub` to the
+  advertiser and claim credit for clicks that were never recorded — which is the entire
+  reason for the `/offer/engage` hop.
+- **Cards are filterable and searchable.** Type chips (All / Offers / Surveys) narrow the
+  list, and search covers the title, blurb, partner, and keywords — searching the title alone
+  found nothing for a partner name that was visible on screen. The count reads "0 of 12
+  offers" when a filter is hiding things, because "0 offers" on a list of twelve reads as an
+  outage, and the empty state offers a reset.
+- The response is short-cached (`max-age=30, stale-while-revalidate=60`) in `vercel.json`.
+  These rows are public, change rarely, and are identical for every visitor.
+
+`offers.description` and `offers.partner_label` were added in migration `008` for the card.
+`network_name` is the advertiser's tracking identifier, which reads as noise on a card, so it
+is displayed only as a fallback.
+
 ## Front end
 
 The stylesheet is a single design system in `public/style.css`, ordered tokens → base →
@@ -286,6 +369,15 @@ TEST_DATABASE_URL=postgresql://user:pass@host/testdb npm test
 ```
 
 Run the live suite against a disposable database only.
+
+`npm run smoke` is the one command that exercises the real wiring rather than stubs: it
+boots the app and requests every page the deployment is supposed to serve, the catalog, the
+full click hop through to the advertiser, the demo redirect, and an unsigned webhook. It
+exists because the routing bug above was invisible to every other check — Express serves all
+of those paths correctly, so only a real request against the real routes can tell that a
+rewrite is swallowing one. It registers an account to make the click hop, and deletes it
+afterwards. It needs a reachable database, and it points `APP_BASE_URL` at its own port, so
+give it a free one (`PORT=3311 npm run smoke`).
 
 ## Static checks
 

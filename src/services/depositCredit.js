@@ -26,29 +26,49 @@ const knownProviderStatuses = new Set(
 
 /**
  * Whether the provider reports the customer as having sent the full amount.
- * Handles string numbers, floating point precision edge cases, and missing fields.
+ *
+ * `payment_status: finished` is the provider's documented terminal success state, and it is
+ * the only status that reaches this function. It is still not evidence on its own: the
+ * provider sets it, and anything that can post a signed callback can carry it, so the credit
+ * has to rest on the money having actually arrived.
+ *
+ * Two fields are required, and the absence of either is a refusal rather than a pass:
+ *
+ *  - `actually_paid`, what the provider says arrived, and
+ *  - `pay_amount`, the amount the customer was quoted when the payment was created.
+ *
+ * The comparison is against `pay_amount` and never against `price_amount`. `price_amount`
+ * is the fiat value of the deposit; `actually_paid` is a quantity of coin. Comparing a coin
+ * amount to a fiat number is a units error that either always passes or always fails
+ * depending on the exchange rate, and a check whose verdict depends on the price of the
+ * asset is not a check.
+ *
+ * An earlier version of this function fell back to "if the numbers are missing or
+ * unparseable, trust the status string". That made every malformed or partial callback a
+ * credit: a `finished` body with no `actually_paid` at all -- exactly what a misconfigured
+ * proxy, a truncated delivery, or a hand-rolled request produces -- passed the check and
+ * funded a balance. A missing field is not evidence of payment, so it is refused. The cost
+ * of refusing is a delay: reconciliation re-asks the provider on its next sweep, and
+ * a payment that really did finish is credited then.
+ *
+ * The tolerance is relative, because crypto amounts span many orders of magnitude and a
+ * fixed epsilon is either noise on a large amount or a real underpayment on a small one.
  */
 function isPaymentFullyPaid(payload) {
     if (!payload) return false;
 
-    const actuallyPaid = parseFloat(payload.actually_paid);
-    const payAmount = parseFloat(payload.pay_amount);
-    const priceAmount = parseFloat(payload.price_amount);
-    const outcomeAmount = parseFloat(payload.outcome_amount);
+    const actuallyPaid = Number(payload.actually_paid);
+    const payAmount = Number(payload.pay_amount);
 
-    // Pick the most relevant target payment amount
-    const targetAmount = !isNaN(payAmount) && payAmount > 0 
-        ? payAmount 
-        : (!isNaN(priceAmount) && priceAmount > 0 ? priceAmount : outcomeAmount);
-
-    // If numerical payment numbers are missing or zero, fallback to checking payment status directly
-    if (isNaN(actuallyPaid) || isNaN(targetAmount) || targetAmount <= 0) {
-        const status = String(payload.payment_status || '').toLowerCase();
-        return status === 'finished';
+    if (!Number.isFinite(actuallyPaid) || !Number.isFinite(payAmount) || payAmount <= 0) {
+        return false;
     }
 
-    // Allow a small absolute tolerance (0.00001) for crypto precision differences
-    return actuallyPaid + 0.00001 >= targetAmount;
+    // Only enough slack to absorb binary floating point representation error, which is the
+    // one case where a provider that paid the exact quoted amount can still report a hair
+    // under. Anything beyond that is a real shortfall and must not be credited.
+    const tolerance = Math.max(1e-12, payAmount * 1e-9);
+    return actuallyPaid + tolerance >= payAmount;
 }
 
 /**

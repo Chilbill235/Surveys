@@ -6,134 +6,244 @@ const pool = require('../config/db');
 const paymentController = require('../controllers/paymentController');
 const { rateLimitByIp } = require('../services/security');
 
-// All routes here require a valid JWT token
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/**
+ * Page size for the two history endpoints. Extracted because the receipt page
+ * and the history page must agree on it: a user who sees "20 most recent" in
+ * the UI and then cannot find an older row in the receipt lookup is reporting
+ * the same bug from two directions.
+ */
+const HISTORY_PAGE_SIZE = 20;
+
+/**
+ * A Postgres BIGINT holds up to 19 digits. A longer numeric string is not a
+ * valid id, so it does not need to reach the database at all.
+ */
+const RECORD_ID_PATTERN = /^\d{1,19}$/;
+
+/**
+ * The `source_id` prefix used when a withdrawal refund is written to the
+ * ledger. It must match the value the withdrawal service writes, because the
+ * history query joins on it: if the two drift, a refunded withdrawal silently
+ * shows no `refunded_at`, which is the exact "the money came back and I cannot
+ * see it" question this join was added to answer.
+ */
+const WITHDRAWAL_REFUND_SOURCE_PREFIX = 'withdrawal:';
+
+/**
+ * Postgres / network error codes that mean "the database is not reachable", as
+ * opposed to "the query was wrong". Classified in one place so every handler
+ * on this router returns the same status for the same underlying problem, and
+ * so it matches the classification the auth router already makes.
+ */
+const DB_UNREACHABLE_CODES = new Set([
+    'ECONNREFUSED', 'ENOTFOUND', 'ETIMEDOUT', 'EHOSTUNREACH', 'EAI_AGAIN',
+]);
+
+/**
+ * The rate limit applied to the two routes that spend money: a deposit
+ * creation and a withdrawal request.
+ *
+ * The name reflects that both routes are financial mutations, not just
+ * deposits: the previous `depositLimit` name was applied to `/withdraw` as
+ * well, which is the kind of mismatch that leads to one of the two being
+ * dropped in a refactor because it "looks like the wrong limiter."
+ *
+ * The limiter keys on IP because that is what the shared service does. The
+ * trade-off is that a shared NAT shares the budget; the alternative (keying on
+ * `req.user.id`, which IS available here because `requireAuth` runs first) is
+ * more precise and worth switching to if the service gains a user-keyed form.
+ * That is a change to `services/security`, so it is left as a note rather than
+ * done silently here.
+ */
+const financialMutationLimit = rateLimitByIp({
+    name: 'financial-mutation',
+    maxAttempts: 10,
+    windowSeconds: 15 * 60,
+});
+
+// ---------------------------------------------------------------------------
+// Middleware
+// ---------------------------------------------------------------------------
+
+// Every route on this router requires a valid JWT. Registered before any
+// handler so a future route added below is authenticated by default rather
+// than by remembering to add the middleware.
 router.use(requireAuth);
 
-// Creating a deposit calls a paid third-party API and writes a row for every attempt.
-// Unthrottled, one client could drive a large volume of provider requests and leave a
-// trail of unusable deposit rows, so it carries the same per-IP limit as the auth
-// endpoints. The limiter runs after `requireAuth`, so only the address is available to
-// key on; that is the same trade-off the login limiter already makes.
-const depositLimit = rateLimitByIp({ name: 'create-deposit', maxAttempts: 10, windowSeconds: 15 * 60 });
+/**
+ * Marks a response as per-user and uncacheable.
+ *
+ * Every route on this router returns account-specific data: balances,
+ * withdrawal history, deposit history, one user's deposit by id. A shared
+ * cache or a browser's back/forward cache serving one user another's history
+ * is the kind of incident that turns a support ticket into a security report.
+ */
+router.use((req, res, next) => {
+    res.set('Cache-Control', 'no-store');
+    next();
+});
+
+// ---------------------------------------------------------------------------
+// Response helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Adds the link a confirmed deposit can be viewed at.
+ *
+ * Built from the request's own origin rather than a configured base URL,
+ * because the receipt is a link the current user follows right now, in this
+ * browser. A stored APP_BASE_URL is what provider callbacks are built from,
+ * which is a different question and can legitimately be a tunnel while the
+ * user is on localhost.
+ */
+function withReceiptUrl(deposit) {
+    return { ...deposit, receipt_url: `/deposit/${deposit.id}` };
+}
+
+/** Classifies a database error so the same cause always produces the same status. */
+function sendDatabaseFailure(res, logPrefix, error) {
+    console.error(`${logPrefix}:`, pool.describeError ? pool.describeError(error) : error.message);
+    if (DB_UNREACHABLE_CODES.has(error?.code)) {
+        return res.status(503).json({ error: 'This service is temporarily unavailable.' });
+    }
+    return res.status(500).json({ error: 'Internal server error.' });
+}
+
+// ---------------------------------------------------------------------------
+// Account state
+// ---------------------------------------------------------------------------
 
 router.get('/balance', async (req, res) => {
-	try {
-		const result = await pool.query(
-			'SELECT balance, demo_balance FROM users WHERE id = $1',
-			[req.user.id]
-		);
-		if (result.rows.length === 0) {
-			return res.status(404).json({ error: 'User not found.' });
-		}
-		return res.json({
-			balance: result.rows[0].balance,
-			demoBalance: result.rows[0].demo_balance
-		});
-	} catch (error) {
-		console.error('Balance Error:', error.message);
-		return res.status(500).json({ error: 'Failed to load balance.' });
-	}
+    try {
+        const result = await pool.query(
+            'SELECT balance, demo_balance FROM users WHERE id = $1',
+            [req.user.id]
+        );
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'User not found.' });
+        }
+        // Returned as-is: the columns are NUMERIC and `node-postgres` hands them
+        // back as strings precisely to avoid float precision loss. Coercing to
+        // Number here would quietly round a balance that a wallet expects to be
+        // exact, so the string form is preserved. A client that needs a number
+        // should parse at the edge of its own arithmetic, not here.
+        return res.json({
+            balance: result.rows[0].balance,
+            demoBalance: result.rows[0].demo_balance,
+        });
+    } catch (error) {
+        return sendDatabaseFailure(res, 'Balance Error', error);
+    }
 });
+
+// ---------------------------------------------------------------------------
+// Withdrawal history
+// ---------------------------------------------------------------------------
 
 router.get('/withdrawals', async (req, res) => {
-	try {
-		// The destination is included so the user can confirm a request was recorded
-		// against the address they intended, which is the mistake that is hardest to
-		// reverse once an operator has paid it.
-		//
-		// `failure_reason` and `refunded_at` are included because a rejected withdrawal has
-		// the money returned to the balance, and a refund the user cannot account for is the
-		// same support question as a withdrawal that never arrived. Whether a refund
-		// actually happened is read from the ledger rather than inferred from the status:
-		// a row edited outside the app can say `failed` with no refund behind it, and
-		// telling the user it was returned in that case would be a lie about their money.
-		const result = await pool.query(
-			`SELECT w.id, w.amount, w.payment_method, w.payment_address, w.asset_code, w.network,
-			        w.status, w.failure_reason, w.created_at, w.paid_at,
-			        r.created_at AS refunded_at
-			 FROM withdrawals w
-			 LEFT JOIN balance_transactions r
-			        ON r.transaction_type = 'refund'
-			        AND r.source_id = 'withdrawal:' || w.id::TEXT
-			        AND r.user_id = w.user_id
-			 WHERE w.user_id = $1
-			 ORDER BY w.created_at DESC
-			 LIMIT 20`,
-			[req.user.id]
-		);
-		return res.json(result.rows);
-	} catch (error) {
-		console.error('Withdrawal history error:', error.message);
-		return res.status(500).json({ error: 'Failed to load withdrawal history.' });
-	}
+    try {
+        // The destination is included so the user can confirm a request was
+        // recorded against the address they intended, which is the mistake that
+        // is hardest to reverse once an operator has paid it.
+        //
+        // `failure_reason` and `refunded_at` are included because a rejected
+        // withdrawal has the money returned to the balance, and a refund the
+        // user cannot account for is the same support question as a withdrawal
+        // that never arrived. Whether a refund actually happened is read from
+        // the ledger rather than inferred from the status: a row edited outside
+        // the app can say `failed` with no refund behind it, and telling the
+        // user it was returned in that case would be a lie about their money.
+        const result = await pool.query(
+            `SELECT w.id, w.amount, w.payment_method, w.payment_address, w.asset_code, w.network,
+                    w.status, w.failure_reason, w.created_at, w.paid_at,
+                    r.created_at AS refunded_at
+             FROM withdrawals w
+             LEFT JOIN balance_transactions r
+                    ON r.transaction_type = 'refund'
+                    AND r.source_id = $2 || w.id::TEXT
+                    AND r.user_id = w.user_id
+             WHERE w.user_id = $1
+             ORDER BY w.created_at DESC, w.id DESC
+             LIMIT $3`,
+            [req.user.id, WITHDRAWAL_REFUND_SOURCE_PREFIX, HISTORY_PAGE_SIZE]
+        );
+        return res.json(result.rows);
+    } catch (error) {
+        return sendDatabaseFailure(res, 'Withdrawal history error', error);
+    }
 });
 
+// ---------------------------------------------------------------------------
+// Deposit history
+// ---------------------------------------------------------------------------
+
 router.get('/deposits', async (req, res) => {
-	try {
-		const result = await pool.query(
-			`SELECT id, amount, asset_code, currency_code, network, deposit_address, checkout_url, status, created_at
-			 FROM deposits
-			 WHERE user_id = $1
-			 ORDER BY created_at DESC
-			 LIMIT 20`,
-			[req.user.id]
-		);
-		return res.json(result.rows.map(withReceiptUrl));
-	} catch (error) {
-		console.error('Deposit history error:', error.message);
-		return res.status(500).json({ error: 'Failed to load deposit history.' });
-	}
+    try {
+        // `credited_at` is included for the same reason the single-deposit
+        // lookup includes it: `status = 'confirmed'` and "the money is on the
+        // balance" are the same thing only when the credit ran, and the user
+        // looking at their history is the one who cannot tell the two apart.
+        const result = await pool.query(
+            `SELECT id, amount, asset_code, currency_code, network, deposit_address,
+                    checkout_url, status, credited_at, created_at
+             FROM deposits
+             WHERE user_id = $1
+             ORDER BY created_at DESC, id DESC
+             LIMIT $2`,
+            [req.user.id, HISTORY_PAGE_SIZE]
+        );
+        return res.json(result.rows.map(withReceiptUrl));
+    } catch (error) {
+        return sendDatabaseFailure(res, 'Deposit history error', error);
+    }
 });
 
 /**
  * One deposit, for its own receipt screen.
  *
- * A crypto deposit has no provider checkout to redirect to -- the customer is shown an
- * address and leaves the site -- so there was no page to send anyone back to afterwards,
- * and the only record of a $5,000 XRP deposit was a row of JSON. This is what a
- * "view your deposit" link points at, and what the standalone receipt page polls.
+ * A crypto deposit has no provider checkout to redirect to -- the customer is
+ * shown an address and leaves the site -- so there was no page to send anyone
+ * back to afterwards, and the only record of a $5,000 XRP deposit was a row of
+ * JSON. This is what a "view your deposit" link points at, and what the
+ * standalone receipt page polls.
  *
- * Scoped to the owner, so an id alone reveals nothing. Returns 404 rather than 403 for
- * someone else's deposit, so the response does not confirm that the id exists.
+ * Scoped to the owner, so an id alone reveals nothing. Returns 404 rather than
+ * 403 for someone else's deposit, so the response does not confirm that the id
+ * exists.
  */
 router.get('/deposits/:id', async (req, res) => {
-	const depositId = String(req.params.id);
-	if (!/^\d+$/.test(depositId)) {
-		return res.status(404).json({ error: 'Deposit not found.' });
-	}
-	try {
-		const result = await pool.query(
-			`SELECT id, amount, asset_code, currency_code, network, deposit_address, checkout_url,
-			        status, credited_at, created_at
-			 FROM deposits
-			 WHERE id = $1 AND user_id = $2`,
-			[depositId, req.user.id]
-		);
-		if (result.rows.length === 0) {
-			return res.status(404).json({ error: 'Deposit not found.' });
-		}
-		return res.json(withReceiptUrl(result.rows[0]));
-	} catch (error) {
-		console.error('Deposit lookup error:', error.message);
-		return res.status(500).json({ error: 'Failed to load the deposit.' });
-	}
+    const depositId = String(req.params.id);
+    if (!RECORD_ID_PATTERN.test(depositId)) {
+        return res.status(404).json({ error: 'Deposit not found.' });
+    }
+    try {
+        const result = await pool.query(
+            `SELECT id, amount, asset_code, currency_code, network, deposit_address, checkout_url,
+                    status, credited_at, created_at
+             FROM deposits
+             WHERE id = $1 AND user_id = $2`,
+            [depositId, req.user.id]
+        );
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'Deposit not found.' });
+        }
+        return res.json(withReceiptUrl(result.rows[0]));
+    } catch (error) {
+        return sendDatabaseFailure(res, 'Deposit lookup error', error);
+    }
 });
 
-/**
- * Adds the link a confirmed deposit can be viewed at.
- *
- * Built from the request's own origin rather than a configured base URL, because the
- * receipt is a link the current user follows right now, in this browser. A stored
- * APP_BASE_URL is what provider callbacks are built from, which is a different question
- * and can legitimately be a tunnel while the user is on localhost.
- */
-function withReceiptUrl(deposit) {
-	return { ...deposit, receipt_url: `/deposit/${deposit.id}` };
-}
+// ---------------------------------------------------------------------------
+// Options and financial mutations
+// ---------------------------------------------------------------------------
 
 router.get('/payment-options', paymentController.providerOptions);
 router.get('/withdrawal-options', payoutController.withdrawalOptions);
-router.post('/deposits', depositLimit, paymentController.createDeposit);
-router.post('/withdraw', depositLimit, payoutController.requestWithdrawal);
+router.post('/deposits', financialMutationLimit, paymentController.createDeposit);
+router.post('/withdraw', financialMutationLimit, payoutController.requestWithdrawal);
 
 module.exports = router;

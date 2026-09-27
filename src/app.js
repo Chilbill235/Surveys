@@ -12,10 +12,28 @@ const paymentController = require('./controllers/paymentController');
 
 const app = express();
 
-// Security HTTP headers (configured to allow serving local static assets & scripts)
+// Security HTTP headers.
+//
+// Three of helmet's defaults are deliberately overridden, and the reason is the same in
+// each case: the policy is expressed in `vercel.json` at the edge, and a second,
+// differently-scoped copy of the same header from the origin only produces a conflict that
+// the stricter of the two silently wins.
+//
+//  - `contentSecurityPolicy: false`. The policy is set in vercel.json so it also covers the
+//    files Vercel serves from its own CDN, which never reach this process. Emitting one
+//    here as well would mean the two have to stay identical forever, with no signal when
+//    they drift.
+//  - `frameguard: false`. Helmet's default is `X-Frame-Options: SAMEORIGIN`, which is
+//    *narrower* than the `frame-ancestors 'self' https:` the deployment allows, and it
+//    cannot express "any https origin" at all. Left on, it silently overrides the intent
+//    and blocks the site being embedded over https while looking like a security win.
+//    `frame-ancestors` is the modern control and is the one that applies.
+//  - `crossOriginResourcePolicy: 'cross-origin'`, because the site is meant to be embedded
+//    and the same-origin default would block the embedded page's own subresources.
 app.use(
     helmet({
-        contentSecurityPolicy: false, // Disable default CSP to prevent breaking external CDNs/scripts unless strictly configured
+        contentSecurityPolicy: false,
+        frameguard: false,
         crossOriginResourcePolicy: { policy: 'cross-origin' }
     })
 );

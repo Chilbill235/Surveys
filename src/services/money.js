@@ -78,8 +78,30 @@ function amountsMatch(a, b) {
     return Math.abs(left - right) < 0.005;
 }
 
-module.exports = { 
-    parseCents, 
-    parseAmountInRange, 
-    amountsMatch 
+/**
+ * Renders a USD amount the way a person reads it.
+ *
+ * The deposit and withdrawal bounds are shown to the user in error messages, and
+ * interpolating the raw number produced "between $1 and $5000". That is not a rounding
+ * problem -- the value is correct -- but it reads as a different number than the one the
+ * form shows, and a user comparing the two has no way to tell which is the limit.
+ *
+ * Grouped, two decimal places, and no currency code: the limit is a dollar amount and the
+ * message already says so. A non-finite value is passed through rather than rendered as
+ * `NaN`, because a limit that failed to load should say nothing about itself.
+ */
+function formatUsd(value) {
+    const amount = Number(value);
+    if (!Number.isFinite(amount)) return String(value);
+    return amount.toLocaleString('en-US', {
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2
+    });
+}
+
+module.exports = {
+    parseCents,
+    parseAmountInRange,
+    amountsMatch,
+    formatUsd
 };

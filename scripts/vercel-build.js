@@ -131,7 +131,34 @@ async function main() {
  * click hop is `/offer/engage`, which is not under `/api`, so the advertiser redirect is
  * swallowed and the user lands back on the offers page with no error anywhere. The home
  * page, the password reset page, and every deposit receipt break the same way.
+ *
+ * Returns the verdict rather than exiting, so the rule can be exercised by a test against
+ * configurations that are known-bad -- including the one this project actually shipped,
+ * which no amount of running the good path would prove.
  */
+function checkRouting(config) {
+    const rewrites = (config && config.rewrites) || [];
+    const catchAll = rewrites.find((rule) => !/^\/api\//.test(rule.source));
+    if (!catchAll) {
+        return {
+            ok: false,
+            reason: 'no catch-all. Non-API paths are unrouted, so /offer/engage, /, /reset-password, and /deposit/:id will 404.'
+        };
+    }
+    if (/index\.html$/.test(catchAll.destination)) {
+        return {
+            ok: false,
+            reason: 'non-API paths go to index.html. That swallows /offer/engage, so clicking an ' +
+                'offer returns the user to the catalog instead of the advertiser, and breaks /, ' +
+                '/reset-password, and /deposit/:id. Point it at the function instead.'
+        };
+    }
+    if (!/^\/api\//.test(catchAll.destination)) {
+        return { ok: false, reason: `page requests are routed to ${catchAll.destination}, which is not a function.` };
+    }
+    return { ok: true, source: catchAll.source, destination: catchAll.destination };
+}
+
 function verifyRouting() {
     const configPath = path.join(projectRoot, 'vercel.json');
     if (!fs.existsSync(configPath)) {
@@ -147,28 +174,19 @@ function verifyRouting() {
         process.exit(1);
     }
 
-    const rewrites = config.rewrites || [];
-    const catchAll = rewrites.find((rule) => !/^\/api\//.test(rule.source));
-    if (!catchAll) {
-        console.error('vercel.json rewrites every non-API path nowhere, so /offer/engage, /, /reset-password, and /deposit/:id will 404.');
+    const verdict = checkRouting(config);
+    if (!verdict.ok) {
+        console.error(`vercel.json routing is broken: ${verdict.reason}`);
         process.exit(1);
     }
-    if (/index\.html$/.test(catchAll.destination)) {
-        console.error(
-            'vercel.json sends non-API paths to index.html. That swallows /offer/engage, ' +
-            'so clicking an offer returns the user to the catalog instead of the advertiser, ' +
-            'and breaks /, /reset-password, and /deposit/:id. Point it at the function instead.'
-        );
-        process.exit(1);
-    }
-    if (!/^\/api\//.test(catchAll.destination)) {
-        console.error(`vercel.json routes page requests to ${catchAll.destination}, which is not a function.`);
-        process.exit(1);
-    }
-    console.log(`Routing verified: ${catchAll.source} -> ${catchAll.destination}`);
+    console.log(`Routing verified: ${verdict.source} -> ${verdict.destination}`);
 }
 
-main().catch((error) => {
-    console.error('Build failed:', error.message);
-    process.exit(1);
-});
+if (require.main === module) {
+    main().catch((error) => {
+        console.error('Build failed:', error.message);
+        process.exit(1);
+    });
+}
+
+module.exports = { checkRouting };

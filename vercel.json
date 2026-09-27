@@ -20,7 +20,7 @@
     "crons": [
         {
             "path": "/api/maintenance/reconcile-deposits",
-            "schedule": "0 */6 * * *"
+            "schedule": "0 4 * * *"
         }
     ],
     "headers": [
