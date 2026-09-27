@@ -36,19 +36,49 @@ const DB_UNREACHABLE_CODES = new Set([
     'ECONNREFUSED', 'ENOTFOUND', 'ETIMEDOUT', 'EHOSTUNREACH', 'EAI_AGAIN',
 ]);
 
+/**
+ * Whether demo offers should appear in the public catalog.
+ *
+ * This used to be derived from `NODE_ENV`, which was wrong in two directions:
+ *
+ *   1. Vercel sets `NODE_ENV=production` on *every* deployment, including
+ *      previews and staging. A preview that wants demos visible could not get
+ *      them without overriding NODE_ENV, which changes much more than the
+ *      catalog.
+ *
+ *   2. A production deployment whose catalog is entirely demo offers -- a
+ *      common state early on -- served `[]`, because the filter excluded the
+ *      only rows that existed. The catalog worked; there was just nothing left
+ *      after the filter, and the empty array looked identical to "the database
+ *      is empty".
+ *
+ * The new resolution is explicit and independent of `NODE_ENV`:
+ *
+ *   - `OFFERS_INCLUDE_DEMO=true`  -> demo offers are always included.
+ *   - `OFFERS_INCLUDE_DEMO=false` -> demo offers are always excluded.
+ *   - unset                       -> included outside production, excluded in
+ *                                    production (the previous default, kept
+ *                                    so nothing changes for a deployment that
+ *                                    does not set the variable).
+ *
+ * Set `OFFERS_INCLUDE_DEMO=true` on Vercel to show demo offers there. If the
+ * demo path itself (`/demo`, `/api/demo/complete`) is not wired up in that
+ * environment, the offers will appear but clicking one will lead to a 404 --
+ * see `demoController` for that half.
+ */
+function resolveIncludeDemo() {
+    const explicit = String(process.env.OFFERS_INCLUDE_DEMO || '').trim().toLowerCase();
+    if (explicit === 'true' || explicit === '1') return true;
+    if (explicit === 'false' || explicit === '0') return false;
+    return process.env.NODE_ENV !== 'production';
+}
+
 // ---------------------------------------------------------------------------
 // Public offer catalog
 // ---------------------------------------------------------------------------
 
 /**
  * The offer catalog, which is the only thing the landing page needs to render.
- *
- * Demo offers are excluded in production. They were served unconditionally, and
- * every one of them is a dead end there: `/offer/engage` redirects a demo click
- * to `/demo`, which answers 404 in production, and `/api/demo/complete` does
- * the same. So a production visitor could browse a "Take survey" card, sign in,
- * click it, and be sent to a 404 -- the catalog was advertising an offer the
- * deployment could not honour.
  *
  * `tracking_url` is deliberately absent. Sending it would let anyone append
  * their own aff_sub to the advertiser directly and collect credit for clicks
@@ -63,7 +93,7 @@ async function handleListOffers(req, res) {
     res.set('Cache-Control', OFFERS_CACHE_CONTROL);
 
     try {
-        const includeDemo = process.env.NODE_ENV !== 'production';
+        const includeDemo = resolveIncludeDemo();
         const result = await pool.query(
             `SELECT id, title, description, payout, network_name, partner_label, is_demo, offer_type
              FROM offers
@@ -72,6 +102,20 @@ async function handleListOffers(req, res) {
              ORDER BY created_at DESC, id DESC`,
             [includeDemo]
         );
+
+        // The count is logged on the way out so an empty catalog is never
+        // silently mistaken for a working one. A 200 with `[]` and a 200 with
+        // 40 rows are the same shape to a client and a very different shape to
+        // an operator reading logs, and the distinction is exactly what was
+        // missing while this was producing empty pages.
+        if (result.rows.length === 0) {
+            console.warn(
+                `Offer catalog is empty (includeDemo=${includeDemo}). ` +
+                'Check that the offers table has active rows in this database, and that ' +
+                'OFFERS_INCLUDE_DEMO is set correctly for the environment.'
+            );
+        }
+
         return res.json(result.rows);
     } catch (error) {
         // The message is resolved through the pool's helper because a connection
