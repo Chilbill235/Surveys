@@ -905,6 +905,9 @@ textarea.form-control { min-height: 96px; resize: vertical; }
 .payment-status { flex: 0 0 auto; padding: 4px 9px; border-radius: var(--r-pill); color: var(--warning); background: var(--warning-bg); font-size: 0.7rem; font-weight: 700; text-transform: capitalize; white-space: nowrap; }
 .status-paid, .status-confirmed { color: var(--success); background: var(--success-bg); }
 .status-failed, .status-expired, .status-cancelled { color: var(--danger); background: var(--danger-bg); }
+/* A refunded withdrawal was still rejected, so it keeps the failure colour; it gets its own
+   selector only so the badge is never left unstyled if the class list is read on its own. */
+.status-refunded { color: var(--danger); background: var(--danger-bg); }
 .status-processing, .status-confirming, .status-pending { color: var(--warning); background: var(--warning-bg); }
 
 .deposit-address {

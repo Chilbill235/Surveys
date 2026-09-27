@@ -184,6 +184,46 @@ XRPL routes by a destination tag as well as by address, and a correct XRP addres
 tag is unsendable in a way the address format cannot reveal. The withdrawal form asks for
 the tag when the selected asset needs one.
 
+### Resolving a withdrawal
+
+A request is a debit the moment it is stored, so it has to end somewhere. Two operator
+endpoints close it, and both are guarded by `CRON_SECRET` exactly like scheduled
+reconciliation (loopback only outside production):
+
+| Endpoint | Effect |
+| --- | --- |
+| `GET /api/maintenance/withdrawals` | Requests still awaiting a decision, oldest first. |
+| `POST /api/maintenance/withdrawals/:id/paid` | Marks it sent. `providerReference` is required. |
+| `POST /api/maintenance/withdrawals/:id/refund` | Closes it as `failed` and returns the money. `reason` is required. |
+
+A refund is the balance write plus a `refund` ledger row keyed on `withdrawal:<id>`, in one
+transaction, so a repeat attempt collides on the ledger instead of paying the user twice.
+A withdrawal already marked `paid` is refused outright: once the funds have left, giving
+the money back is not a database operation. A refund is also the only way the destination
+problem above is recoverable — before these endpoints the sole remedy was editing the
+`withdrawals` table by hand, which is how a row ends up saying `failed` with the money
+still debited and nothing in the app able to notice.
+
+Both actions are single-shot. A second call reports `409` rather than repeating the write,
+because a retried operator action and a contradictory one are different problems.
+
+## Reconciling the books
+
+`npm run audit:balance` compares every balance against the cash ledger and reports eight
+ways the two can stop agreeing with each other — including deposits shown as confirmed that
+were never credited, and withdrawals that ended without being paid or refunded. It is
+read-only, exits `1` when money is unaccounted for and `2` when the audit itself cannot
+run, so it can be scheduled or monitored. `--json` is available for machine reading.
+
+Two schema rules make most of those checks structural rather than hopeful:
+
+- `deposits.status = 'confirmed'` requires `credited_at` to be set. `creditConfirmedDeposit`
+  writes both in one statement, and reconciliation only re-checks `pending`/`confirming`
+  rows, so a confirmed row with no credit would otherwise be invisible forever.
+- `balance_transactions.is_demo` separates the demo rewards, which move `demo_balance`, from
+  the rows that explain `balance`. Without it, "my balance equals the sum of my ledger" is
+  false by construction and cannot be checked.
+
 ## Front end
 
 The stylesheet is a single design system in `public/style.css`, ordered tokens → base →

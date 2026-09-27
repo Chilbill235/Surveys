@@ -1482,6 +1482,16 @@ function describeHistoryItem(item, kind) {
 
 function describeHistorySubtitle(item, kind) {
     if (kind === 'withdrawal') {
+        // A rejected withdrawal is the one history row where the outcome is not in the
+        // amount, and "Failed" next to a debited balance reads as money lost. The ledger is
+        // what says the money came back, so the wording follows it rather than the status:
+        // a row that says failed with no refund behind it gets the honest reading.
+        if (item.status === 'failed' || item.status === 'cancelled') {
+            const outcome = item.refunded_at
+                ? `Returned to your balance on ${new Date(item.refunded_at).toLocaleDateString()}`
+                : 'No refund was recorded for this request';
+            return item.failure_reason ? `${outcome} · ${item.failure_reason}` : outcome;
+        }
         return item.payment_address
             ? `${item.payment_address} · ${new Date(item.created_at).toLocaleDateString()}`
             : new Date(item.created_at).toLocaleDateString();
@@ -1549,8 +1559,12 @@ async function loadPaymentHistory(endpoint, containerId, kind) {
             }
 
             const badge = document.createElement('span');
-            badge.className = `payment-status status-${status}`;
-            badge.textContent = statusLabels[status] || status;
+            // "Refunded" is a different claim from "Failed": it tells the user the money is
+            // back, and it is only used when the ledger says so. The colour stays the
+            // failure colour because the request was still rejected.
+            const refunded = kind === 'withdrawal' && Boolean(item.refunded_at);
+            badge.className = `payment-status status-${refunded ? 'refunded' : status}`;
+            badge.textContent = refunded ? 'Refunded' : (statusLabels[status] || status);
 
             row.append(details, badge);
             fragment.append(row);

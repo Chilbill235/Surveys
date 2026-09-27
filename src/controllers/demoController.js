@@ -77,10 +77,15 @@ const demoController = {
                 'UPDATE users SET demo_balance = demo_balance + $1 WHERE id = $2 RETURNING demo_balance',
                 [payout, req.user.id]
             );
+            // This row lands in the same table as the cash ledger even though it moves
+            // `demo_balance` and never touches `balance`, so it is flagged rather than
+            // identified by its description: the flag is what makes "balance equals the
+            // sum of my cash ledger" a query, and the description is free text an operator
+            // can edit.
             await client.query(
                 `INSERT INTO balance_transactions
-                    (user_id, amount, transaction_type, source_id, description)
-                 VALUES ($1, $2, 'adjustment', $3, 'Non-cash demo reward')`,
+                    (user_id, amount, transaction_type, source_id, description, is_demo)
+                 VALUES ($1, $2, 'adjustment', $3, 'Non-cash demo reward', TRUE)`,
                 [req.user.id, payout, `demo:${clickId}`]
             );
 

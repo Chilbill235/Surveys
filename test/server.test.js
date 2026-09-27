@@ -2087,20 +2087,15 @@ test('withdrawal review endpoints resolve a request and refuse to do it twice', 
     process.env.NODE_ENV = 'test';
     process.env.CRON_SECRET = 'withdrawal-cron-secret';
     const originalConnect = pool.connect;
+    const originalQuery = pool.query;
 
     let withdrawalStatus = 'pending';
     let balance = 0;
     const ledger = [];
-    pool.connect = async () => ({
+    const client = {
         query: async (query, params = []) => {
             const normalized = query.replace(/\s+/g, ' ').trim();
             if (/^(BEGIN|COMMIT|ROLLBACK)$/i.test(normalized)) return { rows: [] };
-            if (/SELECT w.id, w.user_id, u.email/.test(normalized)) {
-                return { rows: withdrawalStatus === 'pending'
-                    ? [{ id: 12, user_id: 1, email: 'a@b.test', amount: '500.00', payment_method: 'paypal',
-                        payment_address: 'me@example.test', asset_code: null, network: null, status: withdrawalStatus, created_at: new Date() }]
-                    : [] };
-            }
             if (/SELECT id, user_id, amount, status, provider_reference/.test(normalized)) {
                 return { rows: [{ id: 12, user_id: 1, amount: '500.00', status: withdrawalStatus, provider_reference: null }] };
             }
@@ -2126,7 +2121,25 @@ test('withdrawal review endpoints resolve a request and refuse to do it twice', 
             throw new Error(`Unexpected query: ${normalized}`);
         },
         release: () => {}
-    });
+    };
+    pool.connect = async () => client;
+    // `pg`'s Pool.query is implemented on top of Pool.connect, so replacing connect alone
+    // leaves pool.query calling a callback the replacement never invokes -- the request
+    // waits forever instead of failing. The listing goes through pool.query, so it has to
+    // be replaced too, and anything unrecognised throws rather than reaching the database:
+    // this test is about the review endpoints, not about what is in the live ledger.
+    pool.query = async (query) => {
+        if (/SELECT w\.id, w\.user_id, u\.email/.test(query)) {
+            return {
+                rows: withdrawalStatus === 'pending' || withdrawalStatus === 'processing'
+                    ? [{ id: 12, user_id: 1, email: 'a@b.test', amount: '500.00', payment_method: 'paypal',
+                        payment_address: 'me@example.test', asset_code: null, network: null,
+                        status: withdrawalStatus, created_at: new Date() }]
+                    : []
+            };
+        }
+        throw new Error(`Unexpected pool.query: ${query}`);
+    };
 
     try {
         const listed = await fetch(`${origin}/api/maintenance/withdrawals?secret=withdrawal-cron-secret`);
@@ -2174,10 +2187,17 @@ test('withdrawal review endpoints resolve a request and refuse to do it twice', 
         assert.equal(afterPaid.status, 409);
         assert.equal(balance, 500);
 
+        // A wrong secret is only refused where the secret is the gate. Outside production
+        // the gate is loopback and the secret is ignored, so asserting 403 here would be
+        // asserting a rule this app does not have; the production contract is asserted
+        // instead, and a resolvable route must stay undiscoverable to someone guessing it.
+        process.env.NODE_ENV = 'production';
         const wrongSecret = await fetch(`${origin}/api/maintenance/withdrawals/12/paid?secret=wrong`, { method: 'POST' });
-        assert.equal(wrongSecret.status, 403);
+        assert.equal(wrongSecret.status, 404);
+        assert.equal(balance, 500);
     } finally {
         pool.connect = originalConnect;
+        pool.query = originalQuery;
         if (priorEnvironment === undefined) delete process.env.NODE_ENV;
         else process.env.NODE_ENV = priorEnvironment;
         if (priorSecret === undefined) delete process.env.CRON_SECRET;

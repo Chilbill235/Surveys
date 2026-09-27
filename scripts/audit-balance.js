@@ -117,6 +117,21 @@ const CHECKS = [
             `${r.failure_reason ? ` -- ${r.failure_reason}` : ' with no reason recorded'}`
     },
     {
+        key: 'unprovablePaidWithdrawals',
+        severity: 'warning',
+        title: 'Withdrawals marked paid with nothing to prove it',
+        why: 'A paid withdrawal with no provider reference cannot be checked against a ' +
+            'provider dashboard or a bank statement. If the money did not arrive there is ' +
+            'no way to tell, and no way to correct it without a support ticket.',
+        sql: `SELECT id, user_id, amount, payment_method, provider_reference, paid_at
+              FROM withdrawals
+              WHERE status = 'paid' AND (provider_reference IS NULL OR paid_at IS NULL)
+              ORDER BY id`,
+        format: (r) => `withdrawal ${r.id}: ${r.amount} (${r.payment_method}) is marked paid but has ` +
+            `${[r.provider_reference ? null : 'no provider reference', r.paid_at ? null : 'no paid_at']
+                .filter(Boolean).join(' and ')}`
+    },
+    {
         key: 'unresolvedWithdrawals',
         severity: 'warning',
         title: 'Withdrawals still awaiting a decision',

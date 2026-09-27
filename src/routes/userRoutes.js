@@ -40,11 +40,24 @@ router.get('/withdrawals', async (req, res) => {
 		// The destination is included so the user can confirm a request was recorded
 		// against the address they intended, which is the mistake that is hardest to
 		// reverse once an operator has paid it.
+		//
+		// `failure_reason` and `refunded_at` are included because a rejected withdrawal has
+		// the money returned to the balance, and a refund the user cannot account for is the
+		// same support question as a withdrawal that never arrived. Whether a refund
+		// actually happened is read from the ledger rather than inferred from the status:
+		// a row edited outside the app can say `failed` with no refund behind it, and
+		// telling the user it was returned in that case would be a lie about their money.
 		const result = await pool.query(
-			`SELECT id, amount, payment_method, payment_address, asset_code, network, status, created_at, paid_at
-			 FROM withdrawals
-			 WHERE user_id = $1
-			 ORDER BY created_at DESC
+			`SELECT w.id, w.amount, w.payment_method, w.payment_address, w.asset_code, w.network,
+			        w.status, w.failure_reason, w.created_at, w.paid_at,
+			        r.created_at AS refunded_at
+			 FROM withdrawals w
+			 LEFT JOIN balance_transactions r
+			        ON r.transaction_type = 'refund'
+			        AND r.source_id = 'withdrawal:' || w.id::TEXT
+			        AND r.user_id = w.user_id
+			 WHERE w.user_id = $1
+			 ORDER BY w.created_at DESC
 			 LIMIT 20`,
 			[req.user.id]
 		);
