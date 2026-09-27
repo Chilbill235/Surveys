@@ -171,7 +171,15 @@ document.addEventListener('DOMContentLoaded', () => {
     updateDepositFields();
     updateWithdrawFields();
     refreshBalance();
-    loadOffers();
+    // The notice is shown once the catalog has finished loading, not before. `loadOffers`
+    // owns `page-message` for the duration of its request -- it clears the box on the way
+    // in and writes an error into it on the way out -- so setting a notice beforehand would
+    // be wiped by the next line, and setting it unconditionally afterwards would hide a
+    // catalog failure behind a less important message. On success the notice replaces
+    // nothing; on failure the real error stays.
+    loadOffers().then((loaded) => {
+        if (loaded) showPageNotice();
+    });
     // A payment that confirmed while the tab was closed has no other way to announce
     // itself, and the deposit dialog's poll only runs while that dialog is open.
     announceMissedCredits();
@@ -237,6 +245,48 @@ function handleUnauthorized(error) {
 
 /* ---------------------------------------------------------------- catalog */
 
+/**
+ * Says why the browser arrived here, when the server sent it back.
+ *
+ * `/offer/engage` redirects to the catalog with `?notice=demo-unavailable` when a click was
+ * recorded against a demo offer that this deployment cannot run -- a click made in local
+ * development and then engaged on a deployment with demo mode off, which is exactly what a
+ * shared database between the two produces. Returning the user here with no explanation
+ * would look like the click did nothing; the notice is the difference between "this offer
+ * is not available here" and "something is broken".
+ *
+ * The parameter is read rather than the whole query string, and only recognised values are
+ * acted on, so an arbitrary query string cannot put text on the page.
+ */
+const PAGE_NOTICES = {
+    'demo-unavailable': 'That offer is a test offer, and test offers are not available in this environment.'
+};
+
+function showPageNotice() {
+    let notice;
+    try {
+        notice = new URLSearchParams(window.location.search).get('notice');
+    } catch {
+        return;
+    }
+    const text = PAGE_NOTICES[notice];
+    if (!text) return;
+    showPageMessage(text);
+    // The notice is removed once shown so a refresh does not repeat it, and so the URL the
+    // user copies does not carry it.
+    const cleaned = new URL(window.location.href);
+    cleaned.searchParams.delete('notice');
+    window.history.replaceState({}, '', cleaned.pathname + cleaned.search);
+}
+
+/**
+ * Loads the catalog.
+ *
+ * Resolves to true when the catalog rendered, so the caller knows whether the message area
+ * is free. A failure resolves to false rather than rejecting: nothing awaits this for its
+ * error, and an unhandled rejection from a page-load convenience call would be reported as
+ * a broken script instead of as a catalog that did not load.
+ */
 async function loadOffers() {
     const skeletons = document.getElementById('loading-skeletons');
     const grid = document.getElementById('offer-grid');
@@ -250,6 +300,7 @@ async function loadOffers() {
         if (!Array.isArray(offers)) throw new Error('The offers response was not valid.');
         offerState.all = offers;
         renderOffers();
+        return true;
     } catch (error) {
         offerState.all = [];
         grid.replaceChildren();
@@ -262,6 +313,7 @@ async function loadOffers() {
         retry.addEventListener('click', loadOffers);
         message.append(retry);
         message.hidden = false;
+        return false;
     } finally {
         skeletons.hidden = true;
         grid.removeAttribute('aria-busy');

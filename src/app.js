@@ -9,6 +9,7 @@ const publicRoutes = require('./routes/publicRoutes');
 const userRoutes = require('./routes/userRoutes');
 const maintenanceRoutes = require('./routes/maintenanceRoutes');
 const paymentController = require('./controllers/paymentController');
+const { isDemoModeEnabled } = require('./services/demoMode');
 
 const app = express();
 
@@ -114,7 +115,11 @@ app.get('/deposit/:id', (req, res) => {
 });
 
 app.get('/demo', (req, res) => {
-    if (process.env.NODE_ENV === 'production') {
+    // Demo mode, not NODE_ENV. The demo page and the demo offers in the catalog are one
+    // feature: if the catalog shows a demo offer, this page has to be reachable, and if it
+    // is not, the catalog has nothing to point at. Keying them off different variables is
+    // how a deployment ends up advertising surveys that lead to a 404.
+    if (!isDemoModeEnabled()) {
         return res.status(404).send('Page not found.');
     }
     return res.sendFile(path.join(publicDirectory, 'demo.html'));

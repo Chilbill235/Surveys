@@ -88,7 +88,9 @@ with `contentSecurityPolicy: false`, and with `frameguard: false`:
 | `JWT_SECRET` | yes | Long random value that signs session tokens. |
 | `APP_BASE_URL` | yes | Public HTTPS origin. Used for provider callbacks and reset links. |
 | `POSTBACK_SECRET` | production | Shared secret for advertiser postbacks. |
-| `PROXYCHECK_KEY` | production | VPN/proxy fraud checks on click tracking. |
+| `PROXYCHECK_KEY` | optional | VPN/proxy fraud checks on click tracking. |
+| `PROXYCHECK_REQUIRED` | optional | `true` refuses clicks while a proxy check cannot run. Default `false`: the click is tracked and the gap logged. |
+| `OFFERS_INCLUDE_DEMO` | optional | `true` enables the demo offers, the `/demo` page, and the demo reward flow. Unset means enabled outside production only. |
 | `CRON_SECRET` | recommended | Protects scheduled deposit reconciliation. |
 | `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET` | for cards | Enables Stripe Checkout deposits. |
 | `NOWPAYMENTS_API_KEY`, `NOWPAYMENTS_IPN_SECRET` | for crypto | Enables crypto deposits. |
@@ -289,9 +291,25 @@ Two schema rules make most of those checks structural rather than hopeful:
 `GET /api/offers` is the whole product surface for a first-time visitor, and it answers with
 `id, title, description, payout, network_name, partner_label, is_demo, offer_type`.
 
-- **Demo offers are excluded in production, in SQL.** Every demo offer is a dead end
-  otherwise: a demo click redirects to `/demo`, which is 404 in production. Serving them
-  meant production advertised "Take survey" cards that could only ever lead to a 404.
+- **Demo offers are a feature, not a data flag.** `OFFERS_INCLUDE_DEMO` decides four things
+  at once: whether demo offers appear in the catalog, whether `/demo` is served, whether
+  `/api/demo/complete` accepts a completion, and whether a demo click may redirect. They
+  used to be four separate `NODE_ENV` comparisons, which is how a deployment ends up
+  advertising a survey that 404s — the catalog is the only one of the four a visitor can
+  see, so the other three failing produces no signal at all.
+  - `true` — available. `false` — not available. Unset — available outside production.
+  - Vercel sets `NODE_ENV=production` on previews too, so a staging deployment needs this
+    set explicitly to test the survey flow. That is the setting the demo flow is for.
+  - The unset default is *off* in production, because a production deployment shares its
+    database with local development: a default of on would publish local test offers to
+    real visitors.
+- **A click that cannot run here is never recorded.** Clicking a demo offer in a deployment
+  with demo mode off is refused with an explanation, before the row is written — a recorded
+  click can never resolve, and would sit in `clicks` looking like a real tracked click.
+- **A click that was recorded elsewhere is not a dead end.** A click made in local
+  development and engaged on a deployment with demo mode off (the same database, so this
+  happens) redirects back to the catalog with `?notice=demo-unavailable`, and the catalog
+  says why. The previous response was a 404 page reading "Demo offer not found."
 - **`tracking_url` is never sent.** With it, anyone could append their own `aff_sub` to the
   advertiser and claim credit for clicks that were never recorded — which is the entire
   reason for the `/offer/engage` hop.
@@ -300,8 +318,10 @@ Two schema rules make most of those checks structural rather than hopeful:
   found nothing for a partner name that was visible on screen. The count reads "0 of 12
   offers" when a filter is hiding things, because "0 offers" on a list of twelve reads as an
   outage, and the empty state offers a reset.
-- The response is short-cached (`max-age=30, stale-while-revalidate=60`) in `vercel.json`.
-  These rows are public, change rarely, and are identical for every visitor.
+- The response is short-cached (`max-age=30, s-maxage=30, stale-while-revalidate=60`) from
+  the handler rather than from `vercel.json`, so a self-hosted deploy gets the same behaviour
+  and the policy lives next to the response it describes. These rows are public, change
+  rarely, and are identical for every visitor. A failure is answered 503 and never cached.
 
 `offers.description` and `offers.partner_label` were added in migration `008` for the card.
 `network_name` is the advertiser's tracking identifier, which reads as noise on a card, so it
@@ -378,6 +398,11 @@ of those paths correctly, so only a real request against the real routes can tel
 rewrite is swallowing one. It registers an account to make the click hop, and deletes it
 afterwards. It needs a reachable database, and it points `APP_BASE_URL` at its own port, so
 give it a free one (`PORT=3311 npm run smoke`).
+
+`npm run smoke:survey` is the same idea for demo mode. It runs with
+`NODE_ENV=production` — the environment of a real deployment — and walks the demo flow with
+demo mode off, then on, then off again mid-flow to prove the last case returns the user to
+the catalog instead of dead-ending. That middle case is the bug that was reported.
 
 ## Static checks
 

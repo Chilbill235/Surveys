@@ -1,4 +1,5 @@
 const pool = require('../config/db');
+const { isDemoModeEnabled } = require('../services/demoMode');
 
 const clickIdPattern = /^[\da-f]{8}-(?:[\da-f]{4}-){3}[\da-f]{12}$/i;
 const favoriteOptions = new Set(['games', 'shopping', 'learning']);
@@ -13,8 +14,11 @@ function validAnswers(offerType, answers) {
 
 const demoController = {
     complete: async (req, res) => {
-        if (process.env.NODE_ENV === 'production') {
-            return res.status(404).json({ error: 'Demo rewards are disabled.' });
+        // Same gate as the catalog and the demo page. When this rejected while the catalog
+        // showed the offer, a user could complete the survey and be told the reward did not
+        // exist, having already spent the time.
+        if (!isDemoModeEnabled()) {
+            return res.status(404).json({ error: 'Demo rewards are not available in this deployment.' });
         }
 
         const clickId = String(req.body.clickId || '').trim();

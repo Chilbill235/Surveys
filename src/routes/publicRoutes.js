@@ -7,6 +7,7 @@ const paymentController = require('../controllers/paymentController');
 const fraudDetection = require('../middlewares/fraudDetection');
 const requireAuth = require('../middlewares/requireAuth');
 const pool = require('../config/db');
+const { isDemoModeEnabled, describeDemoMode } = require('../services/demoMode');
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -37,40 +38,15 @@ const DB_UNREACHABLE_CODES = new Set([
 ]);
 
 /**
- * Whether demo offers should appear in the public catalog.
+ * Whether demo offers appear in the public catalog.
  *
- * This used to be derived from `NODE_ENV`, which was wrong in two directions:
- *
- *   1. Vercel sets `NODE_ENV=production` on *every* deployment, including
- *      previews and staging. A preview that wants demos visible could not get
- *      them without overriding NODE_ENV, which changes much more than the
- *      catalog.
- *
- *   2. A production deployment whose catalog is entirely demo offers -- a
- *      common state early on -- served `[]`, because the filter excluded the
- *      only rows that existed. The catalog worked; there was just nothing left
- *      after the filter, and the empty array looked identical to "the database
- *      is empty".
- *
- * The new resolution is explicit and independent of `NODE_ENV`:
- *
- *   - `OFFERS_INCLUDE_DEMO=true`  -> demo offers are always included.
- *   - `OFFERS_INCLUDE_DEMO=false` -> demo offers are always excluded.
- *   - unset                       -> included outside production, excluded in
- *                                    production (the previous default, kept
- *                                    so nothing changes for a deployment that
- *                                    does not set the variable).
- *
- * Set `OFFERS_INCLUDE_DEMO=true` on Vercel to show demo offers there. If the
- * demo path itself (`/demo`, `/api/demo/complete`) is not wired up in that
- * environment, the offers will appear but clicking one will lead to a 404 --
- * see `demoController` for that half.
+ * Thin alias kept so the catalog's dependency is named where it is used. The decision
+ * itself lives in `src/services/demoMode.js` and is shared with the `/demo` page, the
+ * completion endpoint, and the click handler, because a catalog that advertises a demo
+ * offer the deployment cannot complete is worse than an empty catalog.
  */
 function resolveIncludeDemo() {
-    const explicit = String(process.env.OFFERS_INCLUDE_DEMO || '').trim().toLowerCase();
-    if (explicit === 'true' || explicit === '1') return true;
-    if (explicit === 'false' || explicit === '0') return false;
-    return process.env.NODE_ENV !== 'production';
+    return isDemoModeEnabled();
 }
 
 // ---------------------------------------------------------------------------
@@ -107,12 +83,16 @@ async function handleListOffers(req, res) {
         // silently mistaken for a working one. A 200 with `[]` and a 200 with
         // 40 rows are the same shape to a client and a very different shape to
         // an operator reading logs, and the distinction is exactly what was
-        // missing while this was producing empty pages.
+        // missing while this was producing empty pages. The mode is described
+        // rather than just reported because the useful question is always
+        // "was that deliberate here", and the answer differs by deployment.
         if (result.rows.length === 0) {
+            const mode = describeDemoMode();
             console.warn(
-                `Offer catalog is empty (includeDemo=${includeDemo}). ` +
-                'Check that the offers table has active rows in this database, and that ' +
-                'OFFERS_INCLUDE_DEMO is set correctly for the environment.'
+                `Offer catalog is empty. Demo mode is ${mode.enabled ? 'on' : 'off'} ` +
+                `(from ${mode.source}, NODE_ENV=${mode.environment}). Check that the offers ` +
+                'table has active rows in this database, and that OFFERS_INCLUDE_DEMO is ' +
+                'set correctly for the environment.'
             );
         }
 

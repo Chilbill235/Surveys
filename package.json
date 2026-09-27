@@ -10,6 +10,7 @@
     "reconcile": "node scripts/reconcile-deposits.js",
     "audit:balance": "node scripts/audit-balance.js",
     "smoke": "node scripts/smoke-routes.js",
+    "smoke:survey": "node scripts/smoke-survey-flow.js",
     "vercel-build": "node scripts/vercel-build.js",
     "seed:demo": "node scripts/seed-demo-offers.js",
     "check:frontend": "node scripts/check-frontend.js",

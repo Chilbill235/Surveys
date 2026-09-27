@@ -1627,15 +1627,18 @@ test('click creation returns the configured absolute aff_sub URL and redirects t
     pool.query = async (query, values) => {
         if (query.includes('SELECT token_version')) return { rows: [{ token_version: 0, is_banned: false }] };
         if (query.includes('SELECT COUNT(*)')) return { rows: [{ count: '0' }] };
-        if (query.includes('SELECT tracking_url FROM offers')) {
-            return { rows: [{ tracking_url: 'https://partner.example/click?campaign=42' }] };
+        // Matched on the columns rather than the whole statement. The offer lookup also
+        // reads `is_demo` now, so a stub keyed on the exact old SELECT text silently
+        // stopped matching and turned this into a 500 with no explanation of why.
+        if (/SELECT tracking_url.*FROM offers/i.test(query)) {
+            return { rows: [{ tracking_url: 'https://partner.example/click?campaign=42', is_demo: false }] };
         }
         if (query.includes('INSERT INTO clicks')) {
             createdClickId = values[0];
             return { rows: [] };
         }
         if (query.includes('SELECT offers.tracking_url')) {
-            return { rows: [{ tracking_url: 'https://partner.example/click?campaign=42' }] };
+            return { rows: [{ tracking_url: 'https://partner.example/click?campaign=42', is_demo: false }] };
         }
         throw new Error(`Unexpected test query: ${query}`);
     };
@@ -2400,4 +2403,175 @@ test('a crypto deposit is never confirmed against its fiat value', async () => {
     // 25 -- and the same fallback would call a 0.0003 payment unpaid on any asset cheaper
     // than BTC. Neither direction is a payment check.
     assert.equal(isPaymentFullyPaid({ ...deposit, pay_amount: undefined, actually_paid: 0.0003 }), false);
+});
+
+/**
+ * Demo mode is one switch, read by four call sites.
+ *
+ * They were four independent `NODE_ENV` comparisons, which is how a deployment ends up
+ * advertising a demo offer whose survey 404s: the catalog used one rule, the /demo page
+ * another, the completion endpoint a third, and the click handler a fourth. The specific
+ * failure this locks down is `OFFERS_INCLUDE_DEMO=true` on a deployment with
+ * `NODE_ENV=production` -- the state a staging environment is in -- where all four must
+ * agree or the survey is a dead end.
+ */
+test('demo mode resolves the same way for the catalog, the page, and the reward', () => {
+    const { isDemoModeEnabled, describeDemoMode } = require('../src/services/demoMode');
+    const priorEnvironment = process.env.NODE_ENV;
+    const priorOverride = process.env.OFFERS_INCLUDE_DEMO;
+
+    try {
+        const cases = [
+            { nodeEnv: 'production', override: undefined, expected: false },
+            { nodeEnv: 'production', override: 'true', expected: true },
+            { nodeEnv: 'production', override: '1', expected: true },
+            { nodeEnv: 'production', override: 'false', expected: false },
+            { nodeEnv: 'production', override: '0', expected: false },
+            // The default is not "on": a production deployment shares its database with
+            // local development, so a default of on would publish local test offers to
+            // real visitors.
+            { nodeEnv: 'development', override: undefined, expected: true },
+            { nodeEnv: 'test', override: undefined, expected: true },
+            // An explicit false wins even outside production, so a shared environment can
+            // be held to the production rule.
+            { nodeEnv: 'development', override: 'false', expected: false }
+        ];
+
+        for (const { nodeEnv, override, expected } of cases) {
+            if (override === undefined) delete process.env.OFFERS_INCLUDE_DEMO;
+            else process.env.OFFERS_INCLUDE_DEMO = override;
+            process.env.NODE_ENV = nodeEnv;
+            assert.equal(
+                isDemoModeEnabled(), expected,
+                `NODE_ENV=${nodeEnv} OFFERS_INCLUDE_DEMO=${override}`
+            );
+        }
+
+        // The description is what makes an empty catalog diagnosable, so it must say where
+        // the answer came from, not just what it was.
+        process.env.NODE_ENV = 'production';
+        delete process.env.OFFERS_INCLUDE_DEMO;
+        assert.deepEqual(describeDemoMode(), { enabled: false, source: 'NODE_ENV', environment: 'production' });
+        process.env.OFFERS_INCLUDE_DEMO = 'true';
+        assert.deepEqual(describeDemoMode(), { enabled: true, source: 'OFFERS_INCLUDE_DEMO', environment: 'production' });
+    } finally {
+        if (priorEnvironment === undefined) delete process.env.NODE_ENV;
+        else process.env.NODE_ENV = priorEnvironment;
+        if (priorOverride === undefined) delete process.env.OFFERS_INCLUDE_DEMO;
+        else process.env.OFFERS_INCLUDE_DEMO = priorOverride;
+    }
+});
+
+test('a proxy check that cannot run does not take the whole offer flow down by default', () => {
+    const { proxyCheckRequired } = require('../src/middlewares/fraudDetection');
+    const priorRequired = process.env.PROXYCHECK_REQUIRED;
+
+    try {
+        delete process.env.PROXYCHECK_REQUIRED;
+        // Failing closed by default meant a deployment that had never configured
+        // proxycheck.io answered 503 to every click, on every offer, for every user.
+        assert.equal(proxyCheckRequired(), false, 'the default must not refuse tracking');
+
+        process.env.PROXYCHECK_REQUIRED = 'true';
+        assert.equal(proxyCheckRequired(), true, 'the strict posture must be selectable');
+
+        process.env.PROXYCHECK_REQUIRED = 'false';
+        assert.equal(proxyCheckRequired(), false);
+    } finally {
+        if (priorRequired === undefined) delete process.env.PROXYCHECK_REQUIRED;
+        else process.env.PROXYCHECK_REQUIRED = priorRequired;
+    }
+});
+
+test('a demo click is refused before it is recorded when demo mode is off', async () => {
+    const originalQuery = pool.query;
+    const priorEnvironment = process.env.NODE_ENV;
+    const priorOverride = process.env.OFFERS_INCLUDE_DEMO;
+    const recorded = [];
+
+    pool.query = async (query, values) => {
+        // The session has to resolve to a user, or `requireAuth` answers 401 before the
+        // offer is ever looked at and the assertion is testing the wrong thing.
+        if (query.includes('SELECT token_version')) return { rows: [{ token_version: 0, is_banned: false }] };
+        if (query.includes('SELECT COUNT(*)')) return { rows: [{ count: '0' }] };
+        if (/SELECT tracking_url.*FROM offers/i.test(query)) {
+            return { rows: [{ tracking_url: 'https://partner.example/go', is_demo: true }] };
+        }
+        if (query.includes('INSERT INTO clicks')) {
+            recorded.push(values[0]);
+            return { rows: [] };
+        }
+        return { rows: [] };
+    };
+
+    const priorSecret = process.env.JWT_SECRET;
+    try {
+        process.env.JWT_SECRET = 'demo-click-test-secret';
+        process.env.NODE_ENV = 'production';
+        process.env.OFFERS_INCLUDE_DEMO = 'false';
+
+        const click = await fetch(`${origin}/api/click/1`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                Authorization: `Bearer ${jwt.sign({ id: 1 }, 'demo-click-test-secret')}`
+            },
+            body: '{}'
+        });
+        assert.equal(click.status, 404);
+        // The point of refusing here: a recorded click can never resolve, so the row would
+        // sit in `clicks` looking like a real tracked click forever.
+        assert.equal(recorded.length, 0, 'no click row may be written for a demo offer this deployment cannot run');
+
+        // And the message has to explain itself. A bare 404 for an offer the user can see
+        // is indistinguishable from a broken link.
+        const text = await click.text();
+        assert.match(text, /test offer/i);
+        assert.doesNotMatch(text, /not found/i);
+    } finally {
+        pool.query = originalQuery;
+        for (const [key, value] of [['JWT_SECRET', priorSecret], ['NODE_ENV', priorEnvironment], ['OFFERS_INCLUDE_DEMO', priorOverride]]) {
+            if (value === undefined) delete process.env[key];
+            else process.env[key] = value;
+        }
+    }
+});
+
+test('a click that cannot run here returns the user to the catalog with a reason', async () => {
+    const originalQuery = pool.query;
+    const priorEnvironment = process.env.NODE_ENV;
+    const priorOverride = process.env.OFFERS_INCLUDE_DEMO;
+    const priorBase = process.env.APP_BASE_URL;
+    const clickId = '305e6314-02c3-4c6a-8365-f8588f335dfb';
+
+    pool.query = async (query) => {
+        if (/SELECT offers.tracking_url/i.test(query)) {
+            return { rows: [{ tracking_url: 'https://partner.example/go', is_demo: true, offer_type: 'survey' }] };
+        }
+        return { rows: [] };
+    };
+
+    try {
+        process.env.NODE_ENV = 'production';
+        process.env.OFFERS_INCLUDE_DEMO = 'false';
+        delete process.env.APP_BASE_URL;
+
+        const engage = await fetch(`${origin}/offer/engage?aff_sub=${clickId}`, { redirect: 'manual' });
+
+        // The old behaviour was a 404 page reading "Demo offer not found.", which reads as
+        // a broken link and tells the user nothing. The user is now returned somewhere they
+        // can keep working, and told why.
+        assert.equal(engage.status, 302);
+        const location = engage.headers.get('location') || '';
+        assert.match(location, /\/offers/);
+        assert.match(location, /notice=demo-unavailable/);
+        // A redirect must not be cached, or a proxy would keep sending later users here.
+        assert.match(engage.headers.get('cache-control') || '', /no-store/);
+    } finally {
+        pool.query = originalQuery;
+        for (const [key, value] of [['NODE_ENV', priorEnvironment], ['OFFERS_INCLUDE_DEMO', priorOverride], ['APP_BASE_URL', priorBase]]) {
+            if (value === undefined) delete process.env[key];
+            else process.env[key] = value;
+        }
+    }
 });

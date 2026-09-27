@@ -1,6 +1,7 @@
 const { v4: uuidv4 } = require('uuid');
 const pool = require('../config/db');
 const { resolvePublicBaseUrl } = require('../services/publicBaseUrl');
+const { isDemoModeEnabled } = require('../services/demoMode');
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -8,6 +9,8 @@ const { resolvePublicBaseUrl } = require('../services/publicBaseUrl');
 
 const ENGAGE_PATH = '/offer/engage';
 const DEMO_PATH = '/demo';
+/** Where a click that cannot be completed here is sent, so the user is not stranded. */
+const ENGAGE_CATALOG_PATH = '/offers';
 
 /**
  * The query parameter that carries the click id on *our* engage URL. It is
@@ -136,10 +139,25 @@ function redirectNoStore(res, status, location) {
 // Click tracking
 // ---------------------------------------------------------------------------
 
-/** Loads and validates an offer's tracking URL. */
+/**
+ * Loads and validates an offer's tracking URL.
+ *
+ * `is_demo` comes back with it because a demo offer is only clickable where the demo flow
+ * is actually available. Recording a click for a demo offer in a deployment that cannot
+ * complete it produces a row that can never resolve: the engage hop 404s, the reward never
+ * posts back, and the click sits in the table looking like a real tracked click. Refusing
+ * to record it is what stops that row existing.
+ */
 async function loadOfferTrackingUrl(offerId) {
-    const result = await pool.query('SELECT tracking_url FROM offers WHERE id = $1', [offerId]);
+    const result = await pool.query(
+        'SELECT tracking_url, is_demo FROM offers WHERE id = $1',
+        [offerId]
+    );
     if (result.rows.length === 0) return { status: 'not_found' };
+    const isDemo = result.rows[0].is_demo === true;
+    if (isDemo && !isDemoModeEnabled()) {
+        return { status: 'demo_unavailable' };
+    }
     const url = safeParseHttpUrl(result.rows[0].tracking_url);
     if (!url) return { status: 'invalid' };
     return { status: 'ok', url };
@@ -155,6 +173,14 @@ async function createTrackedClick(req, res, redirectImmediately) {
         const offer = await loadOfferTrackingUrl(offerId);
         if (offer.status === 'not_found') {
             return res.status(404).send('Offer not found.');
+        }
+        if (offer.status === 'demo_unavailable') {
+            // 404, because from this deployment's point of view the offer does not exist.
+            // The message says *why*, though: a bare "not found" for an offer the user can
+            // see in front of them is indistinguishable from a bug, and this one was
+            // reported as a broken survey rather than as a disabled test offer.
+            console.warn(`Refused a click on demo offer ${offerId}: demo mode is off in this deployment.`);
+            return res.status(404).send('That offer is a test offer and is not available in this environment.');
         }
         if (offer.status === 'invalid') {
             console.error(`Offer ${offerId} has an invalid tracking URL.`);
@@ -221,8 +247,26 @@ async function engageClick(req, res) {
         const offer = clickResult.rows[0];
 
         if (offer.is_demo) {
-            if (process.env.NODE_ENV === 'production') {
-                return res.status(404).send('Demo offer not found.');
+            if (!isDemoModeEnabled()) {
+                // The click exists because it was recorded when demo mode was on -- in
+                // local development, or on a deployment that has since turned it off, and
+                // the row is in a database both share. The old response was a bare
+                // "Demo offer not found.", which reads as a broken link and tells the
+                // user nothing they can act on.
+                //
+                // It also 302s back to the catalog rather than dead-ending on a 404 page,
+                // so the user lands somewhere they can keep working.
+                console.warn(
+                    `Click ${clickId} is for a demo offer, but demo mode is off in this ` +
+                    'deployment, so it cannot be completed here. Returning to the catalog.'
+                );
+                const catalogUrl = buildPublicUrl(ENGAGE_CATALOG_PATH);
+                // The relative fallback keeps the notice. Returning a bare `/offers` here
+                // would land the user on the catalog with no explanation, which is the
+                // dead end this branch exists to avoid -- and it would do so exactly when
+                // the deployment is misconfigured enough that `buildPublicUrl` fails.
+                const fallback = `${ENGAGE_CATALOG_PATH}?notice=demo-unavailable`;
+                return redirectNoStore(res, 302, catalogUrl ? `${catalogUrl.toString()}?notice=demo-unavailable` : fallback);
             }
             const demoUrl = buildPublicUrl(DEMO_PATH);
             if (!demoUrl) {
