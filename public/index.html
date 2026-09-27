@@ -48,10 +48,15 @@
                     <span id="offer-count">Loading offers</span>
                 </div>
                 <div class="catalog-filters">
+                    <div class="filter-chips" role="group" aria-label="Filter offers by type">
+                        <button type="button" class="filter-chip" data-offer-type="all" aria-pressed="true">All</button>
+                        <button type="button" class="filter-chip" data-offer-type="offer" aria-pressed="false">Offers</button>
+                        <button type="button" class="filter-chip" data-offer-type="survey" aria-pressed="false">Surveys</button>
+                    </div>
                     <label class="search-field">
                         <span class="visually-hidden">Search offers</span>
                         <span class="search-icon" aria-hidden="true"></span>
-                        <input id="offer-search" type="search" placeholder="Search offers" autocomplete="off">
+                        <input id="offer-search" type="search" placeholder="Search by title, partner, or keyword" autocomplete="off">
                     </label>
                     <label class="sort-field">
                         <span class="visually-hidden">Sort offers</span>

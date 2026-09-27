@@ -8,14 +8,32 @@ const fraudDetection = require('../middlewares/fraudDetection');
 const requireAuth = require('../middlewares/requireAuth');
 const pool = require('../config/db');
 
-// --- Frontend Data Routes ---
+/**
+ * The offer catalog, which is the only thing the landing page needs to render.
+ *
+ * Demo offers are excluded in production. They were served unconditionally, and every one
+ * of them is a dead end there: `/offer/engage` redirects a demo click to `/demo`, which
+ * answers 404 in production, and `/api/demo/complete` does the same. So a production
+ * visitor could browse a "Take survey" card, sign in, click it, and be sent to a 404 --
+ * the catalog was advertising an offer the deployment could not honour.
+ *
+ * `tracking_url` is deliberately absent. Sending it would let anyone append their own
+ * aff_sub to the advertiser directly and collect credit for clicks that were never
+ * recorded, which is the entire thing the tracking hop exists to prevent.
+ *
+ * The response is short-cached by `vercel.json`. These rows are public, change rarely, and
+ * are identical for every visitor, so a 30 second window removes most of the function
+ * invocations the catalog costs without making a new offer feel late.
+ */
 router.get('/api/offers', async (req, res) => {
     try {
+        const includeDemo = process.env.NODE_ENV !== 'production';
         const result = await pool.query(
-            `SELECT id, title, payout, network_name, is_demo, offer_type
+            `SELECT id, title, description, payout, network_name, partner_label, is_demo, offer_type
              FROM offers
-             WHERE is_active IS TRUE
-             ORDER BY created_at DESC, id DESC`
+             WHERE is_active IS TRUE AND ($1::boolean OR is_demo IS FALSE)
+             ORDER BY created_at DESC, id DESC`,
+            [includeDemo]
         );
         res.json(result.rows);
     } catch (error) {

@@ -690,6 +690,30 @@ h1, h2, h3, h4 { line-height: 1.15; text-wrap: balance; font-weight: 400; }
 .count-mark { width: 7px; height: 7px; flex: 0 0 auto; border-radius: 50%; background: var(--success); box-shadow: 0 0 0 4px color-mix(in srgb, var(--success) 20%, transparent); }
 .catalog-filters { display: flex; gap: 10px; }
 
+/* Type filter chips.
+   A button group rather than a select because the active filter has to stay visible while
+   a long list is scrolled, and because the counts next to each chip are only meaningful
+   beside the label they belong to. `aria-pressed` is the state; the styles below are the
+   visual mirror of it, so a chip that is pressed is always distinguishable without colour
+   alone -- it also changes its background, its border, and its text weight. */
+.filter-chips { display: flex; gap: 4px; padding: 3px; border: 1px solid var(--line-strong); border-radius: var(--r-sm); background-color: var(--surface-2); }
+.filter-chip {
+    height: 34px;
+    padding: 0 12px;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    color: var(--muted);
+    background: none;
+    font: inherit;
+    font-size: var(--step--1);
+    font-weight: 600;
+    cursor: pointer;
+    transition: color 0.16s var(--ease), background-color 0.16s var(--ease), border-color 0.16s var(--ease);
+}
+.filter-chip:hover { color: var(--heading); }
+.filter-chip[aria-pressed="true"] { color: var(--accent); background-color: var(--surface); border-color: var(--line-strong); box-shadow: var(--shadow-xs); }
+.filter-chip:focus-visible { outline: 2px solid var(--indigo-700); outline-offset: 1px; }
+
 .search-field, .sort-field { position: relative; display: block; }
 .search-field input, .sort-field select {
     height: 42px;
@@ -749,6 +773,22 @@ h1, h2, h3, h4 { line-height: 1.15; text-wrap: balance; font-weight: 400; }
 
 .offer-title { min-height: 3em; margin: 18px 0 12px; color: var(--heading); font-family: var(--font-display); font-size: var(--step-2); overflow-wrap: anywhere; }
 
+/* The blurb sits under the title and above the reward, clamped to two lines.
+   Clamping rather than hiding it entirely: the full text is what makes an offer
+   comparable to its neighbour, and the two lines that fit are enough to tell two offers
+   apart without turning every card into a wall of text. */
+.offer-blurb {
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+    overflow: hidden;
+    margin: -4px 0 14px;
+    color: var(--ink-soft);
+    font-size: var(--step--1);
+    line-height: 1.5;
+}
+
 .offer-reward { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin: auto 0 16px; }
 .offer-reward span { color: var(--muted); font-size: var(--step--1); }
 .offer-reward strong { color: var(--accent); font-size: var(--step-2); font-variant-numeric: tabular-nums; }
@@ -774,6 +814,11 @@ h1, h2, h3, h4 { line-height: 1.15; text-wrap: balance; font-weight: 400; }
 .start-button:hover:not(:disabled)::after { transform: translateX(3px); }
 
 .loading-state, .empty-state { grid-column: 1 / -1; padding: 48px 16px; color: var(--muted); text-align: center; }
+/* The reset action inside an empty catalog. A block-level stack so the button is not
+   centred against the text baseline, which puts it a few pixels low and reads as
+   misaligned on touch. */
+.empty-state { display: flex; flex-direction: column; align-items: center; gap: 14px; }
+.empty-state p { margin: 0; }
 .loading-dots { display: inline-block; overflow: hidden; width: 18px; vertical-align: bottom; animation: dots 1s steps(4, end) infinite; }
 
 .page-message {
@@ -1456,6 +1501,11 @@ textarea.form-control { min-height: 96px; resize: vertical; }
     .catalog-toolbar { position: static; flex-direction: column; align-items: stretch; }
     .catalog-filters { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, auto); }
     .search-field input { width: 100%; }
+    /* The chips take their own full-width row so the search box keeps the space it needs
+       for its placeholder, and each chip stretches to an even share so the three targets
+       stay thumb-sized rather than shrinking to fit their labels. */
+    .filter-chips { grid-column: 1 / -1; }
+    .filter-chips .filter-chip { flex: 1 1 0; padding: 0 8px; }
 
     /* Offers become rows rather than cards: the reward and the call to action sit on
        one line, so three offers are visible in the space one card used to take. */
@@ -1463,7 +1513,7 @@ textarea.form-control { min-height: 96px; resize: vertical; }
         min-height: 0;
         display: grid;
         grid-template-columns: minmax(0, 1fr) auto;
-        grid-template-areas: 'top top' 'title title' 'reward start';
+        grid-template-areas: 'top top' 'title title' 'blurb blurb' 'reward start';
         align-items: center;
         column-gap: 14px;
         row-gap: 0;
@@ -1471,7 +1521,8 @@ textarea.form-control { min-height: 96px; resize: vertical; }
     }
     .offer-card::before { height: 100%; inset: 0 auto 0 0; width: 4px; }
     .offer-card-top { grid-area: top; }
-    .offer-title { grid-area: title; min-height: 0; margin: 6px 0 10px; font-size: var(--step-1); }
+    .offer-title { grid-area: title; min-height: 0; margin: 6px 0 4px; font-size: var(--step-1); }
+    .offer-blurb { grid-area: blurb; margin: 0 0 12px; }
     .offer-reward { grid-area: reward; margin: 0; flex-direction: column; align-items: flex-start; gap: 2px; }
     .start-button { grid-area: start; width: auto; min-width: 116px; padding: 0 14px; }
     .start-button::after { display: none; }
@@ -1571,5 +1622,6 @@ textarea.form-control { min-height: 96px; resize: vertical; }
 @media (pointer: coarse) {
     .button, .icon-button, .amount-presets button, .choice, .deposit-method-option, .auth-mode-button, .start-button { min-height: 48px; }
     .catalog-filters .form-control, .search-field input, .sort-field select { height: 48px; }
+    .filter-chip { min-height: 48px; }
     .form-control { min-height: 48px; }
 }

@@ -212,7 +212,12 @@ const expectations = [
     ['phone', '.offer-card', 'display', { 'phone 390 (modern)': 'grid', 'laptop 1280': 'flex' }],
     // 430px sits above the 400px block, so the row layout keeps its 116px action.
     ['phone', '.start-button', 'min-width', { 'phone 430 (large)': '116px', 'phone 390 (modern)': '0', 'laptop 1280': undefined }],
-    ['phone', '.offer-card', 'grid-template-areas', { 'phone 430 (large)': "'top top' 'title title' 'reward start'", 'laptop 1280': undefined }],
+    // The blurb is a full-width row between the title and the reward. It is named rather
+    // than auto-placed: an unnamed child in a grid with template areas lands in an implicit
+    // row whose size nothing controls, which is how the row collapsed to zero height.
+    ['phone', '.offer-card', 'grid-template-areas', { 'phone 430 (large)': "'top top' 'title title' 'blurb blurb' 'reward start'", 'laptop 1280': undefined }],
+    // The blurb must be given its own area on mobile too, or it lands in that implicit row.
+    ['phone', '.offer-blurb', 'grid-area', { 'phone 390 (modern)': 'blurb', 'laptop 1280': undefined }],
     ['phone', '.offer-grid', 'grid-template-columns', { 'phone 390 (modern)': 'minmax(0, 1fr)', 'laptop 1280': 'repeat(3, minmax(0, 1fr))', 'wide 1920': 'repeat(4, minmax(0, 1fr))' }],
     // The base .dialog must state inset/margin explicitly. The `* { margin: 0 }` reset
     // overrides the UA's `dialog:modal` centring, which is what left dialogs pinned to

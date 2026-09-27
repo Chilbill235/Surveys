@@ -55,6 +55,12 @@
             ]
         },
         {
+            "source": "/api/offers",
+            "headers": [
+                { "key": "Cache-Control", "value": "public, max-age=30, stale-while-revalidate=60" }
+            ]
+        },
+        {
             "source": "/(style|app|home|demo|reset-password|deposit-receipt).js",
             "headers": [
                 { "key": "Cache-Control", "value": "public, max-age=3600, must-revalidate" }

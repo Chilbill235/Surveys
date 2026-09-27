@@ -12,7 +12,7 @@
 
 const accountTokenKey = 'offerNetworkSessionToken';
 
-const offerState = { all: [], search: '', sort: 'featured' };
+const offerState = { all: [], search: '', sort: 'featured', type: 'all' };
 const depositState = { options: null, method: 'crypto' };
 /**
  * Ids of deposits already seen in a credited state.
@@ -126,6 +126,20 @@ document.addEventListener('DOMContentLoaded', () => {
     document.getElementById('offer-sort').addEventListener('change', (event) => {
         offerState.sort = event.target.value;
         renderOffers();
+    });
+    // The type chips are a filter rather than a select because they are the one control
+    // whose current value has to stay visible while scrolling a long list. `aria-pressed`
+    // carries the state instead of a class alone, so the filter is announced as well as
+    // drawn -- and a chip group is not a tablist, because it filters one list rather than
+    // swapping between panels.
+    document.querySelectorAll('[data-offer-type]').forEach((button) => {
+        button.addEventListener('click', () => {
+            offerState.type = button.dataset.offerType;
+            document.querySelectorAll('[data-offer-type]').forEach((other) => {
+                other.setAttribute('aria-pressed', String(other === button));
+            });
+            renderOffers();
+        });
     });
     document.querySelectorAll('[data-close]').forEach((button) => {
         button.addEventListener('click', () => document.getElementById(button.dataset.close).close());
@@ -254,12 +268,32 @@ async function loadOffers() {
     }
 }
 
+/**
+ * Everything a card can be matched or sorted on, lower-cased once.
+ *
+ * Search used to compare the title alone, so typing a partner name or "survey" found
+ * nothing even though both were on screen. The blurb is included too, which is what makes
+ * a keyword search useful rather than decorative.
+ */
+function offerSearchText(offer) {
+    return [
+        offer.title,
+        offer.description,
+        offer.network_name,
+        offer.partner_label,
+        offer.is_demo ? 'demo test' : '',
+        offer.offer_type === 'survey' ? 'survey questionnaire' : 'offer task'
+    ].filter(Boolean).join(' ').toLowerCase();
+}
+
 function renderOffers() {
     const grid = document.getElementById('offer-grid');
     const count = document.getElementById('offer-count');
-    const visible = offerState.all.filter((offer) =>
-        String(offer.title || '').toLowerCase().includes(offerState.search)
-    );
+    const visible = offerState.all.filter((offer) => {
+        if (offerState.type !== 'all' && offer.offer_type !== offerState.type) return false;
+        if (!offerState.search) return true;
+        return offerSearchText(offer).includes(offerState.search);
+    });
 
     if (offerState.sort === 'payout-high') {
         visible.sort((a, b) => Number(b.payout) - Number(a.payout));
@@ -269,15 +303,42 @@ function renderOffers() {
         visible.sort((a, b) => String(a.title).localeCompare(String(b.title)));
     }
 
-    count.textContent = `${visible.length} ${visible.length === 1 ? 'offer' : 'offers'}`;
+    // The count states the total as well as the visible number whenever a filter is
+    // hiding something. "0 offers" on a list of twelve reads as an outage; "0 of 12 match"
+    // reads as what it is, which is a search that found nothing.
+    const filtering = offerState.type !== 'all' || Boolean(offerState.search);
+    const total = offerState.all.length;
+    count.textContent = filtering
+        ? `${visible.length} of ${total} ${total === 1 ? 'offer' : 'offers'}`
+        : `${visible.length} ${visible.length === 1 ? 'offer' : 'offers'}`;
     grid.replaceChildren();
 
     if (visible.length === 0) {
-        const empty = document.createElement('p');
+        const empty = document.createElement('div');
         empty.className = 'empty-state';
-        empty.textContent = offerState.all.length === 0
+        const message = document.createElement('p');
+        message.textContent = offerState.all.length === 0
             ? 'There are no offers available right now. Check back soon.'
-            : 'No offers match your search.';
+            : 'No offers match these filters.';
+        empty.append(message);
+        // A filter that cannot be undone from the screen is a dead end, so the empty state
+        // offers the reset rather than only reporting the problem.
+        if (offerState.all.length > 0) {
+            const reset = document.createElement('button');
+            reset.type = 'button';
+            reset.className = 'inline-action';
+            reset.textContent = 'Clear filters';
+            reset.addEventListener('click', () => {
+                offerState.search = '';
+                offerState.type = 'all';
+                document.getElementById('offer-search').value = '';
+                document.querySelectorAll('[data-offer-type]').forEach((chip) => {
+                    chip.setAttribute('aria-pressed', String(chip.dataset.offerType === 'all'));
+                });
+                renderOffers();
+            });
+            empty.append(reset);
+        }
         grid.append(empty);
         return;
     }
@@ -300,12 +361,24 @@ function renderOffers() {
         id.textContent = `OFFER ${offer.id}`;
         const type = document.createElement('span');
         type.className = 'offer-type';
-        type.textContent = `${isSurvey ? 'Survey' : 'Offer'} | ${String(offer.network_name || 'Partner')}`;
+        // The partner label is preferred over the tracking network name, which is written
+        // for a tracking URL rather than for a person deciding whether to start a task.
+        type.textContent = `${isSurvey ? 'Survey' : 'Offer'} | ${offer.partner_label || offer.network_name || 'Partner'}`;
         top.append(id, type);
 
         const heading = document.createElement('h2');
         heading.className = 'offer-title';
         heading.textContent = title;
+
+        // The blurb is the reason the card is worth reading, so it is a real paragraph
+        // rather than a title attribute: it is the only text on the card that says what the
+        // user has to do.
+        if (offer.description) {
+            const blurb = document.createElement('p');
+            blurb.className = 'offer-blurb';
+            blurb.textContent = offer.description;
+            card.append(blurb);
+        }
 
         const reward = document.createElement('div');
         reward.className = 'offer-reward';
