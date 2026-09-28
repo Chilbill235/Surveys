@@ -31,11 +31,12 @@ const demoClickId = params.get('click_id') || '';
 const demoType = params.get('type') === 'survey' ? 'survey' : 'offer';
 
 /**
- * Where the participant is returned to.
+ * Where the participant is returned to after completion.
  *
- * Always the offer wall rather than a value from the query string: an open redirect built
- * from a URL parameter is a way to make this page's "return to RewardZone" link land
- * somewhere else wearing its name.
+ * Always the offer wall by default rather than a value from the query string: an open redirect
+ * built from a URL parameter is a way to make this page's "return to RewardZone" link land
+ * somewhere else wearing its name. The server may override it with the offer's own
+ * `completion_url`, which is part of the offer rather than of this page.
  */
 const RETURN_TO = '/offers';
 
@@ -319,32 +320,45 @@ function showResult(data) {
     const repeat = Boolean(data.alreadyCompleted);
 
     result.classList.toggle('is-repeat', repeat);
-    result.textContent = repeat
-        ? `This task was already completed. Test-only balance: ${formatMoney(data.demoBalance)}.`
-        : `Added ${formatMoney(data.credited)} to your test-only balance. New test balance: ${formatMoney(data.demoBalance)}.`;
+    if (data.cashValue) {
+        result.textContent = repeat
+            ? `This task was already completed. Your balance: ${formatMoney(data.balance)}.`
+            : `Added ${formatMoney(data.credited)} to your balance. New balance: ${formatMoney(data.balance)}.`;
+    } else {
+        result.textContent = repeat
+            ? `This task was already completed. Test-only balance: ${formatMoney(data.demoBalance)}.`
+            : `Added ${formatMoney(data.credited)} to your test-only balance. New test balance: ${formatMoney(data.demoBalance)}.`;
+    }
     result.hidden = false;
 
     document.getElementById('demo-progress').hidden = true;
     document.getElementById('survey-back').hidden = true;
-    setMessage('Saved. This is simulated test credit only and has no cash value.', 'success');
-    startReturnCountdown();
+    setMessage(data.cashValue
+        ? 'Saved. This reward was paid to your real balance.'
+        : 'Saved. This is simulated test credit only and has no cash value.',
+        'success');
+    startReturnCountdown(data.returnTo || RETURN_TO);
 }
 
 /**
- * Counts down to the offer wall, and returns there.
+ * Counts down to the return target, and sends the participant there.
  *
  * This is the difference between a survey that feels finished and one that feels abandoned.
  * The countdown is visible and the link works at any point, so the automatic return is a
  * convenience rather than something that has to be waited out -- a participant who wants to
  * look at another offer can leave in the first second.
  */
-function startReturnCountdown() {
+function startReturnCountdown(target) {
+    const destination = typeof target === 'string' && target.startsWith('/')
+        ? target
+        : RETURN_TO;
     const countdown = document.getElementById('return-countdown');
     const link = document.getElementById('return-link');
     if (!countdown || !link) return;
 
     countdown.hidden = false;
     link.hidden = false;
+    link.href = destination;
 
     let remaining = RETURN_DELAY_SECONDS;
     const paint = () => {
@@ -352,7 +366,7 @@ function startReturnCountdown() {
         if (remaining <= 0) {
             window.clearInterval(returnTimer);
             returnTimer = null;
-            window.location.assign(RETURN_TO);
+            window.location.assign(destination);
             return;
         }
         remaining -= 1;

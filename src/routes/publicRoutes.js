@@ -62,6 +62,11 @@ function resolveIncludeDemo() {
  * that were never recorded, which is the entire thing the tracking hop exists
  * to prevent.
  *
+ * The catalog is filtered and sorted in the browser, so the columns it sorts
+ * and filters on are read on every load. `payout` had no index, and every
+ * query that lists the catalog also orders by it when the user asks for
+ * highest-first.
+ *
  * The cache header is set before the query so a slow query still produces a
  * cacheable response, and cleared on the error path so a proxy or a browser
  * never caches a transient failure for 30 seconds.
@@ -72,7 +77,9 @@ async function handleListOffers(req, res) {
     try {
         const includeDemo = resolveIncludeDemo();
         const result = await pool.query(
-            `SELECT id, title, description, payout, network_name, partner_label, is_demo, offer_type
+            `SELECT id, title, description, payout, network_name, partner_label,
+                    is_demo, offer_type, pays_real_money, estimated_minutes,
+                    completion_url
              FROM offers
              WHERE is_active IS TRUE
                AND ($1::boolean OR is_demo IS FALSE)

@@ -1,4 +1,5 @@
 const pool = require('../config/db');
+const payoutEmails = require('./payoutEmails');
 
 /**
  * The terminal states a withdrawal can be moved to, and which of them keep the money.
@@ -15,6 +16,30 @@ const resolvableStatuses = new Set(['pending', 'processing']);
 
 /** Withdrawal statuses that mean the funds left the platform and must never be refunded. */
 const settledStatuses = new Set(['paid']);
+
+/**
+ * The columns the two terminal writes return. The email address is fetched separately
+ * inside the transaction, after the write succeeds, because an UPDATE cannot join another
+ * table in its RETURNING clause -- and the address is the one thing that has to be right
+ * for the notification to reach the right person, so it is read from the row that was
+ * actually closed rather than from a parallel lookup that could describe a different one.
+ */
+const WITHDRAWAL_RETURN_COLUMNS = [
+    'id', 'user_id', 'amount', 'status', 'provider_reference',
+    'payment_method', 'payment_address', 'asset_code', 'network'
+];
+
+/** Reads the recipient address for a withdrawal that has just been closed. */
+async function recipientEmail(client, withdrawalId) {
+    const row = await client.query(
+        `SELECT u.email
+         FROM withdrawals w
+         JOIN users u ON u.id = w.user_id
+         WHERE w.id = $1`,
+        [withdrawalId]
+    );
+    return row.rows[0]?.email || null;
+}
 
 /**
  * Marks a withdrawal as sent, recording the provider reference that proves it.
@@ -43,13 +68,15 @@ async function markWithdrawalPaid(client, withdrawalId, providerReference) {
         `UPDATE withdrawals
          SET status = 'paid', provider_reference = $1, paid_at = NOW(), failure_reason = NULL, updated_at = NOW()
          WHERE id = $2 AND status = ANY($3)
-         RETURNING id, user_id, amount, status`,
+         RETURNING ${WITHDRAWAL_RETURN_COLUMNS.join(', ')}`,
         [reference, withdrawalId, [...resolvableStatuses]]
     );
     if (claimed.rows.length === 0) {
         return { changed: false, reason: await describeUnclaimable(client, withdrawalId) };
     }
-    return { changed: true, withdrawal: claimed.rows[0] };
+    const withdrawal = claimed.rows[0];
+    withdrawal.user_email = await recipientEmail(client, withdrawal.id);
+    return { changed: true, withdrawal };
 }
 
 /**
@@ -78,8 +105,12 @@ async function markWithdrawalPaid(client, withdrawalId, providerReference) {
  */
 async function refundWithdrawal(client, withdrawalId, reason) {
     const settled = await client.query(
-        `SELECT id, user_id, amount, status, provider_reference
-         FROM withdrawals WHERE id = $1 FOR UPDATE`,
+        `SELECT w.id, w.user_id, w.amount, w.status, w.provider_reference,
+                w.payment_method, w.payment_address, w.asset_code, w.network,
+                u.email AS user_email
+         FROM withdrawals w
+         JOIN users u ON u.id = w.user_id
+         WHERE w.id = $1 FOR UPDATE`,
         [withdrawalId]
     );
     if (settled.rows.length === 0) {
@@ -104,12 +135,16 @@ async function refundWithdrawal(client, withdrawalId, reason) {
         `UPDATE withdrawals
          SET status = 'failed', failure_reason = $1, updated_at = NOW()
          WHERE id = $2 AND status = ANY($3)
-         RETURNING id, user_id, amount, status`,
+         RETURNING ${WITHDRAWAL_RETURN_COLUMNS.join(', ')}`,
         [failureReason, withdrawalId, [...resolvableStatuses]]
     );
     if (closed.rows.length === 0) {
         return { changed: false, reason: 'already-resolved', withdrawal };
     }
+    // The email came from the pre-flight SELECT above, not from this UPDATE, because an
+    // UPDATE cannot join another table in its RETURNING clause. Carried over so the caller
+    // can notify the right person without a second lookup against a row that may have moved.
+    closed.rows[0].user_email = withdrawal.user_email;
 
     const balanceUpdate = await client.query(
         'UPDATE users SET balance = balance + $1 WHERE id = $2 RETURNING balance',
@@ -191,14 +226,60 @@ async function withTransaction(work) {
     }
 }
 
-/** Sends a withdrawal. `withdrawalId` is coerced so a route param cannot reach SQL as-is. */
-function sendWithdrawal(withdrawalId, providerReference) {
-    return withTransaction((client) => markWithdrawalPaid(client, Number(withdrawalId), providerReference));
+/**
+ * Sends a withdrawal. `withdrawalId` is coerced so a route param cannot reach SQL as-is.
+ *
+ * The notification is fired after the transaction commits, never inside it. A mail call
+ * belongs to the outcome, not to the write: sending it from within the transaction would
+ * couple a provider outage to the payout, and the one thing this module must never do is
+ * make a successful payout look like a failure. The email is advisory and is awaited
+ * neither for the response nor for the balance, so a mail provider that is down leaves the
+ * payout intact and the user simply uninformed.
+ */
+async function sendWithdrawal(withdrawalId, providerReference) {
+    const result = await withTransaction((client) =>
+        markWithdrawalPaid(client, Number(withdrawalId), providerReference)
+    );
+    if (result.changed) {
+        await notifySent(result.withdrawal).catch(() => {});
+    }
+    return result;
 }
 
 /** Closes a withdrawal and refunds the balance. */
-function reverseWithdrawal(withdrawalId, reason) {
-    return withTransaction((client) => refundWithdrawal(client, Number(withdrawalId), reason));
+async function reverseWithdrawal(withdrawalId, reason) {
+    const result = await withTransaction((client) =>
+        refundWithdrawal(client, Number(withdrawalId), reason)
+    );
+    if (result.changed) {
+        await notifyRefunded(result.withdrawal, reason).catch(() => {});
+    }
+    return result;
+}
+
+/** Fires the "your money was sent" message, if there is an address to send it to. */
+async function notifySent(withdrawal) {
+    const email = String(withdrawal?.user_email || '').trim();
+    if (!email) return;
+    await payoutEmails.sendWithdrawalSentEmail({
+        to: email,
+        amount: withdrawal.amount,
+        assetCode: withdrawal.asset_code,
+        network: withdrawal.network,
+        destination: withdrawal.payment_address,
+        batchId: withdrawal.provider_reference
+    });
+}
+
+/** Fires the "your money is back" message, if there is an address to send it to. */
+async function notifyRefunded(withdrawal, reason) {
+    const email = String(withdrawal?.user_email || '').trim();
+    if (!email) return;
+    await payoutEmails.sendWithdrawalRefundedEmail({
+        to: email,
+        amount: withdrawal.amount,
+        reason
+    });
 }
 
 /**

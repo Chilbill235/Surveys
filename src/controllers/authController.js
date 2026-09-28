@@ -369,14 +369,14 @@ const authController = {
 
             const passwordHash = await hashPassword(password);
             const username = `member_${randomUUID().replaceAll('-', '').slice(0, 16)}`;
-            const result = await client.query(
-                `INSERT INTO users (username, email, password_hash, email_verified_at)
-                 VALUES ($1, $2, $3, $4)
-                 RETURNING id, email, balance, demo_balance`,
-                // Confirmed at creation only on the development path above; production always
-                // leaves this NULL until a code proves the address.
-                [username, email, passwordHash, emailReady ? null : new Date()]
-            );
+const result = await client.query(
+            `INSERT INTO users (username, email, password_hash, email_verified_at)
+             VALUES ($1, $2, $3, $4)
+             RETURNING id, email, balance, demo_balance, token_version`,
+            // Confirmed at creation only on the development path above; production always
+            // leaves this NULL until a code proves the address.
+            [username, email, passwordHash, emailReady ? null : new Date()]
+        );
             const user = result.rows[0];
 
             if (emailReady) {

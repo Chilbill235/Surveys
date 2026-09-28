@@ -541,6 +541,12 @@ async function handlePayoutRun(req, res) {
     });
     const outcome = await autoPayouts.submitClaimedPayouts(claimed);
 
+    // One line per withdrawal, so a run that reports only a count cannot leave an operator
+    // wondering whether a silent failure left a user waiting.
+    console.log(`Payout run: ${claimed.length} claimed, ${outcome.submitted} submitted, ` +
+        `${outcome.released} released, ${outcome.uncertain} uncertain` +
+        (outcome.error ? `, error: ${outcome.error}` : ''));
+
     return res.json({
         ok: true,
         dryRun: false,
@@ -552,6 +558,9 @@ async function handlePayoutRun(req, res) {
         // They stay claimed on purpose and are listed for the operator to reconcile.
         uncertain: outcome.uncertain,
         skipped,
+        // Per-withdrawal verdict, so the operator can see which rows were sent, released,
+        // or held -- and why.
+        outcomes: outcome.outcomes || [],
         ...(outcome.error ? { error: outcome.error } : {})
     });
 }

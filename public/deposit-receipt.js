@@ -17,9 +17,15 @@ const terminalStatuses = new Set(['confirmed', 'paid', 'failed', 'expired', 'can
 
 let pollTimer;
 
-/** The deposit id is the last path segment: /deposit/1234 */
+/** The deposit id is the last path segment: /deposit/1234.
+ *
+ * `RegExp#test` returns a boolean, and using it as if it returned a match array is how this
+ * page used to show "That link does not point at a deposit" for every URL including the ones
+ * that did: `match[1]` was always undefined. `exec` returns the array, which is what makes the
+ * capture group reachable.
+ */
 function depositIdFromLocation() {
-    const match = /\/deposit\/(\d+)\/?$/.test(window.location.pathname);
+    const match = /\/deposit\/(\d+)\/?$/.exec(window.location.pathname);
     return match ? match[1] : null;
 }
 

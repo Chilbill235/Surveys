@@ -947,11 +947,14 @@ function renderOffers() {
 
         // Surveys are the only kind with a predictable length, and stating it is what a
         // survey provider does. It is the question people actually ask before committing to
-        // one, and an unanswered "how long is this?" reads as an unbounded task.
-        if (isSurvey) {
+        // one, and an unanswered "how long is this?" reads as an unbounded task. The estimate
+        // comes from the offer row when it is set, so an operator who knows the survey takes
+        // five minutes can say so on the card instead of leaving the page to guess.
+        const estimated = Number(offer.estimated_minutes);
+        if (isSurvey && Number.isFinite(estimated) && estimated > 0) {
             const estimate = document.createElement('span');
             estimate.className = 'offer-estimate';
-            estimate.textContent = '~2 min';
+            estimate.textContent = `~${estimated} min`;
             top.append(estimate);
         }
 
@@ -972,15 +975,32 @@ function renderOffers() {
         const reward = document.createElement('div');
         reward.className = 'offer-reward';
         const rewardLabel = document.createElement('span');
-        rewardLabel.textContent = offer.is_demo ? 'Test-only reward' : 'Reward';
+        if (offer.is_demo && offer.pays_real_money) {
+            rewardLabel.textContent = 'Real reward';
+        } else if (offer.is_demo) {
+            rewardLabel.textContent = 'Test-only reward';
+        } else {
+            rewardLabel.textContent = 'Reward';
+        }
         const amount = document.createElement('strong');
-        if (offer.is_demo) {
+        if (offer.is_demo && !offer.pays_real_money) {
             amount.className = 'demo-reward';
             amount.textContent = Number.isFinite(payout) ? `${formatBalance(payout)} demo` : '--';
         } else {
             amount.textContent = Number.isFinite(payout) ? formatBalance(payout) : '--';
         }
         reward.append(rewardLabel, amount);
+
+        // A demo offer that pays real money is worth a second line of explanation. Without
+        // it a participant sees "Real reward" and has no idea the money is theirs to keep,
+        // which is the entire difference between a test offer and a real one.
+        if (offer.is_demo && offer.pays_real_money) {
+            const note = document.createElement('p');
+            note.className = 'offer-blurb';
+            note.style.color = 'var(--muted)';
+            note.textContent = 'Pays real money in this test environment.';
+            card.append(note);
+        }
 
         const start = document.createElement('button');
         start.className = 'start-button';

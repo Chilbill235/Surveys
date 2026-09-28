@@ -1,3 +1,31 @@
+/**
+ * Where the participant is returned to after completion.
+ *
+ * The offer's own `completion_url` wins when it is set, because the redirect is part of the
+ * offer rather than of the page: an offer added without editing the page script used to send
+ * everyone back to the catalog, which is a silent loss of the audience that offer paid for.
+ * The catalog is the fallback, and it is never a value from the request, because an open
+ * redirect built from a URL parameter is a way to make this page's "return to RewardZone"
+ * link land somewhere else wearing its name.
+ */
+function resolveCompletionUrl(offer) {
+    const fallback = '/offers';
+    const candidate = String(offer?.completion_url || '').trim();
+    if (!candidate) return fallback;
+    try {
+        const url = new URL(candidate, 'http://localhost');
+        if (url.protocol !== 'http:' && url.protocol !== 'https:') return fallback;
+        if (url.username || url.password) return fallback;
+        // Only a same-origin path is allowed. A fully-qualified URL here would be an open
+        // redirect, which is exactly what the fallback exists to avoid.
+        if (candidate.startsWith('//') || /^https?:\/\//i.test(candidate)) return fallback;
+        if (!candidate.startsWith('/')) return fallback;
+        return candidate;
+    } catch {
+        return fallback;
+    }
+}
+
 const pool = require('../config/db');
 const { isDemoModeEnabled } = require('../services/demoMode');
 const { loadSurveyQuestions, answersAreValid, sanitiseAnswers } = require('../services/surveyService');
@@ -45,7 +73,8 @@ const demoController = {
             client = await pool.connect();
             await client.query('BEGIN');
             const click = await client.query(
-                `SELECT clicks.user_id, offers.is_demo, offers.offer_type, offers.payout
+                `SELECT clicks.user_id, offers.is_demo, offers.offer_type, offers.payout,
+                        offers.pays_real_money, offers.completion_url
                  FROM clicks
                  JOIN offers ON offers.id = clicks.offer_id
                  WHERE clicks.click_id = $1 AND clicks.user_id = $2
@@ -81,14 +110,16 @@ const demoController = {
             );
             if (priorConversion.rows.length > 0) {
                 const user = await client.query(
-                    'SELECT demo_balance FROM users WHERE id = $1',
+                    'SELECT demo_balance, balance FROM users WHERE id = $1',
                     [req.user.id]
                 );
                 await client.query('COMMIT');
                 return res.json({
                     alreadyCompleted: true,
                     demoBalance: user.rows[0].demo_balance,
-                    cashValue: false
+                    balance: user.rows[0].balance,
+                    cashValue: false,
+                    returnTo: resolveCompletionUrl(offer)
                 });
             }
 
@@ -97,11 +128,45 @@ const demoController = {
                 throw new Error('Demo reward is invalid.');
             }
 
+            // A demo offer can pay real money. This is opt-in and off by default: a deployment
+            // that never sets OFFERS_TEST_REAL=true still cannot move cash through the demo
+            // flow, which is the whole point of the flag. Without it every demo completion is a
+            // non-cash credit to demo_balance, and the flag is what lets a test environment
+            // turn that into a real balance move for verifying payouts end to end.
+            const paysReal = offer.pays_real_money === true
+                && process.env.OFFERS_TEST_REAL === 'true';
+
             await client.query(
                 `INSERT INTO conversions (click_id, payout, status, details)
                  VALUES ($1, $2, 'approved', $3::jsonb)`,
                 [clickId, payout, JSON.stringify(recorded)]
             );
+
+            if (paysReal) {
+                const updatedUser = await client.query(
+                    'UPDATE users SET balance = balance + $1 WHERE id = $2 RETURNING balance',
+                    [payout, req.user.id]
+                );
+                // A real-money test completion is a real balance move, so it is written to the
+                // cash ledger without the demo flag. The flag is what keeps "balance equals the
+                // sum of my cash ledger" a query; marking this row demo would break that
+                // invariant for a payout the operator has actually sent.
+                await client.query(
+                    `INSERT INTO balance_transactions
+                        (user_id, amount, transaction_type, source_id, description, is_demo)
+                     VALUES ($1, $2, 'adjustment', $3, 'Test offer reward', FALSE)`,
+                    [req.user.id, payout, `demo:${clickId}`]
+                );
+                await client.query('COMMIT');
+                return res.json({
+                    credited: payout,
+                    balance: updatedUser.rows[0].balance,
+                    demoBalance: null,
+                    cashValue: true,
+                    returnTo: resolveCompletionUrl(offer)
+                });
+            }
+
             const updatedUser = await client.query(
                 'UPDATE users SET demo_balance = demo_balance + $1 WHERE id = $2 RETURNING demo_balance',
                 [payout, req.user.id]
@@ -122,7 +187,9 @@ const demoController = {
             return res.json({
                 credited: payout,
                 demoBalance: updatedUser.rows[0].demo_balance,
-                cashValue: false
+                balance: null,
+                cashValue: false,
+                returnTo: resolveCompletionUrl(offer)
             });
         } catch (error) {
             if (client) await client.query('ROLLBACK').catch(() => {});

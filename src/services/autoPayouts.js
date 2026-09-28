@@ -1,6 +1,7 @@
 const pool = require('../config/db');
 const nowPayments = require('./nowPayments');
 const { sendWithdrawal, reverseWithdrawal } = require('./withdrawalResolution');
+const payoutOptions = require('./payoutOptions');
 const { resolvePublicBaseUrl } = require('./publicBaseUrl');
 
 /**
@@ -53,22 +54,16 @@ function autoPayoutsEnabled() {
  * *network-specific* ticker (usdterc20 on Ethereum, usdttrc20 on TRON). Sending `usdt` for
  * every network confirms against the wrong chain and delivers nothing, so this resolves the
  * pair the same way address validation already does and refuses rather than guessing.
+ *
+ * The map used to live here, next to the payout code. It disagreed with
+ * `src/services/payoutOptions.js` -- USDC on Ethereum resolved to `usdce` here but
+ * `usdcerc20` there, and it listed networks (solana, base) that the destinations table does
+ * not offer -- so a payout could be sent with a ticker that confirmed against the wrong chain.
+ * There is one registry now, and this delegates to it. Anything not in the registry returns
+ * null, which `claimOneRow` turns into a skip rather than a guess.
  */
 function payoutTicker(assetCode, network) {
-    const asset = String(assetCode || '').toLowerCase();
-    const chain = String(network || '').toLowerCase();
-    const pairs = {
-        'usdt:ethereum': 'usdterc20',
-        'usdt:tron': 'usdttrc20',
-        'usdt:polygon': 'usdtmatic',
-        'usdt:bsc': 'usdtbsc',
-        'usdc:ethereum': 'usdce',
-        'usdc:polygon': 'usdcmatic',
-        'usdc:solana': 'usdcsol',
-        'usdc:base': 'usdcbase',
-        'usdt:solana': 'usdtsol'
-    };
-    return pairs[`${asset}:${chain}`] || asset;
+    return payoutOptions.providerCoinFor(assetCode, network);
 }
 
 /**
@@ -169,6 +164,13 @@ async function claimPayoutCandidates({ limit = 10, convertToCoin }) {
             else if (outcome.skipped) skipped.push(outcome.skipped);
         }
 
+        // Skips are reported, not swallowed. A row that cannot be priced or has no ticker is
+        // left unclaimed precisely so an operator can see it -- a run that silently consumed
+        // it would strand a user whose money never moved with no explanation anywhere.
+        for (const skip of skipped) {
+            console.warn(`Payout run skipped withdrawal ${skip.id}: ${skip.reason}`);
+        }
+
         await client.query('COMMIT');
         return { claimed, skipped };
     } catch (error) {
@@ -193,7 +195,7 @@ async function claimPayoutCandidates({ limit = 10, convertToCoin }) {
  * only correct response to an undetermined answer is to stop and look.
  */
 async function submitClaimedPayouts(claimed) {
-    if (claimed.length === 0) return { submitted: 0, released: 0, batchId: null, uncertain: 0 };
+    if (claimed.length === 0) return { submitted: 0, released: 0, batchId: null, uncertain: 0, outcomes: [] };
 
     let response;
     try {
@@ -201,12 +203,20 @@ async function submitClaimedPayouts(claimed) {
     } catch (error) {
         const unknown = isUndetermined(error);
         await releaseOrHoldClaims(claimed, unknown ? 'SUBMISSION_UNKNOWN' : 'SUBMIT_FAILED', error.message);
+        const outcomes = claimed.map((entry) =>
+            summarizeOutcome(entry, {
+                verdict: unknown ? 'held' : 'released',
+                detail: error.message
+            })
+        );
+        logPayoutRun('submitClaimedPayouts', claimed, outcomes);
         return {
             submitted: 0,
             released: unknown ? 0 : claimed.length,
             batchId: null,
             uncertain: unknown ? claimed.length : 0,
-            error: error.message
+            error: error.message,
+            outcomes
         };
     }
 
@@ -220,12 +230,17 @@ async function submitClaimedPayouts(claimed) {
     // money moves, and no error is raised anywhere -- the row simply sits in `processing`
     // until an operator notices. This is the step that makes the payout automatic.
     if (batchId === null) {
+        const outcomes = claimed.map((entry) =>
+            summarizeOutcome(entry, { verdict: 'created', detail: 'Batch created but not verified.' })
+        );
+        logPayoutRun('submitClaimedPayouts', claimed, outcomes);
         return {
             submitted: response.withdrawals.length,
             released: 0,
             batchId: null,
             verified: false,
-            uncertain: claimed.length
+            uncertain: claimed.length,
+            outcomes
         };
     }
 
@@ -239,22 +254,35 @@ async function submitClaimedPayouts(claimed) {
         // withdrawal twice. They stay claimed for reconciliation instead.
         const unknown = isUndetermined(error);
         await releaseOrHoldClaims(claimed, unknown ? 'VERIFY_UNKNOWN' : 'VERIFY_FAILED', error.message);
+        const outcomes = claimed.map((entry) =>
+            summarizeOutcome(entry, {
+                verdict: unknown ? 'held' : 'released',
+                detail: error.message
+            })
+        );
+        logPayoutRun('submitClaimedPayouts', claimed, outcomes);
         return {
             submitted: response.withdrawals.length,
             released: unknown ? 0 : claimed.length,
             batchId,
             verified: false,
             uncertain: unknown ? claimed.length : 0,
-            error: error.message
+            error: error.message,
+            outcomes
         };
     }
 
+    const outcomes = claimed.map((entry) =>
+        summarizeOutcome(entry, { verdict: 'sent', detail: `Batch ${batchId} verified.` })
+    );
+    logPayoutRun('submitClaimedPayouts', claimed, outcomes);
     return {
         submitted: response.withdrawals.length,
         released: 0,
         batchId,
         verified: true,
-        uncertain: 0
+        uncertain: 0,
+        outcomes
     };
 }
 
@@ -287,6 +315,39 @@ function payoutIpnCallbackUrl() {
 function isUndetermined(error) {
     if (!(error instanceof nowPayments.NowPaymentsError)) return true;
     return !(error.status >= 400 && error.status < 500);
+}
+
+/**
+ * One line per withdrawal, for the operator.
+ *
+ * A run that reports only a count cannot tell an operator whether a silent failure left a
+ * user waiting, so each claimed row gets a line naming what happened to it and why. The
+ * caller can log the array or return it in the response; either way the detail is available
+ * wherever the run is driven from.
+ */
+function summarizeOutcome(entry, outcome) {
+    return {
+        withdrawalId: entry.id,
+        amountUsd: entry.amountUsd,
+        asset: entry.assetCode,
+        network: entry.network,
+        coin: entry.currency,
+        coinAmount: entry.amount,
+        ...outcome
+    };
+}
+
+/**
+ * Logs one line per claimed withdrawal, at the end of a run.
+ *
+ * Logged here rather than inline so every path -- success, refusal, and unknown -- produces
+ * the same shape, and so a future caller that forgets to log cannot leave a run silent.
+ */
+function logPayoutRun(label, claimed, outcomes) {
+    const summary = outcomes.length
+        ? outcomes.map((o) => `${o.withdrawalId}:${o.verdict}`).join(', ')
+        : '(none)';
+    console.log(`${label}: ${claimed.length} claimed, ${outcomes.length} resolved [${summary}]`);
 }
 
 /**
@@ -534,6 +595,10 @@ async function claimOneRow(client, row, convertToCoin) {
     return {
         claimed: {
             id: row.id,
+            userId: row.user_id,
+            amountUsd: row.amount,
+            assetCode: row.asset_code,
+            network: row.network,
             // Derived from the withdrawal id rather than random, so a provider response
             // and a later reconciliation pass both recompute the same key.
             payoutId: `wd-${row.id}`,
@@ -566,11 +631,17 @@ async function claimOneRow(client, row, convertToCoin) {
  * this call.
  */
 async function dispatchPayoutForWithdrawal({ withdrawalId, convertToCoin }) {
-    const unattempted = { attempted: false, submitted: 0, batchId: null, verified: false, uncertain: 0 };
-    if (!autoPayoutsEnabled()) return unattempted;
+    const unattempted = { attempted: false, submitted: 0, batchId: null, verified: false, uncertain: 0, outcomes: [], reason: null };
+    if (!autoPayoutsEnabled()) {
+        unattempted.reason = 'automatic-payouts-disabled';
+        return unattempted;
+    }
 
     const id = Number(withdrawalId);
-    if (!Number.isSafeInteger(id) || id <= 0) return unattempted;
+    if (!Number.isSafeInteger(id) || id <= 0) {
+        unattempted.reason = 'invalid-withdrawal-id';
+        return unattempted;
+    }
 
     let claimed = [];
     const client = await pool.connect();
@@ -597,20 +668,30 @@ async function dispatchPayoutForWithdrawal({ withdrawalId, convertToCoin }) {
     } catch (error) {
         await client.query('ROLLBACK').catch(() => {});
         console.error(`Could not claim withdrawal ${id} for automatic payout: ${error.message}`);
+        unattempted.reason = 'claim-failed';
         return unattempted;
     } finally {
         client.release();
     }
 
-    if (claimed.length === 0) return unattempted;
+    if (claimed.length === 0) {
+        unattempted.reason = 'nothing-to-claim';
+        return unattempted;
+    }
 
     const outcome = await submitClaimedPayouts(claimed);
+    // Same shape as the batch run so the operator can grep one log format.
+    console.log(`Payout dispatch for withdrawal ${id}: ` +
+        `${outcome.submitted} submitted, ${outcome.uncertain} uncertain` +
+        (outcome.error ? `, error: ${outcome.error}` : ''));
     return {
         attempted: true,
         submitted: outcome.submitted,
         batchId: outcome.batchId,
         verified: outcome.verified,
-        uncertain: outcome.uncertain
+        uncertain: outcome.uncertain,
+        outcomes: outcome.outcomes,
+        ...(outcome.error ? { error: outcome.error } : {})
     };
 }
 

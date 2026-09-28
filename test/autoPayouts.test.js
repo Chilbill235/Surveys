@@ -17,15 +17,30 @@ const autoPayouts = require('../src/services/autoPayouts');
 
 test('a payout ticker is network-specific, and a bare asset is never guessed', () => {
     // The same asset is a different coin on every chain. Sending the bare ticker confirms
-    // against the wrong chain and delivers nothing.
+    // against the wrong chain and delivers nothing, so the ticker carries the network.
+    //
+    // The values here come from `src/services/payoutOptions.js`, the single registry of
+    // supported destinations. They used to be duplicated in this module and disagreed with
+    // it -- USDC on Ethereum resolved to `usdce` here but `usdcerc20` there -- which is how
+    // a payout could be sent with a ticker that confirmed against the wrong chain.
     assert.equal(autoPayouts.payoutTicker('USDT', 'ethereum'), 'usdterc20');
     assert.equal(autoPayouts.payoutTicker('USDT', 'tron'), 'usdttrc20');
     assert.equal(autoPayouts.payoutTicker('USDT', 'polygon'), 'usdtmatic');
-    assert.equal(autoPayouts.payoutTicker('USDC', 'ethereum'), 'usdce');
+    assert.equal(autoPayouts.payoutTicker('USDT', 'bsc'), 'usdtbsc');
+    assert.equal(autoPayouts.payoutTicker('USDC', 'ethereum'), 'usdcerc20');
+    assert.equal(autoPayouts.payoutTicker('USDC', 'polygon'), 'usdcmatic');
 
-    // A coin with one chain falls through to the asset, which is correct for it.
+    // A coin with one chain resolves to its own ticker.
     assert.equal(autoPayouts.payoutTicker('BTC', 'bitcoin'), 'btc');
     assert.equal(autoPayouts.payoutTicker('LTC', 'litecoin'), 'ltc');
+    assert.equal(autoPayouts.payoutTicker('XRP', 'ripple'), 'xrp');
+
+    // A pair the registry does not offer is not guessed. Returning the bare asset would
+    // confirm against the wrong chain and deliver nothing, so it comes back null and the
+    // claim is skipped for an operator to look at.
+    assert.equal(autoPayouts.payoutTicker('USDC', 'solana'), null);
+    assert.equal(autoPayouts.payoutTicker('USDT', 'arbitrum'), null);
+    assert.equal(autoPayouts.payoutTicker('ZZZ', 'ethereum'), null);
 });
 
 test('automatic payouts stay off until they are explicitly switched on', () => {
