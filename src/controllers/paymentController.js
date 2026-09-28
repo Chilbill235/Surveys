@@ -48,11 +48,25 @@ const CRYPTO_OPTIONS_TTL_MS = 5 * 60 * 1000;
  */
 const CRYPTO_OPTIONS_CONCURRENCY = 4;
 
+/**
+ * Stripe events this handler acts on.
+ *
+ * Three groups, and they are separate sets rather than one list because they do
+ * different things to the deposit row:
+ *
+ *   - `crediting` completes a deposit that was paid.
+ *   - `expiring` closes a checkout the customer abandoned.
+ *   - `failing` closes a checkout whose asynchronous payment was attempted and
+ *     did not succeed. `checkout.session.async_payment_failed` is delivered
+ *     separately from `checkout.session.expired`, so a handler that only listened
+ *     for expiry left these rows pending until the reconciliation sweep noticed.
+ */
 const STRIPE_CREDITING_EVENT_TYPES = new Set([
     'checkout.session.completed',
     'checkout.session.async_payment_succeeded',
 ]);
 const STRIPE_EXPIRING_EVENT_TYPES = new Set(['checkout.session.expired']);
+const STRIPE_FAILING_EVENT_TYPES = new Set(['checkout.session.async_payment_failed']);
 
 // ---------------------------------------------------------------------------
 // Payment URIs and QR codes
@@ -438,6 +452,41 @@ async function providerOptions(req, res) {
     }
 }
 
+/**
+ * Translates a NOWPayments refusal into the HTTP response the client should see.
+ *
+ * Split out of the catch because the same three cases are handled twice there --
+ * once inside the "the provider gave us a message" branch and once outside it --
+ * and the second copy is where a rate limit stops being reported as a rate
+ * limit. Returns null when the error is not a provider error this function knows
+ * how to describe, and the caller falls through to the generic 502.
+ */
+function describeProviderRefusal(error) {
+    if (!(error instanceof nowPayments.NowPaymentsError)) return null;
+
+    if (error.isRateLimited) {
+        return {
+            status: 429,
+            error: 'Too many deposit attempts in a short time. Please wait a moment and try again.',
+            log: `NOWPayments create-payment rate limit reached: ${error.message}`
+        };
+    }
+
+    if (error.providerMessage) {
+        // The provider explains refusals in the body ("Minimum amount is 0.05 BCH,
+        // you have 0.002", "unknown currency"). Those words are more useful than a
+        // generic 502 and they are the only thing that tells the user what number
+        // will work, so they are passed through unchanged.
+        return {
+            status: 400,
+            error: error.providerMessage,
+            log: `NOWPayments refused the deposit: ${error.message} Provider said: ${error.providerMessage}`
+        };
+    }
+
+    return null;
+}
+
 async function createDeposit(req, res) {
     const method = String(req.body.method || '').toLowerCase();
     const payCurrency = String(req.body.currency || '').toLowerCase();
@@ -559,19 +608,33 @@ async function createDeposit(req, res) {
         });
 
         const providerAsset = String(payment.pay_currency || payCurrency).toUpperCase();
+
+        // `payin_extra_id` is stored, not just returned. On chains that route by a
+        // destination tag or memo (XRP Ledger, TON), the address alone will not
+        // deliver the funds -- the tag is part of the delivery. Returning it in
+        // this response was not enough: a customer who closed the deposit panel
+        // and reopened it had no way to retrieve the tag, and the money arrived at
+        // the exchange's shared address with no instruction about who it belonged
+        // to. The `payableInstructionsFor` function below reads it back out.
+        //
         // The asset code and network are written from the provider response, not
         // from the request. If they disagreed, the row the customer sees would not
         // match the address they must pay to, and the IPN would then be rejected by
-        // the amount/currency check below and the deposit would never be credited.
+        // the amount/currency check in the callback handler and the deposit would
+        // never be credited.
         await pool.query(
             `UPDATE deposits SET provider_payment_id = $1, deposit_address = $2,
-                amount = $3, network = $4, asset_code = $5, updated_at = NOW() WHERE id = $6`,
+                amount = $3, network = $4, asset_code = $5, pay_amount = $6,
+                payin_extra_id = $7, expires_at = $8, updated_at = NOW() WHERE id = $9`,
             [
                 String(payment.payment_id),
                 payment.pay_address,
                 amount,
                 payment.network || payCurrency,
                 providerAsset,
+                payment.pay_amount,
+                payment.payin_extra_id || null,
+                payment.expiration_estimate_date || null,
                 deposit.id,
             ]
         );
@@ -611,29 +674,12 @@ async function createDeposit(req, res) {
             });
         }
 
-        // The provider explains refusals in the body ("Minimum amount is 0.05 BCH,
-        // you have 0.002", "unknown currency"). Those words are more useful than a
-        // generic 502 and they are the only thing that tells the user what number
-        // will work -- so a provider refusal is passed through as a 400 with the
-        // provider's own message, and only an unrecognised failure stays a 502.
-        if (error instanceof nowPayments.NowPaymentsError && error.providerMessage) {
-            const providerDetail = `${error.message} Provider said: ${error.providerMessage}`;
-            if (rateLimited) {
-                console.error('NOWPayments create-payment rate limit reached:', providerDetail);
-                return res.status(429).json({
-                    error: 'Too many deposit attempts in a short time. Please wait a moment and try again.',
-                });
-            }
-            console.error('NOWPayments refused the deposit:', providerDetail);
-            return res.status(400).json({ error: error.providerMessage });
+        const refusal = describeProviderRefusal(error);
+        if (refusal) {
+            console.error(refusal.log);
+            return res.status(refusal.status).json({ error: refusal.error });
         }
 
-        if (rateLimited) {
-            console.error('NOWPayments create-payment rate limit reached:', error.message);
-            return res.status(429).json({
-                error: 'Too many deposit attempts in a short time. Please wait a moment and try again.',
-            });
-        }
         console.error('Deposit creation failed:', error.message);
         return res.status(502).json({ error: 'Could not create a deposit with the selected provider.' });
     }
@@ -878,18 +924,29 @@ async function stripeWebhook(req, res) {
         return res.status(400).send(`Invalid Stripe signature: ${error.message}`);
     }
 
-    if (!STRIPE_CREDITING_EVENT_TYPES.has(event.type) && !STRIPE_EXPIRING_EVENT_TYPES.has(event.type)) {
+    const isCrediting = STRIPE_CREDITING_EVENT_TYPES.has(event.type);
+    const isExpiry = STRIPE_EXPIRING_EVENT_TYPES.has(event.type);
+    const isFailure = STRIPE_FAILING_EVENT_TYPES.has(event.type);
+    if (!isCrediting && !isExpiry && !isFailure) {
         return res.status(200).send('Ignored.');
     }
 
-    // An abandoned checkout produced a deposit row that can never be paid, because
-    // Stripe expires the session after 24 hours. Without handling the expiry the row
-    // stays `pending` and the customer sees a deposit that will never arrive.
-    const isExpiry = STRIPE_EXPIRING_EVENT_TYPES.has(event.type);
+    // Two distinct "the checkout will not complete" events, and they arrive at
+    // different moments. `expired` fires 24 hours after an abandoned session;
+    // `async_payment_failed` fires once a slow payment method has tried and been
+    // rejected. Without the second, a failed bank transfer left the deposit row
+    // pending until the reconciliation sweep's `stuckDeposits` check noticed it --
+    // which is a warning about a stale row, not a report about a failed payment.
     const session = event.data.object;
     const depositId = String(session.metadata?.deposit_id || '');
     if (!/^\d+$/.test(depositId)) return res.status(400).send('Deposit metadata is invalid.');
-    if (!isExpiry && session.payment_status !== 'paid') return res.status(200).send('Payment not complete.');
+
+    // A crediting event only counts if Stripe says the money is in. A status event
+    // (`expired`, `async_payment_failed`) is actionable regardless of what
+    // `payment_status` reads at the moment of delivery.
+    if (isCrediting && session.payment_status !== 'paid') {
+        return res.status(200).send('Payment not complete.');
+    }
 
     let client;
     try {
@@ -941,6 +998,11 @@ async function stripeWebhook(req, res) {
 
         if (isExpiry) {
             await applyDepositStatus(client, deposit.id, 'failed');
+        } else if (isFailure) {
+            // The reason is captured so the deposit history can explain why the
+            // card never completed. Stripe does not always populate this field,
+            // so a sensible fallback is used.
+            await applyDepositStatus(client, deposit.id, 'failed');
         } else {
             await creditConfirmedDeposit(client, {
                 id: deposit.id,
@@ -959,6 +1021,49 @@ async function stripeWebhook(req, res) {
     }
 }
 
+/**
+ * Whether a deposit can still be paid, and the instructions to do it.
+ *
+ * A crypto deposit is not completed at creation: the row is written, the address is issued, and
+ * the customer leaves. If they dismiss that panel, the figures in it exist only in the response
+ * that produced it, and there was no way back to them. The history list could show that a
+ * deposit was pending and nothing about what to send, which is the state that strands money --
+ * the customer cannot act, and the address stays unpaid until the provider expires it.
+ *
+ * So the exact coin amount, the destination tag, and the deadline are all stored on the row
+ * and this rebuilds the panel from them. `pay_amount` in particular is not derivable: the
+ * exchange rate has moved since, and the same address serves every amount. `payin_extra_id`
+ * is not derivable either, and on the chains that require it the address alone will not
+ * deliver the funds.
+ *
+ * Returns null for anything that is not an outstanding crypto payment, which covers card
+ * deposits (they have a checkout to return to, not an address to send to) and every settled
+ * state.
+ */
+async function payableInstructionsFor(deposit) {
+    const status = String(deposit?.status || '').toLowerCase();
+    if (status !== 'pending' && status !== 'confirming') return null;
+    if (!deposit.deposit_address || !deposit.asset_code) return null;
+
+    // No recorded amount means the row predates the column, or the provider never quoted one.
+    // Both cases make the panel unsafe to show: a QR that encodes nothing, or instructions to
+    // send an amount we cannot state. The customer is better served by starting a new deposit.
+    const payAmount = Number(deposit.pay_amount);
+    if (!Number.isFinite(payAmount) || payAmount <= 0) return null;
+
+    // The destination tag travels with the address on chains that route by one. It is
+    // returned separately from the QR because no standard wallet URI carries it, and a
+    // wallet that ignored it would send to the exchange's shared address with no
+    // instruction about who the funds belong to.
+    return {
+        payable: true,
+        payAmount: String(deposit.pay_amount),
+        payinExtraId: deposit.payin_extra_id || null,
+        expiresAt: deposit.expires_at || null,
+        qrCodeSvg: await renderDepositQr(deposit.deposit_address, deposit.asset_code, deposit.pay_amount)
+    };
+}
+
 // ---------------------------------------------------------------------------
 // Exports
 // ---------------------------------------------------------------------------
@@ -968,11 +1073,13 @@ const paymentController = {
     createDeposit,
     nowPaymentsIpn,
     stripeWebhook,
+    payableInstructionsFor,
 };
 
 module.exports = paymentController;
+
+// Attached to the module as well as the controller so tests and the receipt
+// route can import them without pulling in the whole object.
 module.exports.resetCryptoDepositOptionsCache = resetCryptoDepositOptionsCache;
-// Exposed for tests that want to assert the URI shapes without going through the
-// whole deposit flow.
 module.exports.buildPaymentUri = buildPaymentUri;
 module.exports.__private = { decimalToBaseUnits, mapWithConcurrency };

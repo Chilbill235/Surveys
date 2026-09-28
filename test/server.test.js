@@ -14,6 +14,18 @@ const { markWithdrawalPaid, refundWithdrawal, refundSourceId } = require('../src
 const { resetCryptoDepositOptionsCache } = require('../src/controllers/paymentController');
 const { registerOrExplain } = require('./helpers/register');
 
+/**
+ * Mints a bearer token the auth middleware will actually accept.
+ *
+ * The issuer is not optional decoration. `requireAuth` verifies it, and a token signed without
+ * it is rejected as `jwt issuer invalid` before the handler runs -- so a test that signed its own
+ * tokens inline would fail as an authentication error and look like a broken endpoint. Centralised
+ * so the required claims are stated once, next to the reason they are required.
+ */
+function signUserToken(subject, secret = process.env.JWT_SECRET) {
+    return jwt.sign({ sub: String(subject) }, secret, { issuer: 'offer-network-api' });
+}
+
 let server;
 let origin;
 
@@ -68,7 +80,12 @@ test('root serves the home page', async () => {
     const response = await fetch(origin);
     const html = await response.text();
     assert.equal(response.status, 200);
-    assert.match(html, /<title>RewardZone \| Home<\/title>/);
+    // The hero is what makes this the home page rather than some other page being served at
+    // `/`. Asserted on a structural marker instead of the title, because the title is copy that
+    // gets rewritten for SEO and a test that fails on every such change is a test people learn
+    // to delete.
+    assert.match(html, /<main class="home-shell"/);
+    assert.match(html, /<h1[^>]*>/);
     assert.match(html, /href="\/offers"/);
 });
 
@@ -176,7 +193,7 @@ test('payment provider options and deposit creation fail honestly when providers
     };
 
     try {
-        const headers = { Authorization: `Bearer ${jwt.sign({ sub: String(userId) }, process.env.JWT_SECRET)}` };
+        const headers = { Authorization: `Bearer ${signUserToken(userId)}` };
 
         const optionsResponse = await fetch(`${origin}/api/user/payment-options`, { headers });
         assert.equal(optionsResponse.status, 200);
@@ -256,10 +273,13 @@ test('provider webhooks reject unsigned or unconfigured callbacks', async () => 
 test('NOWPayments IPN browser GET explains that callbacks require POST', async () => {
     const response = await fetch(`${origin}/api/payments/nowpayments/ipn`);
     assert.equal(response.status, 405);
-    assert.deepEqual(await response.json(), {
-        error: 'This webhook only accepts provider POST requests.',
-        method: 'POST'
-    });
+    const body = await response.json();
+    // Asserted on the parts that matter rather than the exact wording, because a browser
+    // landing on this URL is the only audience: it has to say the method is wrong, and carry
+    // an `Allow` header equivalent so a client can discover the right verb.
+    assert.match(body.error, /POST/);
+    assert.deepEqual(body.allowed, ['POST']);
+    assert.equal(response.headers.get('allow'), 'POST');
 });
 
 test('a correctly signed IPN is accepted whatever content-type it arrives with', async () => {
@@ -365,7 +385,7 @@ test('a deposit receipt is reachable by reference and belongs only to its owner'
     };
 
     try {
-        const headers = { Authorization: `Bearer ${jwt.sign({ sub: String(ownerId) }, jwtSecret)}` };
+        const headers = { Authorization: `Bearer ${signUserToken(ownerId, jwtSecret)}` };
 
         const found = await fetch(`${origin}/api/user/deposits/91`, { headers });
         assert.equal(found.status, 200);
@@ -385,7 +405,7 @@ test('a deposit receipt is reachable by reference and belongs only to its owner'
         // Someone else's deposit must be indistinguishable from one that does not exist,
         // or the endpoint confirms which ids are real.
         const denied = await fetch(`${origin}/api/user/deposits/91`, {
-            headers: { Authorization: `Bearer ${jwt.sign({ sub: '99999' }, jwtSecret)}` }
+            headers: { Authorization: `Bearer ${signUserToken('99999', jwtSecret)}` }
         });
         assert.equal(denied.status, 404);
 
@@ -812,7 +832,7 @@ test('NOWPayments deposit addresses persist and signed confirmations credit once
     try {
         const authHeaders = {
             'Content-Type': 'application/json',
-            Authorization: `Bearer ${jwt.sign({ sub: String(userId) }, jwtSecret)}`
+            Authorization: `Bearer ${signUserToken(userId, jwtSecret)}`
         };
 
         // The provider's per-coin window reaches the client, so the amount box can be
@@ -915,7 +935,7 @@ test('NOWPayments deposit addresses persist and signed confirmations credit once
         assert.equal(repeatIpn.status, 200);
 
         const balanceResponse = await fetch(`${origin}/api/user/balance`, {
-            headers: { Authorization: `Bearer ${jwt.sign({ sub: String(userId) }, jwtSecret)}` }
+            headers: { Authorization: `Bearer ${signUserToken(userId, jwtSecret)}` }
         });
         assert.equal(balanceResponse.status, 200);
         assert.equal((await balanceResponse.json()).balance, '3.00');
@@ -1002,7 +1022,7 @@ test('deposit amounts a user would type are accepted, sub-cent precision is not'
 
     const headers = {
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${jwt.sign({ sub: String(userId) }, jwtSecret)}`
+        Authorization: `Bearer ${signUserToken(userId, jwtSecret)}`
     };
 
     try {
@@ -1265,6 +1285,10 @@ test('deposit options come from the merchant coin list and the provider minimums
             return { rows: [{ attempt_count: 1, window_started_at: new Date().toISOString() }] };
         }
         if (/INSERT INTO deposits/i.test(query)) return { rows: [{ id: 1 }] };
+        // The app closes out a deposit the provider refused, so this write is expected on the
+        // below-the-provider-floor case. Unstubbed it surfaces as a thrown error and the
+        // response becomes a 502, which hides the behaviour under test.
+        if (/UPDATE deposits SET status = 'failed'/i.test(query)) return { rows: [], rowCount: 1 };
         throw new Error(`Unexpected test query: ${query}`);
     };
 
@@ -1283,7 +1307,21 @@ test('deposit options come from the merchant coin list and the provider minimums
         if (target.includes('/v1/min-amount')) {
             const coin = new URL(target).searchParams.get('currency_to');
             const floors = { btc: 18.8, usdt: 5, doge: 2.5 };
-            return new Response(JSON.stringify({ min_amount: floors[coin] ?? 1 }), {
+            // Both fields, because the real provider returns both when `fiat_equivalent` is
+            // requested, and they mean different things: `min_amount` is in the coin, the
+            // `fiat_equivalent` is the same figure in dollars.
+            //
+            // The stub used to return `min_amount` alone at the fiat value, which is precisely
+            // the reading `getMinimumAmount` refuses to make -- 18.8 BTC is not $18.80. The
+            // code then converted through `/v1/estimate` (unstubbed, so the call blew up) and
+            // the deposit was attempted instead of refused. The coin figure here is
+            // deliberately small, so a regression that trusts `min_amount` as dollars would
+            // make the floor $0.0003 and quietly let this same $5 deposit through.
+            const coinAmounts = { btc: 0.0002, usdt: 4.9, doge: 35 };
+            return new Response(JSON.stringify({
+                fiat_equivalent: floors[coin] ?? 1,
+                min_amount: coinAmounts[coin] ?? 0.5
+            }), {
                 status: 200, headers: { 'Content-Type': 'application/json' }
             });
         }
@@ -1298,10 +1336,18 @@ test('deposit options come from the merchant coin list and the provider minimums
                 ]
             }), { status: 200, headers: { 'Content-Type': 'application/json' } });
         }
+        if (target.includes('/v1/payment')) {
+            // The app deliberately does not block on a cached provider floor, so this request
+            // is made and the provider refuses it. NOWPayments words its refusals with the real
+            // number in real units, and the app passes those words back untouched.
+            return new Response(JSON.stringify({
+                error: { code: 'FAILURE', message: 'Minimum amount is 0.0002 BTC, you have 0.000062' }
+            }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+        }
         throw new Error(`Unexpected provider call: ${target}`);
     };
 
-    const headers = { Authorization: `Bearer ${jwt.sign({ sub: String(userId) }, jwtSecret)}` };
+    const headers = { Authorization: `Bearer ${signUserToken(userId, jwtSecret)}` };
 
     try {
         const response = await fetch(`${origin}/api/user/payment-options`, { headers });
@@ -1358,19 +1404,35 @@ test('deposit options come from the merchant coin list and the provider minimums
         assert.equal(aboveCoinCeiling.status, 400);
         assert.match((await aboveCoinCeiling.json()).error, /maximum deposit in BTC is \$900\.00/);
 
-        // A deposit the provider's own floor rules out is refused with that floor named,
-        // rather than being accepted by the app and refused later by the provider.
+        // A deposit the provider's own floor rules out is NOT blocked by the app. The app
+        // advertises a $1.00 minimum and honours it; the provider's floor is a volatile,
+        // pair-specific figure, and refusing on a cached read of it meant the advertised $1
+        // was unsubmittable for a whole class of coins. Instead the request reaches
+        // `createPayment`, the provider refuses, and its own words come back -- which is the
+        // only thing that tells the user the number that will actually work.
         //
-        // The amount box deliberately allows this, because the app's advertised minimum is
-        // $1.00; the provider's volatile per-pair floor is caught here instead, before the
-        // deposit row is written, so nothing is left behind in the history.
+        // This is the opposite of what this assertion used to require, and deliberately so: it
+        // previously expected the app to refuse the amount itself against its cached floor.
         const belowProviderFloor = await fetch(`${origin}/api/user/deposits`, {
             method: 'POST',
             headers: { ...headers, 'Content-Type': 'application/json' },
             body: JSON.stringify({ amount: 5, method: 'crypto', currency: 'btc' })
         });
-        assert.equal(belowProviderFloor.status, 400);
-        assert.match((await belowProviderFloor.json()).error, /NOWPayments accepts BTC deposits from \$18\.80/);
+        assert.equal(
+            belowProviderFloor.status,
+            400,
+            `expected the provider's refusal to pass through as 400, got ${belowProviderFloor.status}: ` +
+            `${JSON.stringify(await belowProviderFloor.clone().text())}. Provider paths: ${requestedPaths.join(' | ')}`
+        );
+        // The provider's own message, not a generic one. This is the whole point of letting the
+        // provider answer: it names the real floor in real units.
+        const floorRefusal = (await belowProviderFloor.json()).error;
+        assert.match(floorRefusal, /Minimum amount is 0\.0002 BTC/i);
+        // And the app did reach the provider, rather than deciding on its own.
+        assert.ok(
+            requestedPaths.some((path) => path.includes('/v1/payment')),
+            'the app refused the amount itself instead of asking the provider'
+        );
 
         // A coin the provider does not offer is refused before any deposit row is written.
         const unlisted = await fetch(`${origin}/api/user/deposits`, {
@@ -1705,7 +1767,7 @@ test('click creation returns the configured absolute aff_sub URL and redirects t
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
-                Authorization: `Bearer ${jwt.sign({ id: 1 }, jwtSecret)}`
+                Authorization: `Bearer ${signUserToken(1, jwtSecret)}`
             },
             body: '{}'
         });
@@ -2004,35 +2066,59 @@ test('production postbacks require a configured secret', async () => {
     }
 });
 
-test('production click tracking requires configured proxy checks', async () => {
+test('an absent proxy check is only fatal when PROXYCHECK_REQUIRED asks it to be', async () => {
+    // The old version of this test asserted a flat 503 in production whenever
+    // PROXYCHECK_KEY was missing, which is the behaviour the middleware was changed to remove:
+    // a feature nobody switched on took the whole catalog offline. The contract is now explicit
+    // -- an absent key is a warning, and only PROXYCHECK_REQUIRED makes it fatal -- so both
+    // halves are asserted here. Testing only the permissive half would let the fail-closed
+    // setting regress unnoticed, and testing only the strict half would re-fail what was fixed.
     const priorEnvironment = process.env.NODE_ENV;
     const priorProxyKey = process.env.PROXYCHECK_KEY;
+    const priorRequired = process.env.PROXYCHECK_REQUIRED;
     const priorJwtSecret = process.env.JWT_SECRET;
     const jwtSecret = 'unit-test-secret';
+    const originalQuery = pool.query;
     process.env.NODE_ENV = 'production';
     process.env.JWT_SECRET = jwtSecret;
     delete process.env.PROXYCHECK_KEY;
-    const originalQuery = pool.query;
+
     pool.query = async (query) => {
         if (query.includes('SELECT token_version')) return { rows: [{ token_version: 0, is_banned: false }] };
         return { rows: [] };
     };
+
+    const click = () => fetch(`${origin}/api/click/test-offer`, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${signUserToken(1, jwtSecret)}`
+        },
+        body: '{}'
+    });
+
     try {
-        const response = await fetch(`${origin}/api/click/test-offer`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                Authorization: `Bearer ${jwt.sign({ id: 1 }, jwtSecret)}`
-            },
-            body: '{}'
-        });
-        assert.equal(response.status, 503);
+        // Not required: the absent key is a warning, so the request gets past fraud detection
+        // and on to the offer lookup. 404 rather than 503 is what proves the proxy check did
+        // not refuse it -- the offer is stubbed away, so the lookup is the next thing to fail.
+        delete process.env.PROXYCHECK_REQUIRED;
+        const allowed = await click();
+        assert.notEqual(allowed.status, 503,
+            'a missing, unrequested proxy check must not refuse every click');
+
+        // Required: now the same absence is fatal, and distinctly so -- 503 is "we refused by
+        // policy", which is the answer an operator needs to tell apart from a broken offer.
+        process.env.PROXYCHECK_REQUIRED = 'true';
+        const refused = await click();
+        assert.equal(refused.status, 503);
     } finally {
         pool.query = originalQuery;
         if (priorEnvironment === undefined) delete process.env.NODE_ENV;
         else process.env.NODE_ENV = priorEnvironment;
         if (priorProxyKey === undefined) delete process.env.PROXYCHECK_KEY;
         else process.env.PROXYCHECK_KEY = priorProxyKey;
+        if (priorRequired === undefined) delete process.env.PROXYCHECK_REQUIRED;
+        else process.env.PROXYCHECK_REQUIRED = priorRequired;
         if (priorJwtSecret === undefined) delete process.env.JWT_SECRET;
         else process.env.JWT_SECRET = priorJwtSecret;
     }
@@ -2102,7 +2188,7 @@ test('a refund that cannot be written to the ledger aborts rather than crediting
 
     await assert.rejects(
         () => refundWithdrawal(client, 12, 'test'),
-        /conflicts with an existing refund ledger entry/
+        /already has a refund ledger entry/
     );
     // The balance write happened first, so the only thing standing between this and a user
     // credited twice is the throw: the caller's rollback is what undoes it.
@@ -2602,7 +2688,7 @@ test('a demo click is refused before it is recorded when demo mode is off', asyn
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
-                Authorization: `Bearer ${jwt.sign({ id: 1 }, 'demo-click-test-secret')}`
+                Authorization: `Bearer ${signUserToken(1, 'demo-click-test-secret')}`
             },
             body: '{}'
         });

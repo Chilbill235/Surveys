@@ -186,8 +186,31 @@ async function verifyPassword(password, encodedHash) {
 
 function issueToken(user) {
     if (!process.env.JWT_SECRET) return null;
+
+    // Read strictly, and refuse rather than defaulting.
+    //
+    // `Number(user.token_version) || 0` used to stand here, and it turned a forgotten column
+    // into a locked-out account instead of a failure. Password reset bumps `users.token_version`,
+    // and `requireAuth` rejects any token whose `ver` claim is not exactly the stored value. If
+    // the row that reached here was selected without that column, the claim was signed as 0, so
+    // a user whose version was 1 passed sign-in, received a token, and then had every single
+    // request refused with "your session ended because the password changed" -- forever, because
+    // signing in again produced the same stale claim. Silent and permanent.
+    //
+    // So an absent or malformed version is an error here. Any query feeding `issueToken` that
+    // leaves out the column now fails loudly at the call site instead of quietly signing a token
+    // that will be rejected on first use.
+    const rawVersion = user?.token_version;
+    const version = rawVersion === null || rawVersion === undefined ? NaN : Number(rawVersion);
+    if (!Number.isInteger(version) || version < 0) {
+        throw new Error(
+            'issueToken was called without a usable token_version. Add token_version to the ' +
+            'query or RETURNING clause that produced this user row.'
+        );
+    }
+
     return jwt.sign(
-        { sub: String(user.id), ver: Number(user.token_version) || 0 },
+        { sub: String(user.id), ver: version },
         process.env.JWT_SECRET,
         { expiresIn: JWT_EXPIRES_IN, issuer: JWT_ISSUER }
     );
@@ -483,7 +506,7 @@ const authController = {
             await client.query('DELETE FROM email_verification_codes WHERE id = $1', [row.code_id]);
             const updated = await client.query(
                 `UPDATE users SET email_verified_at = NOW() WHERE id = $1
-                 RETURNING id, email, balance, demo_balance`,
+                 RETURNING id, email, balance, demo_balance, token_version`,
                 [row.id]
             );
             await client.query('COMMIT');
@@ -609,7 +632,7 @@ const authController = {
 
         try {
             const result = await pool.query(
-                `SELECT id, email, balance, password_hash, is_banned, demo_balance, email_verified_at
+                `SELECT id, email, balance, password_hash, is_banned, demo_balance, email_verified_at, token_version
                  FROM users
                  WHERE LOWER(email) = $1`,
                 [email]

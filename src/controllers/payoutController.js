@@ -14,13 +14,14 @@ const {
     distinctProviderCoins,
 } = require('../services/payoutOptions');
 const nowPayments = require('../services/nowPayments');
+const withdrawalCode = require('../services/withdrawalCode');
 const autoPayouts = require('../services/autoPayouts');
 
 // ---------------------------------------------------------------------------
-// Schema prerequisite
+// Schema prerequisites
 // ---------------------------------------------------------------------------
 //
-// This controller expects the following migration to have been applied:
+// This controller expects the following migrations to have been applied:
 //
 //   ALTER TABLE withdrawals ADD COLUMN idempotency_key TEXT;
 //
@@ -30,6 +31,60 @@ const autoPayouts = require('../services/autoPayouts');
 //
 // The column is nullable so existing rows and any caller that does not supply a
 // key are unaffected. The index is partial so multiple NULLs do not collide.
+//
+//   The withdrawal-code table and its index live in `services/withdrawalCode`;
+//   this controller only consumes the interface.
+
+// ---------------------------------------------------------------------------
+// Dependency checks
+// ---------------------------------------------------------------------------
+
+/**
+ * Verifies that the two injected services expose the interface this controller
+ * actually calls.
+ *
+ * Without this, a missing or renamed function fails at request time as
+ * `TypeError: withdrawalCode.consumeWithdrawalCode is not a function` with a
+ * stack trace that names the controller, not the service. The failure surfaces
+ * to the user as a 503 from the outer catch, which reads as "the server is
+ * having a problem" rather than "the service is not wired up".
+ *
+ * The check runs at module load, so a misconfigured deployment fails to start
+ * rather than failing on the first withdrawal attempt.
+ */
+function requireFunctions(moduleName, module, names) {
+    const missing = names.filter((name) => typeof module?.[name] !== 'function');
+    if (missing.length > 0) {
+        throw new Error(
+            `${moduleName} is missing the function(s) this controller requires: ${missing.join(', ')}. ` +
+            'Check that the service exports them and that the require path is correct.'
+        );
+    }
+}
+
+requireFunctions('services/withdrawalCode', withdrawalCode, [
+    'issueWithdrawalCode',
+    'sendWithdrawalCodeEmail',
+    'clearWithdrawalCode',
+    'consumeWithdrawalCode',
+    'failureMessage',
+]);
+requireFunctions('services/autoPayouts', autoPayouts, [
+    'dispatchPayoutForWithdrawal',
+]);
+
+if (typeof withdrawalCode.CODE_PATTERN?.test !== 'function') {
+    throw new Error(
+        'services/withdrawalCode must export CODE_PATTERN as a RegExp so the controller can ' +
+        'reject a malformed code before spending a database round-trip on it.'
+    );
+}
+if (!Number.isInteger(withdrawalCode.CODE_LIFETIME_MINUTES)) {
+    throw new Error(
+        'services/withdrawalCode must export CODE_LIFETIME_MINUTES as an integer so the ' +
+        'controller can tell the user how long the emailed code lasts.'
+    );
+}
 
 // ---------------------------------------------------------------------------
 // Policy
@@ -88,15 +143,28 @@ const SUPPORTED_PAYMENT_METHODS = new Set([
     'crypto',
 ]);
 
+/**
+ * Human-readable names for the fiat methods, so the email does not say "paypal"
+ * or "bank transfer" for a method whose label in the picker is something else.
+ *
+ * Built from `fiatMethods` at module load rather than hard-coded, because the
+ * list of methods lives there and a method added to the picker without a name
+ * here would render its raw `value` in the email.
+ */
+const METHOD_LABELS = new Map(
+    fiatMethods
+        .filter((method) => method?.value && method?.label)
+        .map((method) => [String(method.value).toLowerCase(), String(method.label)])
+);
+
 // ---------------------------------------------------------------------------
 // Small helpers
 // ---------------------------------------------------------------------------
 
 /**
- * Runs `fn` over `items` with at most `limit` in flight at once, preserving
- * order. A rejection from any `fn` rejects the whole call; callers that want
- * per-item fallbacks should catch inside `fn`, which is what the two provider
- * reads below do.
+ * Runs `fn` over `items` with at most `limit` in flight at once, preserving order.
+ * A rejection from any `fn` rejects the whole call; callers that want per-item
+ * fallbacks should catch inside `fn`, which is what the two provider reads below do.
  */
 async function mapWithConcurrency(items, limit, fn) {
     const results = new Array(items.length);
@@ -128,6 +196,17 @@ function normaliseDestinationTag(value) {
 }
 
 /**
+ * Normalises the amount for use in a fingerprint. `0.1 + 0.2` is
+ * `0.30000000000000004` in JavaScript, and using the raw float's string form
+ * in a hash means a fingerprint taken from a slightly different float is a
+ * different fingerprint. Rounding to cents produces the number the user typed,
+ * which is what the request actually means.
+ */
+function normalizeAmountForFingerprint(amount) {
+    return (Math.round(Number(amount) * 100) / 100).toFixed(2);
+}
+
+/**
  * Builds the idempotency key for a withdrawal request.
  *
  * A client-supplied key wins outright: it is the only form that can distinguish
@@ -150,6 +229,42 @@ function resolveIdempotencyKey(req, userId, fingerprintParts) {
         .map((part) => String(part ?? ''))
         .join('|');
     return `auto:${createHash('sha256').update(fingerprint).digest('hex')}`;
+}
+
+/**
+ * The single string a confirmation code is bound to, so both sides compare the
+ * same value. Crypto includes the tag; fiat is just the address.
+ *
+ * Exported implicitly through `validateWithdrawalRequest`'s return so the code
+ * path and the submit path cannot disagree on this value. A disagreement would
+ * make every code "invalid" for the request it was issued for.
+ */
+function destinationFor(paymentMethod, paymentAddress, destinationTag) {
+    if (paymentMethod !== 'crypto') return paymentAddress;
+    return destinationTag ? `${paymentAddress}:${destinationTag}` : paymentAddress;
+}
+
+/**
+ * The label shown in the confirmation email and the response body.
+ *
+ * Two things the previous version got wrong:
+ *   - `.toUpperCase()` was applied to the *whole* joined string, so "BTC on
+ *     Ethereum" became "BTC ON ETHEREUM". The asset code is uppercased because
+ *     that is its canonical form; the network name is not, because it is a
+ *     proper noun.
+ *   - The fallback for a fiat method was the string `"Bank transfer"`, which is
+ *     wrong for anything that is not actually a bank transfer. The label now
+ *     comes from `fiatMethods`, so a method added to the picker is rendered
+ *     with the label the picker shows.
+ */
+function withdrawalMethodLabel(paymentMethod, assetCode, network) {
+    if (paymentMethod === 'crypto') {
+        const parts = [String(assetCode || '').toUpperCase()];
+        if (network) parts.push(String(network));
+        const label = parts.filter(Boolean).join(' on ');
+        return label || 'Cryptocurrency';
+    }
+    return METHOD_LABELS.get(paymentMethod) || paymentMethod;
 }
 
 // ---------------------------------------------------------------------------
@@ -296,64 +411,76 @@ async function getPayoutLimits() {
 }
 
 // ---------------------------------------------------------------------------
-// Options endpoint
+// Shared withdrawal validation
 // ---------------------------------------------------------------------------
 
-async function withdrawalOptions(req, res) {
-    let limits = APP_DEFAULT_LIMITS;
-    try {
-        limits = await getPayoutLimits();
-    } catch (error) {
-        console.error('Could not load NOWPayments payout limits:', error.message);
+/**
+ * Validates every part of a withdrawal request that does not depend on the
+ * database.
+ *
+ * Both `sendWithdrawalCode` and `requestWithdrawal` used to perform this same
+ * validation as separate inline blocks. Two copies that must stay in step is a
+ * recipe for the code path to issue a confirmation code for a request the
+ * submit path then refuses -- which reaches the user as "your code is invalid"
+ * for a code that was fine, and sends them back to the form to try again.
+ *
+ * Returns `{ ok: true, data }` on success and `{ ok: false, status, error }`
+ * on any failure, so the caller is a linear sequence of returns rather than a
+ * nest of `if` blocks.
+ */
+async function validateWithdrawalRequest(body) {
+    const paymentMethod = String(body.paymentMethod || '').toLowerCase();
+    const paymentAddress = String(body.paymentAddress || '').trim();
+    const assetCode = String(body.assetCode || '').toUpperCase();
+    const network = String(body.network || '').toLowerCase();
+    const destinationTag = normaliseDestinationTag(body.destinationTag);
+
+    const amount = parseAmountInRange(body.amount, {
+        min: minimumWithdrawalUsd,
+        max: maximumWithdrawalUsd,
+    });
+    if (amount === null) {
+        return {
+            ok: false,
+            status: 400,
+            error: `Enter an amount between $${formatUsd(minimumWithdrawalUsd)} and $${formatUsd(maximumWithdrawalUsd)}.`,
+        };
     }
 
-    try {
-        return res.json({
-            methods: [
-                ...fiatMethods,
-                {
-                    value: 'crypto',
-                    label: 'Cryptocurrency',
-                    hint: 'Sent to a wallet address you control. Check the network carefully.',
-                },
-            ],
-            assets: cryptoDestinations.map((asset) => ({
-                code: asset.assetCode,
-                label: asset.label,
-                symbol: asset.symbol,
-                addressHint: asset.addressHint,
-                requiresDestinationTag: requiresDestinationTag(asset.assetCode),
-                networks: asset.networks.map((network) => ({
-                    value: network.value,
-                    label: network.label,
-                    addressHint: network.addressHint || asset.addressHint,
-                    providerCoin: network.providerCoin,
-                    minimumCoin: limits.minimums[network.providerCoin] ?? null,
-                    estimatedFeeCoin: limits.fees[network.providerCoin] ?? null,
-                })),
-            })),
-            minimumUsd: minimumWithdrawalUsd,
-            maximumUsd: maximumWithdrawalUsd,
-            limitsSource: {
-                minimums: limits.minimumsSource,
-                fees: limits.feesSource,
-                // Whether the per-network floors were actually read from the provider this
-                // refresh. `minimumsSource` alone cannot carry this: an account the provider
-                // refuses leaves `minimums` empty, which is the same shape as "the provider
-                // answered and reported nothing", and only the first of those means the
-                // displayed floor is unverified.
-                minimumsConfirmed: limits.minimumsConfirmed !== false,
-            },
+    if (!SUPPORTED_PAYMENT_METHODS.has(paymentMethod)) {
+        return { ok: false, status: 400, error: 'Unsupported payment method.' };
+    }
+
+    if (
+        paymentAddress.length < MIN_PAYMENT_ADDRESS_LENGTH ||
+        paymentAddress.length > MAX_PAYMENT_ADDRESS_LENGTH
+    ) {
+        return { ok: false, status: 400, error: 'Enter a valid payment destination.' };
+    }
+
+    if (paymentMethod === 'crypto') {
+        const problem = await validateCryptoWithdrawal({
+            assetCode,
+            network,
+            paymentAddress,
+            destinationTag,
         });
-    } catch (error) {
-        console.error('Could not build withdrawal options response:', error.message);
-        return res.status(500).json({ error: 'Failed to load withdrawal options.' });
+        if (problem) return { ok: false, ...problem };
     }
-}
 
-// ---------------------------------------------------------------------------
-// Withdrawal validation
-// ---------------------------------------------------------------------------
+    return {
+        ok: true,
+        data: {
+            paymentMethod,
+            paymentAddress,
+            assetCode,
+            network,
+            destinationTag,
+            amount,
+            destination: destinationFor(paymentMethod, paymentAddress, destinationTag),
+        },
+    };
+}
 
 /**
  * Validates everything about a crypto withdrawal that can be checked before the
@@ -413,6 +540,151 @@ async function validateCryptoWithdrawal({ assetCode, network, paymentAddress, de
 }
 
 // ---------------------------------------------------------------------------
+// Options endpoint
+// ---------------------------------------------------------------------------
+
+async function withdrawalOptions(req, res) {
+    let limits = APP_DEFAULT_LIMITS;
+    try {
+        limits = await getPayoutLimits();
+    } catch (error) {
+        console.error('Could not load NOWPayments payout limits:', error.message);
+    }
+
+    try {
+        return res.json({
+            methods: [
+                ...fiatMethods,
+                {
+                    value: 'crypto',
+                    label: 'Cryptocurrency',
+                    hint: 'Sent to a wallet address you control. Check the network carefully.',
+                },
+            ],
+            assets: cryptoDestinations.map((asset) => ({
+                code: asset.assetCode,
+                label: asset.label,
+                symbol: asset.symbol,
+                addressHint: asset.addressHint,
+                requiresDestinationTag: requiresDestinationTag(asset.assetCode),
+                networks: asset.networks.map((network) => ({
+                    value: network.value,
+                    label: network.label,
+                    addressHint: network.addressHint || asset.addressHint,
+                    providerCoin: network.providerCoin,
+                    minimumCoin: limits.minimums[network.providerCoin] ?? null,
+                    estimatedFeeCoin: limits.fees[network.providerCoin] ?? null,
+                })),
+            })),
+            minimumUsd: minimumWithdrawalUsd,
+            maximumUsd: maximumWithdrawalUsd,
+            limitsSource: {
+                minimums: limits.minimumsSource,
+                fees: limits.feesSource,
+                // Whether the per-network floors were actually read from the provider this
+                // refresh. `minimumsSource` alone cannot carry this: an account the provider
+                // refuses leaves `minimums` empty, which is the same shape as "the provider
+                // answered and reported nothing", and only the first of those means the
+                // displayed floor is unverified.
+                minimumsConfirmed: limits.minimumsConfirmed !== false,
+            },
+        });
+    } catch (error) {
+        console.error('Could not build withdrawal options response:', error.message);
+        return res.status(500).json({ error: 'Failed to load withdrawal options.' });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Withdrawal code
+// ---------------------------------------------------------------------------
+
+/**
+ * Emails a confirmation code for one specific withdrawal.
+ *
+ * The amount and destination are part of the request, not of the confirmation, and the code is
+ * stored bound to both. That is the point: a code is not permission to withdraw, it is
+ * permission for the withdrawal the user was actually looking at when it was sent. Without the
+ * binding, a code requested for a $1 sanity check would authorise a $10,000 payout to an
+ * address chosen afterwards, which is the case the check exists to prevent.
+ *
+ * Every input is validated exactly as it is for the real withdrawal, so a code is never issued
+ * for a request that could not have been made. Validating here and not there would let a user
+ * be sent a code for a payout the server would refuse, and then discover the refusal only after
+ * reading the code.
+ *
+ * The balance is also checked here, which the earlier version did not do. A user with $0 could
+ * request a code for $100, receive it, and only discover the problem on submit -- a wasted
+ * email and a confusing failure for something the server already knew.
+ */
+async function sendWithdrawalCode(req, res) {
+    const userId = req.user?.id;
+    if (!userId) {
+        return res.status(401).json({ error: 'Sign in to request a withdrawal.' });
+    }
+
+    const validated = await validateWithdrawalRequest(req.body);
+    if (!validated.ok) {
+        return res.status(validated.status).json({ error: validated.error });
+    }
+    const { amount, destination, paymentMethod, assetCode, network } = validated.data;
+
+    try {
+        const userRes = await pool.query('SELECT email, balance FROM users WHERE id = $1', [userId]);
+        if (userRes.rows.length === 0) {
+            return res.status(404).json({ error: 'User not found.' });
+        }
+
+        const { email, balance } = userRes.rows[0];
+        const currentBalance = Number(balance);
+
+        // The same non-finite guard the submit path uses, so a corrupt balance row produces one
+        // consistent refusal rather than a code issued and then a submit rejected.
+        if (!Number.isFinite(currentBalance)) {
+            console.error(`User ${userId} has a non-numeric balance; refusing to issue a code.`);
+            return res.status(500).json({ error: 'Internal server error processing payout.' });
+        }
+        if (currentBalance < amount) {
+            return res.status(400).json({ error: 'Insufficient balance.' });
+        }
+
+        const { code } = await withdrawalCode.issueWithdrawalCode({
+            userId,
+            amount,
+            destination,
+            email
+        });
+
+        const delivery = await withdrawalCode.sendWithdrawalCodeEmail({
+            to: email,
+            code,
+            amount,
+            destination,
+            methodLabel: withdrawalMethodLabel(paymentMethod, assetCode, network)
+        });
+        if (!delivery.sent) {
+            // The row exists but nothing was sent, so a code the user never receives would
+            // otherwise be waiting to be guessed. Cleared rather than left to expire.
+            await withdrawalCode.clearWithdrawalCode(userId).catch(() => {});
+            console.error(`Withdrawal confirmation email was not delivered (${delivery.reason}).`);
+            return res.status(503).json({ error: 'Could not email a confirmation code right now.' });
+        }
+
+        return res.json({
+            sent: true,
+            expiresInMinutes: withdrawalCode.CODE_LIFETIME_MINUTES
+        });
+    } catch (error) {
+        console.error('Withdrawal confirmation failed:', error.message);
+        // Same reasoning as the undelivered case above: the code may well have been written
+        // before the failure, and a code the user never received is still five guesses for
+        // whoever is guessing.
+        await withdrawalCode.clearWithdrawalCode(userId).catch(() => {});
+        return res.status(503).json({ error: 'Could not email a confirmation code right now.' });
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Withdrawal request
 // ---------------------------------------------------------------------------
 
@@ -422,50 +694,55 @@ async function requestWithdrawal(req, res) {
         return res.status(401).json({ error: 'Sign in to request a withdrawal.' });
     }
 
-    const paymentMethod = String(req.body.paymentMethod || '').toLowerCase();
-    const paymentAddress = String(req.body.paymentAddress || '').trim();
-    const assetCode = String(req.body.assetCode || '').toUpperCase();
-    const network = String(req.body.network || '').toLowerCase();
-    const destinationTag = normaliseDestinationTag(req.body.destinationTag);
+    const validated = await validateWithdrawalRequest(req.body);
+    if (!validated.ok) {
+        return res.status(validated.status).json({ error: validated.error });
+    }
+    const { paymentMethod, paymentAddress, assetCode, network, destinationTag, amount, destination } = validated.data;
 
-    const amount = parseAmountInRange(req.body.amount, {
-        min: minimumWithdrawalUsd,
-        max: maximumWithdrawalUsd,
-    });
-    if (amount === null) {
-        return res.status(400).json({
-            // Grouped and cent-exact, so the message matches the hint on the amount box.
-            // Interpolating the raw numbers gave "$5.00 and $50000.00", and a user
-            // comparing that with the form had no way to tell which figure was the limit.
-            error: `Enter an amount between $${formatUsd(minimumWithdrawalUsd)} and $${formatUsd(maximumWithdrawalUsd)}.`,
+    // The confirmation code is checked before the idempotency key is resolved, so a request
+    // that is going to be refused anyway does not burn the key a corrected retry needs.
+    //
+    // Note the trade-off: on a double-click, the second request carries a code the first call
+    // has already consumed, so it fails with "invalid code" rather than being recognised as a
+    // duplicate. The frontend should disable the submit button after the first click. Doing
+    // this the other way -- resolving the idempotency key first and short-circuiting on a
+    // duplicate -- would mean a code typed wrong and corrected still collides with the
+    // abandoned attempt's key, which is worse.
+    //
+    // Checked before the balance is read and debited, which is the whole reason for the check:
+    // a session token alone must not be enough to move money out of an account.
+    const submittedCode = String(req.body.code || '').trim();
+    if (!withdrawalCode.CODE_PATTERN.test(submittedCode)) {
+        return res.status(400).json({ error: withdrawalCode.failureMessage('missing') });
+    }
+
+    try {
+        const verdict = await withdrawalCode.consumeWithdrawalCode({
+            userId,
+            code: submittedCode,
+            amount,
+            destination
         });
-    }
-
-    if (!SUPPORTED_PAYMENT_METHODS.has(paymentMethod)) {
-        return res.status(400).json({ error: 'Unsupported payment method.' });
-    }
-
-    if (
-        paymentAddress.length < MIN_PAYMENT_ADDRESS_LENGTH ||
-        paymentAddress.length > MAX_PAYMENT_ADDRESS_LENGTH
-    ) {
-        return res.status(400).json({ error: 'Enter a valid payment destination.' });
-    }
-
-    if (paymentMethod === 'crypto') {
-        const problem = await validateCryptoWithdrawal({
-            assetCode,
-            network,
-            paymentAddress,
-            destinationTag,
-        });
-        if (problem) return res.status(problem.status).json({ error: problem.error });
+        if (!verdict.ok) {
+            return res.status(400).json({ error: withdrawalCode.failureMessage(verdict.reason) });
+        }
+    } catch (error) {
+        console.error('Withdrawal code check failed:', error.message);
+        // Fails closed. An error here is indistinguishable, to an attacker, from "no code was
+        // supplied", so letting the request through on a database fault would turn a transient
+        // database problem into an unprotected payout path.
+        return res.status(503).json({ error: 'Could not confirm this withdrawal right now. Try again.' });
     }
 
     // Computed after validation so a malformed request does not consume an
     // idempotency key that a corrected retry would need.
+    //
+    // The amount is normalised before it goes into the fingerprint because
+    // `String(0.1 + 0.2)` is `"0.30000000000000004"`, and a fingerprint taken
+    // from a slightly different float is a different fingerprint.
     const idempotencyKey = resolveIdempotencyKey(req, userId, [
-        amount,
+        normalizeAmountForFingerprint(amount),
         paymentMethod,
         paymentAddress,
         assetCode,
@@ -575,7 +852,7 @@ async function requestWithdrawal(req, res) {
                     withdrawalId,
                     convertToCoin: autoPayouts.usdToCoin
                 });
-                if (outcome.attempted) automaticPayout = outcome;
+                if (outcome?.attempted) automaticPayout = outcome;
             } catch (error) {
                 console.error(`Automatic payout for withdrawal ${withdrawalId} did not complete:`, error.message);
             }
@@ -605,6 +882,7 @@ async function requestWithdrawal(req, res) {
 
 const payoutController = {
     withdrawalOptions,
+    sendWithdrawalCode,
     requestWithdrawal,
 };
 
@@ -614,3 +892,4 @@ module.exports.resetPayoutLimitsCache = resetPayoutLimitsCache;
 // controller's own request handlers go through the cache, so there is no other way to observe
 // the fan-out without standing up the whole route and a fake provider.
 module.exports.fetchPayoutLimits = fetchPayoutLimits;
+module.exports.__private = { validateWithdrawalRequest, withdrawalMethodLabel };

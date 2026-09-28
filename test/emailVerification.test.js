@@ -45,6 +45,10 @@ const db = {
     verified: null,
     lastEmailedCode: null,
     passwordHash: null,
+    // Stands in for `users.token_version`, which every password reset bumps. Tracked as real
+    // state because the signed token's `ver` claim has to match it exactly, and a token signed
+    // at 0 for an account sitting at 1 is rejected on first use.
+    tokenVersion: 0,
     rateLimits: new Map()
 };
 
@@ -56,6 +60,7 @@ function resetDb() {
     db.verified = null;
     db.lastEmailedCode = null;
     db.passwordHash = null;
+    db.tokenVersion = 0;
     db.rateLimits.clear();
 }
 
@@ -98,7 +103,7 @@ async function runStubbedQuery(query, values = []) {
     }
     if (/UPDATE users SET email_verified_at = NOW\(\)/i.test(sql)) {
         db.verified = true;
-        return { rows: [{ id: db.user.id, email: db.user.email, balance: '0.00', demo_balance: '0.00' }] };
+        return { rows: [{ id: db.user.id, email: db.user.email, balance: '0.00', demo_balance: '0.00', token_version: db.tokenVersion }] };
     }
     if (/password_hash[\s\S]*FROM users WHERE LOWER\(email\)/i.test(sql)) {
         if (!db.user) return { rows: [] };
@@ -110,7 +115,8 @@ async function runStubbedQuery(query, values = []) {
                 demo_balance: '0.00',
                 password_hash: db.passwordHash,
                 is_banned: false,
-                email_verified_at: db.user.email_verified_at
+                email_verified_at: db.user.email_verified_at,
+                token_version: db.tokenVersion
             }]
         };
     }
@@ -216,8 +222,13 @@ after(async () => {
 });
 
 /** Puts a known user and a known live code into the stand-in database. */
-function seedUserWithCode() {
-    resetDb();
+/** Reads the `ver` claim from a signed token, so a test can assert what the server will compare. */
+function tokenVersionOf(token) {
+    const payload = JSON.parse(Buffer.from(String(token).split('.')[1], 'base64url').toString('utf8'));
+    return payload.ver;
+}
+
+function seedUserWithCode() {    resetDb();
     const code = generateCode();
     db.user = { id: 11, email: 'member@example.test', email_verified_at: null };
     db.passwordHash = db.defaultPasswordHash;
@@ -252,6 +263,63 @@ test('a correct code verifies the address and returns a session', async () => {
     assert.ok(db.deletedCodes > 0);
 });
 
+test('a user who has reset their password can still sign in', async () => {
+    // The bug this covers locked an account out permanently rather than signing it out once.
+    //
+    // Password reset bumps `users.token_version`. The token's `ver` claim is compared against
+    // that column on every request and must match exactly. If the sign-in query did not select
+    // the column, the claim was signed as 0, so an account sitting at 1 passed sign-in, was
+    // handed a token, and then had every request refused with "your session ended because the
+    // password changed" -- and signing in again produced the same stale claim, so the loop
+    // could never be escaped. The `|| 0` default is what made a forgotten column silent.
+    seedUserWithCode();
+    db.user.email_verified_at = new Date();
+    db.tokenVersion = 0;
+
+    const before = await post('/api/auth/login', { email: 'member@example.test', password: PASSWORD });
+    assert.equal(before.status, 200);
+    const beforeToken = (await before.json()).token;
+    assert.equal(tokenVersionOf(beforeToken), 0);
+
+    // A reset, from any device. The old token is meant to die here.
+    db.tokenVersion += 1;
+    assert.notEqual(tokenVersionOf(beforeToken), db.tokenVersion, 'the pre-reset token should no longer match');
+
+    // Signing in again has to produce a token that matches the new version, or the account is
+    // unreachable from here on.
+    const after = await post('/api/auth/login', { email: 'member@example.test', password: PASSWORD });
+    assert.equal(after.status, 200);
+    const afterToken = (await after.json()).token;
+    assert.equal(tokenVersionOf(afterToken), db.tokenVersion);
+    assert.notEqual(afterToken, beforeToken);
+});
+
+test('a token cannot be minted for an account whose version the query did not return', async () => {
+    // The defensive half. `issueToken` must refuse rather than default the version to 0, so
+    // that any future query which leaves out the column fails at the point of the mistake
+    // instead of quietly signing tokens that are rejected on first use.
+    seedUserWithCode();
+    db.user.email_verified_at = new Date();
+
+    // Reproduce the original fault: the sign-in query returns a row with no `token_version`.
+    const originalQuery = pool.query;
+    pool.query = async (query, values) => {
+        if (/password_hash[\s\S]*FROM users WHERE LOWER\(email\)/i.test(String(query).replace(/\s+/g, ' '))) {
+            return { rows: [{ id: db.user.id, email: db.user.email, balance: '0.00', demo_balance: '0.00', password_hash: db.passwordHash, is_banned: false, email_verified_at: db.user.email_verified_at }] };
+        }
+        return originalQuery(query, values);
+    };
+
+    try {
+        // A 500, not a token. The user sees a real failure they can retry, rather than a
+        // successful sign-in followed by a session that dies on the first request.
+        const response = await post('/api/auth/login', { email: 'member@example.test', password: PASSWORD });
+        assert.equal(response.status, 500);
+        assert.equal((await response.json()).token, undefined, 'a token was issued without a known version');
+    } finally {
+        pool.query = originalQuery;
+    }
+});
 test('a used code cannot be replayed', async () => {
     const code = seedUserWithCode();
 

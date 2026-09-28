@@ -38,6 +38,8 @@
     "uuid": "^9.0.1"
   },
   "devDependencies": {
-    "nodemon": "^3.1.14"
+    "gifencoder": "^2.0.1",
+    "nodemon": "^3.1.14",
+    "puppeteer-core": "^25.12.0"
   }
 }

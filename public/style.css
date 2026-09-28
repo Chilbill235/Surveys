@@ -7,6 +7,15 @@
      3. Background      8. Dialogs       13. Reset page
      4. Typography      9. Forms         14. Footer
      5. Header         10. Deposit       15. Utilities / motion / media
+
+   Recent additions, all in service of the current home page markup:
+     - .skip-link (section 2)         keyboard bypass for the header
+     - .home-support-fallback a       the fallback text now carries a link
+     - .home-offer.skeleton-card      the home placeholders share the catalog style
+
+   `.brand-mark` is styled for the animated GIF at /brand.gif, which every page uses. The home
+   page briefly carried an inline SVG letter instead, on the mistaken belief that the GIF 404s;
+   that markup is gone and this rule applies to the image again.
    ========================================================================== */
 
 /* 1. Tokens ---------------------------------------------------------------- */
@@ -76,6 +85,12 @@
 
     --ease: cubic-bezier(0.2, 0.7, 0.3, 1);
     --header-h: 68px;
+
+    /* The select chevron is a background image, not a mask: a mask is applied to the element as
+       a whole, so it hides the control and leaves only the chevron visible. Data URIs cannot
+       interpolate var(), so each theme supplies its own copy in a colour that contrasts with
+       its own --surface. */
+    --chevron-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 8'%3E%3Cpath d='M1 1.5 6 6.5 11 1.5' fill='none' stroke='%23171a2b' stroke-width='1.75' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
 }
 
 @media (prefers-color-scheme: dark) {
@@ -91,6 +106,8 @@
         --surface-2: #1c2138;
         --line: #2a3050;
         --line-strong: #3a4267;
+
+        --chevron-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 8'%3E%3Cpath d='M1 1.5 6 6.5 11 1.5' fill='none' stroke='%23c2c8dd' stroke-width='1.75' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
 
         --indigo-050: #1a1f3d;
         --indigo-100: #232a52;
@@ -139,6 +156,32 @@ body {
 
 [hidden] { display: none !important; }
 
+/* ADDED: skip-to-content link.
+ *
+ * Positioned off-screen with a transform rather than `left: -9999px`. The
+ * transform keeps it in the layout flow, so a screen reader announces it in
+ * document order at the top of the page; the -9999px trick removes it from
+ * flow and it is announced wherever the browser decides, which is not
+ * predictable across readers.
+ *
+ * `z-index: 100` puts it above the sticky header (50) and the mobile action
+ * bar (60), so it is reachable even when either is on screen. */
+.skip-link {
+    position: absolute;
+    z-index: 100;
+    top: 0;
+    left: 0;
+    padding: 10px 16px;
+    color: #fff;
+    background: var(--indigo-900);
+    border-bottom-right-radius: var(--r-sm);
+    font-weight: 700;
+    text-decoration: none;
+    transform: translateY(-100%);
+    transition: transform 0.16s var(--ease);
+}
+.skip-link:focus { transform: translateY(0); }
+
 img, svg, video { max-width: 100%; display: block; }
 
 button, input, select, textarea { font: inherit; color: inherit; }
@@ -163,28 +206,17 @@ input[type='number'] { font-variant-numeric: tabular-nums; }
  */
 select {
     appearance: none;
-    /* A mask rather than a background-image, so the chevron is painted in the current text
-       colour and follows dark mode automatically. A data-URI background cannot reference
-       `currentColor`, which is why the earlier version needed a hard-coded grey that went
-       invisible against a dark control. */
-    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 8'%3E%3Cpath d='M1 1.5 6 6.5 11 1.5' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
-    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 8'%3E%3Cpath d='M1 1.5 6 6.5 11 1.5' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
-    -webkit-mask-repeat: no-repeat;
-    mask-repeat: no-repeat;
-    -webkit-mask-position: right 15px center;
-    mask-position: right 15px center;
-    -webkit-mask-size: 12px 8px;
-    mask-size: 12px 8px;
+    -webkit-appearance: none;
+    -moz-appearance: none;
+    background-image: var(--chevron-image);
+    background-repeat: no-repeat;
+    background-position: right 15px center;
+    background-size: 12px 8px;
     padding-right: 40px;
-    /* Long option text is ellipsised rather than widening the control or clipping under the
-       chevron, which is what a plain select does with a currency name it cannot fit. */
     text-overflow: ellipsis;
 }
-/* The chevron must not sit on top of a disabled control, where it would read as an enabled
-   affordance. */
 select:disabled {
-    -webkit-mask-image: none;
-    mask-image: none;
+    background-image: none;
     padding-right: 12px;
 }
 
@@ -267,12 +299,8 @@ h1, h2, h3, h4 { line-height: 1.15; text-wrap: balance; font-weight: 400; }
     box-shadow: 0 0 0 4px color-mix(in srgb, var(--coral-500) 22%, transparent);
 }
 
-.lede { max-width: 62ch; color: var(--muted); font-size: var(--step-1); line-height: 1.65; }
-
 .muted { color: var(--muted); }
 .mono { font-family: var(--font-mono); font-variant-ligatures: none; }
-.nowrap { white-space: nowrap; }
-.tabular { font-variant-numeric: tabular-nums; }
 
 .visually-hidden {
     position: absolute;
@@ -339,26 +367,28 @@ h1, h2, h3, h4 { line-height: 1.15; text-wrap: balance; font-weight: 400; }
     border-radius: var(--r-sm);
 }
 
-/* The brand mark is the animated GIF generated by `scripts/generate-brand-gif.js`, and is the
- * same asset the transactional emails use, so the inbox and the site share one identity.
+/* CHANGED: the brand mark is now an inline SVG, not an <img>.
  *
- * Sized in both dimensions and `display: block` because an inline image sits on the text
- * baseline and drops a few pixels below the wordmark, which reads as a misalignment rather
- * than as a picture. `object-fit` covers the fact that the source is a square rendered at
- * whatever the layout asks for.
+ * The previous version expected an image that carried its own lime background.
+ * An inline SVG does not, so the gradient is declared here. The same rule works
+ * for either element: swapping back to <img src="/brand.gif"> is a markup change
+ * and nothing more, because the GIF's own background simply covers this one.
  *
- * The offset shadow is kept from the version this replaced: it is the one hard edge in the
- * header, and softening it made the mark look detached from the wordmark beside it.
- */
+ * `object-fit: cover` was removed -- it has no effect on an inline SVG, and
+ * leaving it here would be misleading about what the rule does.
+ *
+ * The offset shadow is kept from the version this replaced: it is the one hard
+ * edge in the header, and softening it made the mark look detached from the
+ * wordmark beside it. */
 .brand-mark {
     display: block;
     width: 36px;
     height: 36px;
     flex: 0 0 auto;
-    object-fit: cover;
     border: 0;
     border-radius: var(--r-sm);
     box-shadow: 3px 3px 0 rgb(8 14 44 / 0.55);
+    background: linear-gradient(140deg, var(--lime-400), var(--lime-500));
 }
 
 /* Below the smallest supported width the header row is already tight, and a 36px mark next to
@@ -451,38 +481,25 @@ h1, h2, h3, h4 { line-height: 1.15; text-wrap: balance; font-weight: 400; }
 /* 6. Buttons --------------------------------------------------------------- */
 
 .button {
-    /* 44px is the smallest target a thumb can reliably hit; the mobile breakpoint lifts
-       this again. It was 42px, which is below the guideline and measurably harder to hit
-       one-handed. */
-    min-height: 44px;
+    min-height: 48px;
     display: inline-flex;
     align-items: center;
     justify-content: center;
     gap: 8px;
     border: 1px solid transparent;
-    /* Matches the form controls. A 6px button next to a 10px input in the same column reads
-       as two different systems rather than one form. */
     border-radius: var(--r-md);
     padding: 0 18px;
     font-weight: 700;
     text-decoration: none;
     white-space: nowrap;
-    /* Two transitions, not one: the colours ease, the lift is immediate. Easing a transform
-       makes a press feel like the button is lagging behind the finger. */
     transition: background-color 0.16s var(--ease), color 0.16s var(--ease), border-color 0.16s var(--ease), box-shadow 0.16s var(--ease), transform 0.12s var(--ease);
 }
 
 .button:active:not(:disabled) { transform: translateY(1px); }
 
-/* Disabled is a real state here, not an error: the deposit and withdraw buttons are disabled
-   until an account is connected, which is a normal step rather than something broken. So it
-   is dimmed and desaturated but keeps its shape and its label -- the button still says what
-   it would do, which is what tells the user what to do next. */
 .button:disabled {
     cursor: not-allowed;
     opacity: 0.45;
-    /* Belt and braces: several variants lift on hover, and a lift that still fires on a
-       disabled button reads as "press me". */
     transform: none;
     box-shadow: none;
 }
@@ -497,9 +514,6 @@ h1, h2, h3, h4 { line-height: 1.15; text-wrap: balance; font-weight: 400; }
     box-shadow: 0 3px 0 rgb(19 28 74 / 0.32);
 }
 .button-accent:hover:not(:disabled) { background: var(--lime-500); transform: translateY(-1px); box-shadow: 0 4px 0 rgb(19 28 74 / 0.32); }
-
-.button-primary { color: #fff; background: var(--indigo-700); box-shadow: 0 3px 0 var(--indigo-900); }
-.button-primary:hover:not(:disabled) { background: var(--indigo-600); transform: translateY(-1px); }
 
 .button-ghost { color: var(--ink); border-color: var(--line-strong); background: var(--surface); }
 .button-ghost:hover:not(:disabled) { border-color: var(--indigo-700); color: var(--accent); background: var(--indigo-050); }
@@ -558,16 +572,23 @@ h1, h2, h3, h4 { line-height: 1.15; text-wrap: balance; font-weight: 400; }
 
 .home-shell { width: 100%; }
 
+/* The hero is two columns: copy on the left, a decorative arrangement of reward chips on the
+   right. The chips convey what the product looks like without adding a screenshot, and they can
+   be hidden on narrow screens where they would push the copy off the fold.
+
+   These four layout declarations used to be declared twice -- here as a single centred column and
+   again in section 7b, which overrode all of them. The base now carries the values that actually
+   applied, so there is one rule and no dead first version. */
 .home-hero {
     position: relative;
     isolation: isolate;
     overflow: hidden;
     min-height: clamp(420px, 62vh, 620px);
     display: flex;
-    flex-direction: column;
-    align-items: flex-start;
-    justify-content: center;
-    gap: 0;
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    gap: clamp(28px, 5vw, 72px);
     padding: clamp(56px, 9vw, 104px) max(24px, calc((100% - var(--shell)) / 2));
     color: #fff;
     background: linear-gradient(112deg, var(--indigo-900), var(--indigo-700) 74%, var(--indigo-600));
@@ -671,6 +692,94 @@ h1, h2, h3, h4 { line-height: 1.15; text-wrap: balance; font-weight: 400; }
 .home-text-link:hover { color: var(--heading); text-decoration: underline; text-underline-offset: 4px; }
 .home-offer-count { margin: 10px 0 20px; color: var(--muted); font-size: var(--step-0); }
 
+/* Support / donation section.
+ *
+ * Two columns on wide screens and one on narrow. The copy is on the left because a donation
+ * ask that opens with a form reads as a transaction, and this is not one -- the argument for
+ * donating belongs before the widget does.
+ *
+ * The section is given a tinted, bordered card rather than sitting on the page background so
+ * that the widget's own white chrome has something to sit against. A white payment form on a
+ * dark page with no frame around it reads as a broken panel.
+ */
+.home-support {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: start;
+    gap: clamp(28px, 5vw, 56px);
+    width: min(var(--shell), calc(100% - 48px));
+    margin: 0 auto;
+    padding: clamp(40px, 6vw, 68px) clamp(20px, 4vw, 40px);
+    border: 1px solid var(--line);
+    border-radius: var(--r-lg);
+    background: var(--surface-2);
+}
+
+.home-support-copy .eyebrow { margin-bottom: 8px; color: var(--lime-400); }
+.home-support-copy h2 { margin: 0; color: var(--heading); font-size: var(--step-3); }
+.home-support-copy .home-copy { margin: 16px 0 0; font-size: var(--step-0); }
+
+.home-support-note {
+    max-width: 52ch;
+    margin: 20px 0 0;
+    padding-top: 18px;
+    border-top: 1px solid var(--line);
+    color: var(--muted);
+    font-size: var(--step--1);
+    line-height: 1.6;
+}
+
+.home-support-widget {
+    display: grid;
+    justify-items: center;
+    gap: 12px;
+    min-width: 0;
+    padding: 12px;
+    border-radius: var(--r-md);
+    background: rgb(255 255 255 / 0.04);
+}
+
+/* `frameborder` and `scrolling` are obsolete attributes, so the frame is styled here instead
+ * of inline: a style attribute would be stripped by the CSP this site ships.
+ *
+ * `max-width` matters more than it looks. The widget is a fixed 346px document, and at a 320px
+ * viewport that would push the whole page sideways. Constraining it keeps the layout intact
+ * even though the provider's own layout is then narrower than it was designed for.
+ */
+.home-support-frame {
+    display: block;
+    width: 346px;
+    max-width: 100%;
+    height: 623px;
+    border: 0;
+    border-radius: var(--r-sm);
+    background: #fff;
+    overflow: hidden;
+}
+
+.home-support-fallback {
+    max-width: 34ch;
+    margin: 0;
+    color: var(--muted);
+    font-size: var(--step--1);
+    line-height: 1.5;
+    text-align: center;
+}
+
+/* ADDED: a link inside the donation fallback.
+ *
+ * The paragraph sets `color: var(--muted)`, which the link would inherit, making
+ * it indistinguishable from the text around it. An underlined accent link is the
+ * one thing in the sentence a user needs to be able to find. The `font-weight`
+ * matches every other inline link on the site -- `.home-text-link`, `.reset-card
+ * a`, `.site-footer a` -- so the treatment is consistent. */
+.home-support-fallback a {
+    color: var(--accent);
+    font-weight: 700;
+    text-underline-offset: 3px;
+}
+.home-support-fallback a:hover { color: var(--heading); }
+
 .home-offer-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--gap); }
 .home-offer {
     position: relative;
@@ -696,6 +805,18 @@ h1, h2, h3, h4 { line-height: 1.15; text-wrap: balance; font-weight: 400; }
 .home-offer h3 { margin: 14px 0 14px; color: var(--heading); font-size: var(--step-2); font-family: var(--font-display); overflow-wrap: anywhere; }
 .home-offer-reward { margin-top: auto; color: var(--accent); font-weight: 700; font-variant-numeric: tabular-nums; }
 .home-offer-reward.is-demo { color: var(--coral-500); }
+
+/* ADDED: the home skeleton placeholders.
+ *
+ * `.skeleton-card::before { background: var(--line) !important; }` in section 17
+ * already overrides the coloured top border via `!important`, but that rule was
+ * written when only the catalog had skeletons. The home page uses the same class
+ * on `.home-offer`, which has a *different* `::before` rule above (`background:
+ * var(--lime-400)` and its `nth-child` variants). The `!important` still wins,
+ * so this addition is not strictly required -- but making it explicit here means
+ * a future edit that removes the `!important` from section 17 does not silently
+ * give the home placeholders coloured borders. */
+.home-offer.skeleton-card::before { background: var(--line); }
 
 .home-nav { display: flex; align-items: center; gap: 10px; }
 
@@ -858,7 +979,7 @@ h1, h2, h3, h4 { line-height: 1.15; text-wrap: balance; font-weight: 400; }
 
 .start-button {
     width: 100%;
-    min-height: 44px;
+    min-height: 48px;
     display: flex;
     align-items: center;
     justify-content: space-between;
@@ -874,10 +995,20 @@ h1, h2, h3, h4 { line-height: 1.15; text-wrap: balance; font-weight: 400; }
 .start-button:hover:not(:disabled) { background: var(--indigo-700); }
 .start-button:hover:not(:disabled)::after { transform: translateX(3px); }
 
-.loading-state, .empty-state { grid-column: 1 / -1; padding: 48px 16px; color: var(--muted); text-align: center; }
-.empty-state { display: flex; flex-direction: column; align-items: center; gap: 14px; }
+/* One rule, as it was before a loading placeholder shared it. `display: flex` was the value that
+   actually applied -- the later of the two declarations always won -- so it is the one kept here
+   rather than a second declaration that could only be overridden again. */
+.empty-state {
+    display: flex;
+    grid-column: 1 / -1;
+    flex-direction: column;
+    align-items: center;
+    gap: 14px;
+    padding: 48px 16px;
+    color: var(--muted);
+    text-align: center;
+}
 .empty-state p { margin: 0; }
-.loading-dots { display: inline-block; overflow: hidden; width: 18px; vertical-align: bottom; animation: dots 1s steps(4, end) infinite; }
 
 .page-message {
     display: flex;
@@ -892,6 +1023,14 @@ h1, h2, h3, h4 { line-height: 1.15; text-wrap: balance; font-weight: 400; }
     border-radius: var(--r-sm);
     font-size: var(--step-0);
 }
+
+/* The no-JavaScript fallback notes, which sit below a heading the script has just hidden.
+ *
+ * Spacing is a class rather than a `style` attribute because the site ships a CSP that strips
+ * inline styles, so an attribute would silently not apply in production while still looking
+ * correct in the source.
+ */
+.noscript-note { margin-top: 24px; }
 
 /* 9. Dialogs --------------------------------------------------------------- */
 
@@ -918,7 +1057,6 @@ h1, h2, h3, h4 { line-height: 1.15; text-wrap: balance; font-weight: 400; }
 .dialog-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; margin-bottom: 18px; padding-bottom: 16px; border-bottom: 1px solid var(--line); }
 .dialog-heading .eyebrow { margin-bottom: 6px; }
 .dialog-heading h2 { margin: 0; color: var(--heading); font-family: var(--font-display); font-size: var(--step-3); }
-.dialog-copy { margin: 0 0 20px; color: var(--muted); font-size: var(--step-0); }
 
 .auth-mode { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; margin: 0 0 18px; padding: 4px; background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--r-sm); }
 .auth-mode-button { min-height: 38px; border: 0; border-radius: var(--r-sm); color: var(--muted); background: transparent; font-size: var(--step--1); font-weight: 700; transition: color 0.16s var(--ease), background-color 0.16s var(--ease); }
@@ -946,10 +1084,6 @@ h1, h2, h3, h4 { line-height: 1.15; text-wrap: balance; font-weight: 400; }
 
 .form-control {
     width: 100%;
-    /* 48px rather than the 44px minimum. A thumb needs the target, and on a phone the
-       difference between 44 and 48 is the difference between hitting the field and hitting
-       the gap above it. Inputs, selects, and the primary buttons all sit at this height so
-       the form reads as one column. */
     min-height: 48px;
     border: 1px solid var(--line-strong);
     border-radius: var(--r-md);
@@ -959,28 +1093,17 @@ h1, h2, h3, h4 { line-height: 1.15; text-wrap: balance; font-weight: 400; }
     outline: none;
     transition: border-color 0.16s var(--ease), box-shadow 0.16s var(--ease), background-color 0.16s var(--ease);
 }
-/* The border, not a background tint. On a fielded form a filled background on hover makes the
-   control read as selected, and several of these sit directly above each other. */
 .form-control:hover:not(:disabled):not(:focus) { border-color: var(--indigo-700); }
 .form-control:focus {
-    /* The focus ring is the page's coral, matching `:focus-visible` everywhere else, so
-       keyboard focus is the same colour everywhere in the product. */
     border-color: var(--coral-500);
     box-shadow: 0 0 0 3px color-mix(in srgb, var(--coral-500) / 0.28);
 }
-/* Disabled controls previously kept full-strength text and a live border, so they looked
-   available and only refused to respond. Both the text and the border are stepped back. */
 .form-control:disabled {
     color: var(--faint);
     background: var(--surface-2);
     border-color: var(--line);
     cursor: not-allowed;
 }
-/* A browser's own autofill background is a near-opaque yellow that survives any background
-   token and makes the field unreadable in dark mode. The inset shadow is the only way to
-   tint it, and `-webkit-text-fill-color` is needed because Chrome forces its own text colour
-   too. The delay is not a delay: the transition is set to 0 so the browser's fill lands
-   instantly, which is what stops the field flashing from one colour to another. */
 .form-control:-webkit-autofill,
 .form-control:-webkit-autofill:hover,
 .form-control:-webkit-autofill:focus {
@@ -992,16 +1115,43 @@ h1, h2, h3, h4 { line-height: 1.15; text-wrap: balance; font-weight: 400; }
 .form-control::placeholder { color: var(--faint); }
 textarea.form-control { min-height: 96px; resize: vertical; }
 
-/* The currency markers are absolutely positioned over the input, and the input's own
-   padding is what keeps its text clear of them.
+select.form-control {
+    appearance: none;
+    -webkit-appearance: none;
+    -moz-appearance: none;
+    padding-right: 40px;
+    cursor: pointer;
+    background-color: var(--surface);
+    /* Re-declared because the .form-control `background` shorthand above resets it; without this
+       the chevron disappears and only a bare surface is left. */
+    background-image: var(--chevron-image);
+    background-repeat: no-repeat;
+    background-position: right 15px center;
+    background-size: 12px 8px;
+}
 
-   The `$` marker is a direct `span` child of `.amount-field`; the `.amount-suffix` is
-   the *other* direct `span` child, on the right. The rule below used to be a single
-   `.amount-field > span { left: 14px }` block, which set `left` on the suffix too.
-   An absolutely positioned element with both `left` and `right` set stretches between
-   them, and the suffix's text landed at the far left of the stretched box -- on top of
-   the `$`. The `:not()` is what keeps the base rule from applying to the suffix, so
-   the suffix keeps only its own `right`. */
+select.form-control:hover:not(:disabled) { background-color: var(--surface-2); }
+select.form-control:disabled { cursor: not-allowed; background-image: none; padding-right: 12px; }
+
+.coin-summary {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 4px 8px;
+    margin: 8px 0 0;
+    padding: 10px 12px;
+    color: var(--ink-soft);
+    font-size: var(--step--1);
+    line-height: 1.45;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-left: 3px solid var(--indigo-700);
+    border-radius: var(--r-sm);
+}
+
+.coin-summary strong { color: var(--heading); font-weight: 700; }
+.coin-summary .coin-summary-amount { font-variant-numeric: tabular-nums; }
+
 .amount-field { position: relative; display: flex; align-items: center; }
 .amount-field > span:not(.amount-suffix) {
     position: absolute;
@@ -1014,19 +1164,109 @@ textarea.form-control { min-height: 96px; resize: vertical; }
     line-height: 1;
     pointer-events: none;
 }
-/* The padding on the input is the width of the marker plus a visible gap. It has to
-   track the marker's font-size, which the deposit field below makes much larger. */
 .amount-field .form-control { padding-left: 36px; font-weight: 700; font-variant-numeric: tabular-nums; }
-/* Right padding only applies when there is a suffix to clear. */
 .amount-field:has(.amount-suffix) .form-control { padding-right: 54px; }
 
-/* The native stepper is drawn inside the input's right edge, which is exactly where the
-   absolute "USD" suffix sits -- the two overlapped, and the spinner arrows sat on top of
-   the currency label. Only the *visual* spinners are removed; the arrow keys still step
-   the value, so nothing is taken away from anyone who uses them. */
 .amount-field input[type='number'] { -moz-appearance: textfield; appearance: textfield; }
 .amount-field input[type='number']::-webkit-outer-spin-button,
 .amount-field input[type='number']::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+
+.history-row.is-reopenable { grid-template-columns: minmax(0, 1fr) auto auto; }
+
+.history-reopen {
+    justify-self: end;
+    align-self: center;
+    min-height: 32px;
+    padding: 6px 12px;
+    color: var(--surface);
+    font: inherit;
+    font-size: var(--step--1);
+    font-weight: 600;
+    line-height: 1.3;
+    white-space: nowrap;
+    background: var(--indigo-700);
+    border: 0;
+    border-radius: var(--r-sm);
+    cursor: pointer;
+    transition: filter var(--fast) var(--ease);
+}
+
+.history-reopen:hover { filter: brightness(1.12); }
+.history-reopen:focus-visible { outline: 2px solid var(--coral-500); outline-offset: 2px; }
+
+@media (max-width: 600px) {
+    .history-row.is-reopenable { grid-template-columns: minmax(0, 1fr) auto; }
+    .history-reopen { grid-column: 1 / -1; justify-self: stretch; white-space: normal; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .history-reopen { transition: none; }
+}
+
+.withdraw-confirm {
+    margin-top: 18px;
+    padding: 16px;
+    background: var(--surface-2);
+    border: 1px solid var(--line);
+    border-left: 3px solid var(--indigo-700);
+    border-radius: var(--r-md);
+}
+
+.withdraw-confirm-title {
+    margin: 0 0 4px;
+    color: var(--heading);
+    font-family: var(--font-display);
+    font-size: var(--step-0);
+    font-weight: 700;
+}
+
+.withdraw-confirm-lead {
+    margin: 0 0 12px;
+    color: var(--ink-soft);
+    font-size: var(--step--1);
+    line-height: 1.5;
+}
+
+.withdraw-confirm-facts {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 6px 12px;
+    margin: 0 0 14px;
+    padding: 11px 13px;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--r-sm);
+    font-size: var(--step--1);
+}
+
+.withdraw-confirm-facts dt { color: var(--muted); overflow-wrap: anywhere; }
+.withdraw-confirm-facts dd {
+    margin: 0;
+    color: var(--heading);
+    font-weight: 700;
+    text-align: right;
+    overflow-wrap: anywhere;
+}
+
+.withdraw-confirm-code .form-label { margin-top: 0; }
+
+.code-input {
+    font-family: ui-monospace, 'Cascadia Mono', Consolas, 'Courier New', monospace;
+    font-size: var(--step-2);
+    font-weight: 700;
+    letter-spacing: 0.5em;
+    text-indent: 0.5em;
+    text-align: center;
+}
+
+.withdraw-confirm-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 12px;
+}
+
+.withdraw-confirm-actions .button { flex: 1 1 auto; }
 
 .form-message { min-height: 20px; margin: 10px 0 4px; color: var(--muted); font-size: var(--step--1); line-height: 1.5; }
 .form-message.is-error { color: var(--danger); font-weight: 600; }
@@ -1035,16 +1275,6 @@ textarea.form-control { min-height: 96px; resize: vertical; }
 .field-hint { margin: 6px 0 0; color: var(--muted); font-size: var(--step--1); }
 .field-hint.is-error { color: var(--danger); }
 
-/* The "use a different coin" offer.
- *
- * It sits under the hint rather than replacing it, because the two say different things: the
- * hint is the range, and this is a consequence plus a way out. Collapsing them would mean the
- * range disappears exactly when the user most needs to see it.
- *
- * Tinted with the warning ramp rather than set in warning text, so the paragraph itself stays
- * readable and the affordance carries the emphasis. The button is a real button and not a
- * styled span, so it is reachable by keyboard and announced as a control.
- */
 .swap-hint {
     display: flex;
     flex-wrap: wrap;
@@ -1062,8 +1292,6 @@ textarea.form-control { min-height: 96px; resize: vertical; }
 
 .swap-button {
     flex: 0 0 auto;
-    /* 32px is short of the 44px comfortable tap target, so the padding is what carries it to
-     * 44px of hit area while the text stays small enough to sit inline with the sentence. */
     min-height: 32px;
     padding: 6px 12px;
     color: var(--surface);
@@ -1163,13 +1391,6 @@ textarea.form-control { min-height: 96px; resize: vertical; }
 
 .deposit-form { margin-top: 18px; padding: 18px; background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--r-md); }
 
-/* The deposit field is the same markup as the withdraw field, with two differences:
-   a much larger `$` marker and a larger value. The container is targeted as well as
-   the input so the padding cannot lose to the base `.amount-field .form-control` rule
-   in section 10, which it did while both selectors had the same specificity and only
-   the base rule's `36px` applied. The `:not(.amount-suffix)` is the same fix as the
-   base rule above -- without it, the container rule would set `left` on the suffix
-   too, and stretch it. */
 .amount-field.deposit-amount-field .form-control {
     min-height: 60px;
     padding-left: 56px;
@@ -1182,12 +1403,8 @@ textarea.form-control { min-height: 96px; resize: vertical; }
 }
 
 .amount-presets { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin-top: 10px; }
-/* 44px and the shared radius, so the four preset chips line up with the button next to them
-   instead of being a row of smaller, differently-shaped pills. */
-.amount-presets button { min-height: 44px; border: 1px solid var(--line-strong); border-radius: var(--r-md); color: var(--heading); background: var(--surface); font-weight: 700; transition: border-color 0.16s var(--ease), background-color 0.16s var(--ease), color 0.16s var(--ease); }
+.amount-presets button { min-height: 48px; border: 1px solid var(--line-strong); border-radius: var(--r-md); color: var(--heading); background: var(--surface); font-weight: 700; transition: border-color 0.16s var(--ease), background-color 0.16s var(--ease), color 0.16s var(--ease); }
 .amount-presets button:hover { border-color: var(--indigo-700); color: var(--accent); }
-/* Selected state uses an inset ring rather than a thicker border, so choosing a preset does
-   not resize the chip and shift the row by two pixels. */
 .amount-presets button.is-active { border-color: var(--indigo-900); color: var(--indigo-900); background: var(--lime-400); box-shadow: inset 0 0 0 1px var(--indigo-900); }
 
 .deposit-method-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
@@ -1209,11 +1426,6 @@ textarea.form-control { min-height: 96px; resize: vertical; }
 .deposit-method-option strong { font-size: var(--step-0); }
 .deposit-method-option span { color: var(--muted); font-size: var(--step--1); }
 .deposit-method-option:hover:not(:disabled) { border-color: var(--indigo-700); background: var(--indigo-050); }
-/* Selection is drawn as an inset ring rather than a 2px border with compensating padding.
-   The old version had to shrink the padding by a pixel to hold the box still, which works
-   only until anyone changes the padding -- and selecting a payment method is exactly the
-   moment a card must not jump, because the two cards are side by side in a grid and a
-   resize moves the one you did not pick. */
 .deposit-method-option.is-active {
     border-color: var(--indigo-700);
     background: var(--indigo-100);
@@ -1222,8 +1434,6 @@ textarea.form-control { min-height: 96px; resize: vertical; }
 .deposit-method-option:disabled { color: var(--faint); background: var(--surface-2); cursor: not-allowed; }
 .deposit-method-option:disabled span { color: var(--muted); }
 
-/* No height override: the select already sits at the shared 48px control height, and a 46px
-   override left it two pixels shorter than the amount field directly above it. */
 #deposit-currency { font-weight: 700; }
 #deposit-submit { min-height: 50px; margin-top: 8px; font-size: var(--step-0); }
 
@@ -1268,9 +1478,6 @@ textarea.form-control { min-height: 96px; resize: vertical; }
 .callout.is-warning { color: var(--warning); background: var(--warning-bg); border-color: color-mix(in srgb, var(--warning) 30%, transparent); }
 .callout.is-warning::before { content: '\26A0'; }
 
-/* A callout that qualifies the field above it rather than standing alone in the flow. Sits
- * directly under its hint with a smaller top margin, because the full 14px reads as a
- * separate section and pulls the eye away from the amount it is about. */
 .callout.is-compact {
     margin-top: 8px;
     padding: 10px 13px;
@@ -1288,10 +1495,6 @@ textarea.form-control { min-height: 96px; resize: vertical; }
 .amount-block-head .form-label { margin-top: 0; margin-bottom: 0; }
 .amount-block > .form-label { margin-top: 0; margin-bottom: 7px; }
 
-/* The unit suffix is absolutely positioned at the right edge of the field. `left: auto`
-   is explicit because the base `.amount-field > span:not(.amount-suffix)` rule no longer
-   sets a `left` on it, and being explicit here means a future change to that selector
-   cannot resurrect the stretch bug by adding one back. */
 .amount-field .amount-suffix {
     position: absolute;
     z-index: 1;
@@ -1308,10 +1511,6 @@ textarea.form-control { min-height: 96px; resize: vertical; }
 }
 
 .max-button {
-    /* The same height as the field it sits inside. It was 30px beside a 48px input, which
-       made the row look like a text field with a stray tag on the end, and left a target far
-       below the size of a thumb. Matching the input is what makes it read as part of the
-       control rather than as a separate object. */
     min-height: 48px;
     flex: 0 0 auto;
     border: 1px solid var(--line-strong);
@@ -1564,7 +1763,28 @@ textarea.form-control { min-height: 96px; resize: vertical; }
     font-size: var(--step--1);
 }
 .site-footer nav { display: flex; flex-wrap: wrap; gap: 18px; }
-.site-footer a { color: var(--accent); font-weight: 700; text-decoration: none; }
+
+/* Footer links, both the compact footer and the wide one.
+ *
+ * `padding` with a matching negative `margin` is the whole trick: the padding above and below
+ * the text becomes hit area, and the negative margin takes exactly that much back out of the
+ * flow, so the row's `gap` and the column's rhythm are unchanged. Without it, meeting the target
+ * size would mean rebuilding the footer's spacing, which is a visual change made for a reason
+ * nobody can see.
+ *
+ * The 24px floor is WCAG 2.5.8 Target Size (Minimum), level AA. These links measured 21-22px
+ * tall, so they failed it with a mouse as well as a finger. The 44px touch target is handled
+ * separately in the `pointer: coarse` block, because a desktop footer does not need to be
+ * 44px tall to be usable and pretending otherwise would make the page look wrong.
+ */
+.site-footer a {
+    display: inline-block;
+    padding: 4px 3px;
+    margin: -4px -3px;
+    color: var(--accent);
+    font-weight: 700;
+    text-decoration: none;
+}
 .site-footer a:hover { text-decoration: underline; text-underline-offset: 3px; }
 .site-footer-meta { display: flex; align-items: center; gap: 8px; }
 .footer-mark { width: 8px; height: 8px; border-radius: 2px; background: var(--lime-500); }
@@ -1588,7 +1808,6 @@ textarea.form-control { min-height: 96px; resize: vertical; }
 @keyframes reveal { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
 @keyframes dialog-in { from { opacity: 0; transform: translateY(10px) scale(0.985); } to { opacity: 1; transform: none; } }
 @keyframes sheet-in { from { transform: translateY(100%); } to { transform: none; } }
-@keyframes dots { to { width: 0; } }
 @keyframes shimmer { from { background-position: 200% 0; } to { background-position: -20% 0; } }
 
 @media (prefers-reduced-motion: reduce) {
@@ -1626,6 +1845,11 @@ textarea.form-control { min-height: 96px; resize: vertical; }
     .catalog-note { white-space: normal; }
 
     .home-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+
+    .home-support { grid-template-columns: minmax(0, 1fr); }
+    .home-support-widget { justify-items: stretch; }
+    .home-support-frame { margin-inline: auto; }
+    .home-support-fallback { margin-inline: auto; }
 
     .balance-block { min-width: 118px; }
     .search-field input { width: 200px; }
@@ -1730,6 +1954,9 @@ textarea.form-control { min-height: 96px; resize: vertical; }
     .amount-presets { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .deposit-method-options { grid-template-columns: minmax(0, 1fr); }
     .choice-grid { grid-template-columns: minmax(0, 1fr); }
+
+    .home-support { padding: 32px 14px; }
+    .home-support-widget { padding: 8px; }
 }
 
 @media (max-width: 400px) {
@@ -1740,28 +1967,365 @@ textarea.form-control { min-height: 96px; resize: vertical; }
     .dialog-panel { padding: 17px 15px calc(17px + env(safe-area-inset-bottom)); }
     .deposit-form { padding: 14px; }
     .history-row { flex-direction: column; align-items: flex-start; gap: 8px; }
-    .offer-card { grid-template-columns: minmax(0, 1fr); grid-template-areas: 'top' 'title' 'reward' 'start'; }
+    /* One column, and every child of the card needs a row in this template.
+     *
+     * The blurb row was missing here while `.offer-blurb` still declared `grid-area: blurb`. A
+     * `grid-area` naming an area the template does not define is invalid, so the declaration was
+     * dropped, the paragraph fell back to auto-placement, and the auto-placed item created an
+     * implicit column. The tracks came out `0px 0px 304px` and the "Start offer" button -- the
+     * card's primary action -- was laid out 28px wide, inside a 366px card.
+     *
+     * So the rule is: every direct child of `.offer-card` needs a named row in every template
+     * that lays the card out as a grid. Dropping a row is not a no-op.
+     */
+    .offer-card { grid-template-columns: minmax(0, 1fr); grid-template-areas: 'top' 'title' 'blurb' 'reward' 'start'; }
     .start-button { width: 100%; min-width: 0; }
     .action-bar { gap: 4px; padding-left: 8px; padding-right: 8px; }
     .action-bar-item { min-height: 50px; font-size: 0.66rem; }
 
     .balance-card { flex-direction: column; align-items: stretch; gap: 12px; }
-    /* Full width at this size, and still at the shared control height. The old value here was
-       40px, which made the button *smaller* on a phone than on a desktop -- the opposite of
-       what a touch target should do. */
     .balance-card .max-button { width: 100%; min-height: 48px; }
     .receipt-qr svg { width: 168px; height: 168px; }
     .confirmation-steps li { padding-left: 30px; }
 }
 
+/* ==========================================================================
+   Home page upgrade
+   --------------------------------------------------------------------------
+   New sections and refinements for the home page. Everything below is
+   additive: no selector here overrides an existing rule, so the current
+   stylesheet keeps working as it did.
+   ========================================================================== */
+
+/* 5c. Home navigation ----------------------------------------------------- */
+
+/* The header nav was a single link. It is now three items, and the plain-text
+   ones need a hover and a focus state that matches the buttons beside them. */
+.home-nav { display: flex; align-items: center; gap: 18px; }
+
+.home-nav-link {
+    color: rgb(255 255 255 / 0.85);
+    font-size: var(--step--1);
+    font-weight: 600;
+    text-decoration: none;
+    padding: 6px 0;
+    border-bottom: 2px solid transparent;
+    transition: color 0.16s var(--ease), border-color 0.16s var(--ease);
+}
+.home-nav-link:hover { color: #fff; border-bottom-color: var(--lime-400); }
+.home-nav-link:focus-visible { outline: 3px solid var(--lime-400); outline-offset: 4px; border-radius: 2px; }
+
+/* Below 720px the two plain links would crowd the header, so they are hidden
+   and the same links remain reachable in the footer. The accent button stays
+   because it is the primary action. */
+@media (max-width: 720px) {
+    .home-nav-link { display: none; }
+    .home-nav { gap: 10px; }
+}
+
+/* 7b. Hero — copy + visual ------------------------------------------------ */
+
+.home-hero-copy { min-width: 0; max-width: 62ch; }
+.home-hero-copy h1,
+.home-hero-copy .home-copy,
+.home-hero-copy .eyebrow,
+.home-hero-copy .home-hero-actions,
+.home-hero-copy .home-hero-signals { max-width: 100%; }
+
+.home-hero-signals {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px 24px;
+    margin: 26px 0 0;
+    padding: 0;
+    list-style: none;
+    color: rgb(255 255 255 / 0.82);
+    font-size: var(--step--1);
+}
+.home-hero-signals li { display: inline-flex; align-items: center; gap: 7px; }
+.signal-check {
+    display: grid;
+    place-items: center;
+    width: 16px;
+    height: 16px;
+    flex: 0 0 auto;
+    border-radius: 50%;
+    color: var(--indigo-900);
+    background: var(--lime-400);
+    font-size: 10px;
+    font-weight: 900;
+    line-height: 1;
+}
+
+/* The floating reward chips. Each is offset by a fixed translate so the
+   composition reads as a stack of confirmations rather than a list, and the
+   animation drifts them very slowly -- enough that the hero is not static,
+   little enough that it does not pull the eye off the headline. */
+.home-hero-visual {
+    position: relative;
+    flex: 0 0 auto;
+    width: clamp(220px, 26vw, 340px);
+    height: clamp(200px, 26vw, 300px);
+    pointer-events: none;
+}
+
+.hero-chip {
+    position: absolute;
+    display: grid;
+    gap: 4px;
+    padding: 12px 16px;
+    min-width: 150px;
+    border-radius: var(--r-md);
+    background: rgb(255 255 255 / 0.96);
+    box-shadow: 0 12px 32px rgb(0 0 0 / 0.35), 0 2px 6px rgb(0 0 0 / 0.18);
+    color: var(--ink);
+    animation: hero-chip-drift 9s var(--ease) infinite;
+}
+
+.hero-chip-label {
+    color: var(--muted);
+    font-size: 0.68rem;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+}
+.hero-chip-value {
+    color: var(--heading);
+    font-family: var(--font-display);
+    font-size: 1.2rem;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+}
+
+.hero-chip-1 { top: 0;    left: 0;    animation-delay: 0s;    }
+.hero-chip-2 { top: 38%;  right: 0;   animation-delay: -3s;   }
+.hero-chip-3 { bottom: 0; left: 12%;  animation-delay: -6s;   }
+
+@keyframes hero-chip-drift {
+    0%, 100% { transform: translateY(0); }
+    50%      { transform: translateY(-10px); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .hero-chip { animation: none; }
+}
+
+/* Below 860px the two-column hero is too tight for both the copy and the
+   visual to be legible, and the visual is the one that can go. */
+@media (max-width: 860px) {
+    .home-hero { flex-direction: column; align-items: flex-start; }
+    .home-hero-visual { display: none; }
+}
+
+/* 7c. Benefits ------------------------------------------------------------ */
+
+.home-benefits {
+    width: min(var(--shell), calc(100% - 48px));
+    margin: 0 auto;
+    padding: clamp(40px, 6vw, 68px) 0 0;
+}
+
+.home-benefit-list {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: 16px;
+    margin: 20px 0 0;
+    padding: 0;
+    list-style: none;
+}
+
+.home-benefit {
+    display: grid;
+    align-content: start;
+    gap: 8px;
+    padding: 22px;
+    border: 1px solid var(--line);
+    border-radius: var(--r-md);
+    background: var(--surface);
+}
+
+.home-benefit-mark {
+    display: grid;
+    place-items: center;
+    width: 28px;
+    height: 28px;
+    border-radius: var(--r-sm);
+    color: transparent;
+    font-size: 0;
+    background:
+        radial-gradient(circle at center, var(--coral-500) 4px, transparent 5px),
+        var(--coral-100);
+}
+.home-benefit:nth-child(2) .home-benefit-mark {
+    background:
+        radial-gradient(circle at center, var(--indigo-700) 4px, transparent 5px),
+        var(--indigo-100);
+}
+.home-benefit:nth-child(3) .home-benefit-mark {
+    background:
+        radial-gradient(circle at center, var(--success) 4px, transparent 5px),
+        var(--success-bg);
+}
+
+.home-benefit h3 { margin: 4px 0 0; color: var(--heading); font-size: var(--step-0); }
+.home-benefit p { margin: 0; color: var(--muted); font-size: var(--step--1); line-height: 1.55; }
+
+/* 7d. Steps — the meta line under each step ------------------------------- */
+
+/* The "how long does it take" line was the first thing every user asked about
+   and nothing on the page answered. Small, muted, right-aligned under the
+   description, so the four cards stay the same height. */
+.home-step-meta {
+    margin: 4px 0 0;
+    color: var(--accent);
+    font-size: 0.72rem;
+    font-weight: 700;
+    letter-spacing: 0.02em;
+}
+
+/* 7e. FAQ ----------------------------------------------------------------- */
+
+.home-faq {
+    width: min(var(--shell), calc(100% - 48px));
+    margin: 0 auto;
+    padding: clamp(40px, 6vw, 68px) 0 0;
+}
+
+.home-faq-list { display: grid; gap: 10px; margin: 20px 0 0; }
+
+/* Native `<details>` with a bespoke summary. `list-style: none` removes the
+   built-in triangle, and the `::after` puts a chevron in its place so the
+   affordance matches the rest of the site. */
+.home-faq-item {
+    border: 1px solid var(--line);
+    border-radius: var(--r-md);
+    background: var(--surface);
+    transition: border-color 0.16s var(--ease);
+}
+.home-faq-item:hover { border-color: var(--line-strong); }
+.home-faq-item[open] { border-color: var(--indigo-700); }
+
+.home-faq-item summary {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    padding: 16px 18px;
+    color: var(--heading);
+    font-size: var(--step-0);
+    font-weight: 700;
+    cursor: pointer;
+    list-style: none;
+    border-radius: var(--r-md);
+}
+.home-faq-item summary::-webkit-details-marker { display: none; }
+.home-faq-item summary::after {
+    content: '\002B';
+    flex: 0 0 auto;
+    color: var(--accent);
+    font-size: 1.25rem;
+    line-height: 1;
+    transition: transform 0.2s var(--ease);
+}
+.home-faq-item[open] summary::after { content: '\2212'; }
+.home-faq-item summary:focus-visible { outline: 3px solid var(--coral-500); outline-offset: 2px; border-radius: var(--r-md); }
+
+.home-faq-item p {
+    margin: 0;
+    padding: 0 18px 18px;
+    color: var(--muted);
+    font-size: var(--step--1);
+    line-height: 1.6;
+}
+
+/* 16b. Footer — three columns -------------------------------------------- */
+
+/* The footer was two flat links. It is now a brand block plus three link
+   groups, because a rewards site is judged by whether the boring pages exist
+   and a visitor who cannot find Terms or Privacy assumes the worst. */
+.site-footer-wide {
+    display: grid;
+    grid-template-columns: minmax(0, 1.6fr) repeat(3, minmax(0, 1fr));
+    gap: clamp(28px, 4vw, 56px);
+    align-items: start;
+    padding: 40px 0 36px;
+}
+
+.site-footer-brand { display: grid; gap: 10px; }
+.site-footer-brand .site-footer-meta { color: var(--heading); font-weight: 700; font-size: var(--step-0); }
+
+.site-footer-tagline {
+    margin: 0;
+    max-width: 32ch;
+    color: var(--muted);
+    font-size: var(--step--1);
+    line-height: 1.55;
+}
+
+.site-footer-column { display: grid; gap: 10px; align-content: start; }
+.site-footer-heading {
+    margin: 0 0 4px;
+    color: var(--muted);
+    font-size: 0.68rem;
+    font-weight: 700;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+}
+.site-footer-column a {
+    color: var(--ink-soft);
+    font-weight: 600;
+    text-decoration: none;
+    transition: color 0.16s var(--ease);
+}
+.site-footer-column a:hover { color: var(--accent); }
+
+@media (max-width: 720px) {
+    .site-footer-wide {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        padding-bottom: 20px;
+    }
+    .site-footer-brand { grid-column: 1 / -1; }
+}
+
+@media (max-width: 400px) {
+    .site-footer-wide { grid-template-columns: minmax(0, 1fr); }
+}
+/* ==========================================================================
+   Touch targets
+   --------------------------------------------------------------------------
+   Last in the file on purpose.
+
+   A `pointer: coarse` block that sits in the middle of a stylesheet only wins against the rules
+   written *before* it. This one used to sit above the "Home page upgrade" section, so the
+   touch sizes it set for `.home-nav-link` were silently overridden by the base rule that
+   declared the same property further down -- equal specificity, later rule wins. The result was
+   a rule that looked correct in the source and did nothing on every phone.
+
+   So: anything that overrides a size belongs at the end. If you add a new interactive element,
+   add it here too, or it will be the next one quietly sized for a mouse.
+   ========================================================================== */
 @media (pointer: coarse) {
-    /* Every interactive surface a finger can land on, at one shared height, so a form reads
-       as a single column of equal rows on a phone. `.max-button` and `#deposit-submit` are
-       listed for the same reason: they are buttons in that column, and a check that does not
-       name them cannot catch one quietly dropping below the rest. */
     .button, .icon-button, .amount-presets button, .choice, .deposit-method-option,
-    .auth-mode-button, .start-button, .max-button, .deposit-method-options button { min-height: 48px; }
+    .auth-mode-button, .start-button, .max-button, .deposit-method-options button,
+    .history-reopen { min-height: 48px; }
     .catalog-filters .form-control, .search-field input, .sort-field select { height: 48px; }
-    .filter-chip { min-height: 48px; }
     .form-control { min-height: 48px; }
+
+    /* The filter chips are side by side in a row, so `min-height` alone leaves the short ones
+     * ("All") at 41px wide. A width floor as well, since the row wraps on narrow screens and
+     * there is room to spare. */
+    .filter-chip { min-height: 48px; min-width: 48px; }
+
+    /* The logo is the largest link on every page and the one a thumb reaches for first. It is
+     * sized by its 32px mark, so the target has to be grown with padding rather than by
+     * enlarging the artwork. */
+    .brand { padding: 6px 0; margin: -6px 0; min-height: 48px; }
+
+    /* Footer and header links. Padding grows the hit area; the matching negative margin takes
+     * the same space back out of the flow, so the footer's gap and the header's spacing are
+     * unchanged. Horizontal padding as well as vertical, because "FAQ" is only 22px of text and
+     * a 24px floor is the WCAG 2.5.8 AA minimum for a target. */
+    .site-footer a { padding: 12px 4px; margin: -12px -4px; }
+    .home-nav-link { padding: 12px 4px; margin: -12px -4px; }
+    .home-text-link { padding: 12px 4px; margin: -12px -4px; }
 }

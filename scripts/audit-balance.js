@@ -13,9 +13,26 @@
  * balance, not to a script.
  *
  * Usage:
- *   npm run audit:balance [-- --json] [--fail-on-warnings] [--check=<key>]
+ *   node scripts/audit-balance.js [--json] [--fail-on-warnings] [--check=<key>] [--help]
  */
-require('dotenv').config();
+
+const path = require('node:path');
+const fs = require('node:fs');
+
+/**
+ * The .env files live next to the project root, not next to the current directory.
+ *
+ * Loading them by bare name -- `require('dotenv').config()` -- reads from `process.cwd()`,
+ * which is the directory the shell happened to be in. That is correct when the script is
+ * run as `npm run audit:balance` from the project root, and silently wrong when it is run
+ * as `node scripts/audit-balance.js` from anywhere else. The failure is a database
+ * connection attempt against an undefined URL, which surfaces as an ECONNREFUSED against
+ * localhost rather than as "the .env was not found".
+ */
+const PROJECT_ROOT = path.join(__dirname, '..');
+require('dotenv').config({ path: path.join(PROJECT_ROOT, '.env.local') });
+require('dotenv').config({ path: path.join(PROJECT_ROOT, '.env') });
+
 const pool = require('../src/config/db');
 
 /**
@@ -31,6 +48,13 @@ const STUCK_DEPOSIT_MINUTES = 30;
  * The count is always the true count; only the listing is bounded.
  */
 const MAX_ENTRIES_PER_FINDING = 25;
+
+/**
+ * The order severity is reported in. `critical` first because the whole point of the
+ * audit is to surface the checks that affect money before the ones that are merely
+ * untidy. Within a severity, the checks appear in the order they are declared.
+ */
+const SEVERITY_ORDER = { critical: 0, warning: 1, info: 2 };
 
 /**
  * One check per way the books can stop agreeing with themselves.
@@ -60,6 +84,20 @@ const CHECKS = [
               WHERE u.balance <> COALESCE(c.total, 0)
               ORDER BY ABS(u.balance - COALESCE(c.total, 0)) DESC`,
         format: (r) => `user ${r.id} (${r.email}): balance ${r.balance}, ledger ${r.cash_ledger}, drift ${r.drift}`
+    },
+    {
+        key: 'negativeBalances',
+        severity: 'critical',
+        title: 'Balances below zero',
+        why: 'A negative balance is not a state the app can produce: every write is a ' +
+            'debit that was checked against the balance first, or a credit that only ' +
+            'adds. A negative value means the balance was changed outside the app, or a ' +
+            'debit was written without the check it was supposed to have.',
+        sql: `SELECT id, email, balance
+              FROM users
+              WHERE balance < 0
+              ORDER BY balance ASC`,
+        format: (r) => `user ${r.id} (${r.email}): balance ${r.balance}`
     },
     {
         key: 'confirmedWithoutCredit',
@@ -138,6 +176,48 @@ const CHECKS = [
             `${r.failure_reason ? ` -- ${r.failure_reason}` : ' with no reason recorded'}`
     },
     {
+        key: 'withdrawalsWithoutDebit',
+        severity: 'critical',
+        title: 'Withdrawals with no matching debit on the ledger',
+        why: 'The balance is debited the moment a withdrawal is requested, and a ledger row ' +
+            'records why. A withdrawal row with no debit means either the balance was ' +
+            'never reduced for a request the user believes was made, or the debit was ' +
+            'written without the ledger row that would let it be accounted for.',
+        // The debit is written as `transaction_type = 'withdrawal'` with `source_id =
+        // <withdrawal id>`. The refund, when it happens, is a separate `refund` row, so
+        // a refunded withdrawal still has its withdrawal debit and is not caught here.
+        sql: `SELECT w.id, w.user_id, w.amount, w.payment_method, w.status, w.created_at
+              FROM withdrawals w
+              WHERE NOT EXISTS (
+                  SELECT 1 FROM balance_transactions b
+                  WHERE b.transaction_type = 'withdrawal'
+                    AND b.source_id = w.id::TEXT
+              )
+              ORDER BY w.id`,
+        format: (r) => `withdrawal ${r.id}: ${r.amount} (${r.payment_method}, ${r.status}) ` +
+            `requested ${r.created_at} has no debit row`
+    },
+    {
+        key: 'refundWithoutFailedWithdrawal',
+        severity: 'critical',
+        title: 'Refund ledger entries with no failed withdrawal behind them',
+        why: 'A refund credits the balance back for a withdrawal that was not paid. If the ' +
+            'withdrawal it names is not in a failed state, the credit is money that was ' +
+            'added without the corresponding reservation being closed -- either a ' +
+            'double-refund or a refund written for the wrong row.',
+        sql: `SELECT b.id, b.user_id, b.amount, b.source_id, b.created_at
+              FROM balance_transactions b
+              WHERE b.transaction_type = 'refund'
+                AND b.source_id LIKE 'withdrawal:%'
+                AND NOT EXISTS (
+                    SELECT 1 FROM withdrawals w
+                    WHERE 'withdrawal:' || w.id::TEXT = b.source_id
+                      AND w.status IN ('failed', 'cancelled')
+                )
+              ORDER BY b.id`,
+        format: (r) => `ledger ${r.id}: refund ${r.amount} for ${r.source_id} at ${r.created_at}`
+    },
+    {
         key: 'unprovablePaidWithdrawals',
         severity: 'warning',
         title: 'Withdrawals marked paid with nothing to prove it',
@@ -188,6 +268,27 @@ const CHECKS = [
 
 const CHECK_KEYS = new Set(CHECKS.map((c) => c.key));
 
+const HELP = `Usage: node scripts/audit-balance.js [options]
+
+Runs every balance-integrity check and reports anything it finds. Read-only: it never
+modifies the database, only reports what is inconsistent.
+
+Options:
+  --json                    Print machine-readable JSON instead of a text report
+  --fail-on-warnings        Exit non-zero when warnings are found (default: only criticals)
+  --check=<key>             Run only the named check
+  --list                    Print the key of every check, then exit
+  --help, -h                Print this message
+
+Exit codes:
+  0  Every check clean, or warnings only without --fail-on-warnings
+  1  A critical check found something, or a warning did under --fail-on-warnings
+  2  The audit could not run (database unreachable, bad --check value, or a crash)
+
+Available checks:
+${CHECKS.map((c) => `  ${c.severity.padEnd(8)} ${c.key.padEnd(30)} ${c.title}`).join('\n')}
+`;
+
 /**
  * Runs the audit. `only` restricts it to a single check by key, which is what a
  * monitor or an operator wants when only one line of the report has changed.
@@ -214,9 +315,26 @@ async function runAudit({ only = null } = {}) {
     return findings;
 }
 
+/**
+ * Orders findings by severity, then by the count of affected rows.
+ *
+ * The report is read top-down and the reader stops at the first thing that matters. A
+ * critical with one affected user is more urgent than a warning with twenty, and the
+ * default order -- the order the checks happen to be declared in -- put the summary at
+ * the bottom regardless.
+ */
+function orderFindings(findings) {
+    return [...findings].sort((a, b) => {
+        const bySeverity = (SEVERITY_ORDER[a.severity] ?? 9) - (SEVERITY_ORDER[b.severity] ?? 9);
+        if (bySeverity !== 0) return bySeverity;
+        return b.count - a.count;
+    });
+}
+
 function renderText(findings) {
     const lines = [];
-    const problems = findings.filter((f) => f.count > 0);
+    const ordered = orderFindings(findings);
+    const problems = ordered.filter((f) => f.count > 0);
 
     for (const finding of problems) {
         lines.push(`${finding.severity.toUpperCase()}  ${finding.title} (${finding.count})`);
@@ -253,7 +371,31 @@ function readOption(name) {
     return match ? match.slice(prefix.length) : null;
 }
 
+/**
+ * Uses the pool's own error formatter when it has one.
+ *
+ * A connection failure is reported by Node as an `AggregateError` whose `message` is the
+ * empty string, with the useful detail on `errors`. `error.message` therefore prints as a
+ * blank line, which reads as "the audit crashed for no reason" rather than "the database
+ * is unreachable". The pool carries a `describeError` that walks the error and its
+ * causes, and this uses it when present so the failure is legible.
+ */
+function describeError(error) {
+    if (typeof pool.describeError === 'function') return pool.describeError(error);
+    return error?.message || String(error);
+}
+
 async function main() {
+    if (process.argv.includes('--help') || process.argv.includes('-h')) {
+        console.log(HELP);
+        return;
+    }
+
+    if (process.argv.includes('--list')) {
+        console.log(CHECKS.map((c) => `${c.severity}\t${c.key}\t${c.title}`).join('\n'));
+        return;
+    }
+
     const asJson = process.argv.includes('--json');
     // `--fail-on-warnings` opts into exiting non-zero on warnings as well as
     // criticals. Off by default: a scheduled job that only wants to hear about
@@ -268,9 +410,12 @@ async function main() {
     try {
         findings = await runAudit({ only });
     } catch (error) {
-        console.error(`Balance audit could not run: ${error.message}`);
+        const message = describeError(error);
+        console.error(`Balance audit could not run: ${message}`);
         if (asJson) {
-            console.log(JSON.stringify({ ok: false, error: error.message }, null, 2));
+            // Printed even on failure so a script that parses stdout gets a well-formed
+            // document either way, and can branch on `ok` instead of on the exit code.
+            console.log(JSON.stringify({ ok: false, error: message }, null, 2));
         }
         process.exitCode = 2;
         return;
@@ -296,7 +441,7 @@ async function main() {
 if (require.main === module) {
     main()
         .catch((error) => {
-            console.error('Balance audit crashed:', error);
+            console.error('Balance audit crashed:', describeError(error));
             process.exitCode = 2;
         })
         .finally(() => pool.end().catch(() => {}));

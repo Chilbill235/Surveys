@@ -268,6 +268,10 @@
                 <div id="crypto-deposit-fields" class="field-group" hidden>
                     <label class="form-label" for="deposit-currency">Pay with</label>
                     <select class="form-control" id="deposit-currency"></select>
+                    <!-- Resolved for the chosen coin. The option labels carry "from $X" so the
+                         choice is informed before it is made, but the number the user needs to
+                         work against is otherwise only visible inside the closed menu. -->
+                    <p class="coin-summary" id="deposit-coin-summary" hidden></p>
                     <p class="form-note">You will be shown a deposit address and an exact amount. Send only that asset on that network.</p>
                 </div>
 
@@ -320,11 +324,43 @@
                     <input class="form-control" id="withdraw-amount" type="number" min="1" max="10000" step="0.01" placeholder="0.00" inputmode="decimal" required>
                     <span class="amount-suffix" aria-hidden="true">USD</span>
                 </div>
-                <p class="field-hint" id="withdraw-amount-hint">Minimum $1.00. Maximum $10,000.00.</p>
-                <!-- Shown only when the provider refused to report its per-network payout
-                     floors, so the $1.00 above is known to be our own rule rather than a
-                     limit the provider has agreed to. -->
-                <p class="callout is-warning is-compact" id="withdraw-minimum-unconfirmed" hidden></p>
+                    <p class="field-hint" id="withdraw-amount-hint">Minimum $1.00. Maximum $10,000.00.</p>
+                    <!-- Shown only when the provider refused to report its per-network payout
+                         floors, so the $1.00 above is known to be our own rule rather than a
+                         limit the provider has agreed to. -->
+                    <p class="callout is-warning is-compact" id="withdraw-minimum-unconfirmed" hidden></p>
+
+                    <!-- The email confirmation step.
+                         Separate from the form above and below it on purpose: a code is issued
+                         for one specific amount and destination, so changing either of those
+                         after the code arrives invalidates it. Keeping the code in its own
+                         block, with a summary of what it was issued for, makes that visible
+                         instead of leaving the user to find out from a rejection. -->
+                    <div class="withdraw-confirm" id="withdraw-confirm" hidden>
+                        <h3 class="withdraw-confirm-title">Confirm this withdrawal</h3>
+                        <p class="withdraw-confirm-lead" id="withdraw-confirm-lead">
+                            We email a 6-digit code to confirm it is really you moving the money.
+                        </p>
+                        <dl class="withdraw-confirm-facts" id="withdraw-confirm-facts"></dl>
+                        <div class="withdraw-confirm-code">
+                            <label class="form-label" for="withdraw-code">6-digit code</label>
+                            <input
+                                class="form-control code-input"
+                                id="withdraw-code"
+                                type="text"
+                                inputmode="numeric"
+                                autocomplete="one-time-code"
+                                pattern="[0-9]{6}"
+                                maxlength="6"
+                                placeholder="000000"
+                            />
+                        </div>
+                        <div class="withdraw-confirm-actions">
+                            <button class="button button-light" type="button" id="withdraw-code-send">Email me a code</button>
+                            <button class="button" type="button" id="withdraw-code-resend" hidden>Send another</button>
+                        </div>
+                        <p class="field-hint" id="withdraw-code-hint" hidden></p>
+                    </div>
             </div>
 
             <fieldset class="fieldset-reset">

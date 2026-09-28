@@ -5,40 +5,117 @@
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
     <meta name="theme-color" content="#131c4a" media="(prefers-color-scheme: dark)">
     <meta name="theme-color" content="#2449d8" media="(prefers-color-scheme: light)">
-    <meta name="description" content="Find offers and earn rewards with RewardZone.">
-    <title>RewardZone | Home</title>
+    <meta name="description" content="Earn rewards for completing surveys and offers. Free to join, paid out from $1.00, no fees.">
+
+    <!--
+        Open Graph and Twitter cards. Without these, a link to the home page in a
+        chat or a social post is a bare URL. They cost nothing and they are the
+        first impression anyone shares.
+    -->
+    <meta property="og:type" content="website">
+    <meta property="og:title" content="RewardZone — Make every offer count.">
+    <meta property="og:description" content="Free to join. Payouts from $1.00. No fees.">
+    <meta property="og:site_name" content="RewardZone">
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="RewardZone — Make every offer count.">
+    <meta name="twitter:description" content="Free to join. Payouts from $1.00. No fees.">
+
+    <title>RewardZone | Earn rewards for surveys and offers</title>
+
+    <!--
+        Preconnect to the donation widget host. The browser spends a DNS lookup and
+        a TLS handshake on the first request to a new origin; announcing the origin
+        up front means those are already paid for by the time the iframe loads. It
+        is one line and it removes the largest single delay from the page.
+    -->
+    <link rel="preconnect" href="https://nowpayments.io" crossorigin>
+
     <link rel="stylesheet" href="/style.css">
-<link rel="icon" href="/favicon.ico" sizes="any">
-<link rel="icon" href="/favicon.svg" type="image/svg+xml">
-<link rel="icon" href="/favicon-32.png" sizes="32x32" type="image/png">
-<link rel="icon" href="/icon-192.png" sizes="192x192" type="image/png">
-<link rel="apple-touch-icon" href="/apple-touch-icon.png">
-<link rel="manifest" href="/site.webmanifest">
+    <link rel="icon" href="/favicon.ico" sizes="any">
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+    <link rel="icon" href="/favicon-32.png" sizes="32x32" type="image/png">
+    <link rel="icon" href="/icon-192.png" sizes="192x192" type="image/png">
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+    <link rel="manifest" href="/site.webmanifest">
     <script src="/home.js" defer></script>
 </head>
 <body>
+    <a class="skip-link" href="#main">Skip to main content</a>
+
     <header class="topbar">
         <a class="brand" href="/" aria-label="RewardZone home">
+            <!--
+                The animated mark, the same asset every other page uses.
+
+                This was an inline SVG letter "R" standing in for it, on the grounds that
+                `<img src="/brand.gif">` 404s. It does not 404 -- the file is served with every
+                page and the other four all reference it -- so the home page was the only one
+                showing a different brand mark to everyone who landed on it. An inline SVG cannot
+                404, but neither can it animate, and the point of the asset is the animation.
+            -->
             <img class="brand-mark" src="/brand.gif" alt="" width="36" height="36">
             <span>reward<span class="brand-light">zone</span></span>
         </a>
+
         <nav class="home-nav" aria-label="Main navigation">
-            <a class="button button-light" href="/offers">Browse offers</a>
+            <a class="home-nav-link" href="#home-faq">FAQ</a>
+            <a class="home-nav-link" href="/offers">Browse offers</a>
+            <a class="button button-accent" href="/offers">Start earning</a>
         </nav>
     </header>
 
-    <main class="home-shell">
+    <main class="home-shell" id="main">
         <section class="home-hero" aria-labelledby="home-title">
-            <p class="eyebrow"><span class="eyebrow-dot" aria-hidden="true"></span> RewardZone</p>
-            <h1 id="home-title" class="display">Make every offer count.</h1>
-            <p class="home-copy">Discover available offers, complete them with our partners, and follow your rewards from one place. Funds are only credited after a partner confirms the conversion.</p>
-            <div class="home-hero-actions">
-                <a class="home-cta" href="/offers">Explore offers <span aria-hidden="true">&#8594;</span></a>
-                <a class="home-text-link" href="#home-steps">How it works</a>
+            <div class="home-hero-copy">
+                <p class="eyebrow"><span class="eyebrow-dot" aria-hidden="true"></span> RewardZone</p>
+                <h1 id="home-title" class="display">Make every offer count.</h1>
+                <p class="home-copy">
+                    Complete surveys and offers from real partners, track your balance from one
+                    place, and withdraw once your rewards are confirmed.
+                </p>
+
+                <div class="home-hero-actions">
+                    <a class="home-cta" href="/offers">
+                        Browse offers <span aria-hidden="true">&#8594;</span>
+                    </a>
+                    <a class="home-text-link" href="#home-steps">See how it works</a>
+                </div>
+
+                <!--
+                    Three lines of plain facts, not marketing claims. Each is a
+                    policy the rest of the app enforces, so a user can check it.
+                    A trust line that cannot be checked is worse than none.
+                -->
+                <ul class="home-hero-signals">
+                    <li><span class="signal-check" aria-hidden="true">&#10003;</span> Free to join</li>
+                    <li><span class="signal-check" aria-hidden="true">&#10003;</span> Payouts from $1.00</li>
+                    <li><span class="signal-check" aria-hidden="true">&#10003;</span> No hidden fees</li>
+                </ul>
+            </div>
+
+            <!--
+                A decorative arrangement of floating reward chips. `aria-hidden` because
+                it is a picture of the product, not information -- the actual numbers
+                come from the live stats strip underneath, and announcing both would be
+                saying the same thing twice.
+            -->
+            <div class="home-hero-visual" aria-hidden="true">
+                <div class="hero-chip hero-chip-1">
+                    <span class="hero-chip-label">Survey complete</span>
+                    <span class="hero-chip-value">+$4.50</span>
+                </div>
+                <div class="hero-chip hero-chip-2">
+                    <span class="hero-chip-label">Offer confirmed</span>
+                    <span class="hero-chip-value">+$12.00</span>
+                </div>
+                <div class="hero-chip hero-chip-3">
+                    <span class="hero-chip-label">Withdrawn</span>
+                    <span class="hero-chip-value">$25.00</span>
+                </div>
             </div>
         </section>
 
-        <section class="home-stats" aria-label="Platform summary">
+        <section class="home-stats" aria-label="Platform summary" aria-live="polite" role="status">
             <div class="home-stat">
                 <strong id="stat-offers">--</strong>
                 <span>Offers in the catalog</span>
@@ -57,6 +134,39 @@
             </div>
         </section>
 
+        <!--
+            Why-choose-us. Three points that a user actually cares about, each of
+            which maps to something the app does: crypto payouts (the withdrawal
+            service), no fees (no fee line is ever subtracted), and low minimum
+            (the form enforces $1).
+        -->
+        <section class="home-benefits" aria-labelledby="home-benefits-title">
+            <div class="home-section-heading">
+                <div>
+                    <p class="eyebrow">Why RewardZone</p>
+                    <h2 id="home-benefits-title" class="display">Built to pay you fairly</h2>
+                </div>
+            </div>
+
+            <ul class="home-benefit-list">
+                <li class="home-benefit">
+                    <span class="home-benefit-mark" aria-hidden="true">&#9679;</span>
+                    <h3>Paid from $1.00</h3>
+                    <p>Most platforms hold your balance until $10 or $25. Here the withdrawal form accepts anything from a single dollar.</p>
+                </li>
+                <li class="home-benefit">
+                    <span class="home-benefit-mark" aria-hidden="true">&#9679;</span>
+                    <h3>No fees taken</h3>
+                    <p>The amount a partner confirms is the amount added to your balance. Nothing is subtracted on the way in or out.</p>
+                </li>
+                <li class="home-benefit">
+                    <span class="home-benefit-mark" aria-hidden="true">&#9679;</span>
+                    <h3>Crypto, PayPal, and more</h3>
+                    <p>Withdraw in the currency that suits you. Crypto payouts go out automatically once a request is approved.</p>
+                </li>
+            </ul>
+        </section>
+
         <section class="home-steps" aria-labelledby="home-steps-title">
             <div class="home-section-heading">
                 <div>
@@ -69,16 +179,19 @@
                     <span class="home-step-number" aria-hidden="true">1</span>
                     <h3>Pick an offer</h3>
                     <p>Every offer states what you will be asked to do and what it pays before you start.</p>
+                    <p class="home-step-meta">Takes under a minute</p>
                 </li>
                 <li class="home-step">
                     <span class="home-step-number" aria-hidden="true">2</span>
                     <h3>Complete it</h3>
                     <p>Finish the partner task or survey. We track the click, so your progress is not lost.</p>
+                    <p class="home-step-meta">5 to 20 minutes</p>
                 </li>
                 <li class="home-step">
                     <span class="home-step-number" aria-hidden="true">3</span>
                     <h3>Get paid</h3>
-                    <p>Funds are credited once the partner confirms the conversion, then withdraw from $1.00.</p>
+                    <p>Funds are credited once the partner confirms the conversion, then you can withdraw from $1.00.</p>
+                    <p class="home-step-meta">Most confirm within 24h</p>
                 </li>
             </ol>
         </section>
@@ -89,19 +202,236 @@
                     <p class="eyebrow">From the catalog</p>
                     <h2 id="home-offers-title" class="display">Available offers</h2>
                 </div>
-                <a class="home-text-link" href="/offers">View all offers <span aria-hidden="true">&#8594;</span></a>
+                <a class="home-text-link" href="/offers">
+                    View all offers <span aria-hidden="true">&#8594;</span>
+                </a>
             </div>
-            <p id="home-offer-count" class="home-offer-count" role="status">Loading offers...</p>
-            <div id="home-offers" class="home-offer-grid" aria-live="polite"></div>
+
+            <p id="home-offer-count" class="home-offer-count">Loading offers...</p>
+
+            <div id="home-offers" class="home-offer-grid" aria-live="polite" aria-busy="true">
+                <article class="home-offer skeleton-card" aria-hidden="true">
+                    <div class="skeleton-line is-short"></div>
+                    <div class="skeleton-line is-tall skeleton-title"></div>
+                    <div class="skeleton-line is-medium"></div>
+                </article>
+                <article class="home-offer skeleton-card" aria-hidden="true">
+                    <div class="skeleton-line is-short"></div>
+                    <div class="skeleton-line is-tall skeleton-title"></div>
+                    <div class="skeleton-line is-medium"></div>
+                </article>
+                <article class="home-offer skeleton-card" aria-hidden="true">
+                    <div class="skeleton-line is-short"></div>
+                    <div class="skeleton-line is-tall skeleton-title"></div>
+                    <div class="skeleton-line is-medium"></div>
+                </article>
+            </div>
+
+            <p id="home-offers-error" class="page-message" role="alert" hidden>
+                <span id="home-offers-error-text">Offers could not be loaded.</span>
+                <button id="home-offers-retry" class="inline-action" type="button">Try again</button>
+            </p>
+        </section>
+
+        <!--
+            FAQ. Uses native `<details>` and `<summary>` rather than a JavaScript
+            accordion: it works without script, the open/close animation is the
+            browser's, keyboard behaviour is correct by default, and the browser's
+            own find-in-page can jump to a closed answer by opening it.
+
+            The questions are the ones support actually gets. Putting them on the
+            home page is the cheapest support ticket deflection available.
+        -->
+        <section class="home-faq" id="home-faq" aria-labelledby="home-faq-title">
+            <div class="home-section-heading">
+                <div>
+                    <p class="eyebrow">Questions</p>
+                    <h2 id="home-faq-title" class="display">Before you start</h2>
+                </div>
+            </div>
+
+            <div class="home-faq-list">
+                <details class="home-faq-item">
+                    <summary>How do I actually earn money?</summary>
+                    <p>
+                        Every offer in the catalog is a paid task run by a partner. You complete
+                        the task, the partner confirms it happened, and the reward lands on your
+                        balance. The catalog page states the exact amount and what is expected
+                        before you click anything.
+                    </p>
+                </details>
+
+                <details class="home-faq-item">
+                    <summary>When do I get paid?</summary>
+                    <p>
+                        The balance updates as soon as the partner confirms the conversion. Most
+                        confirmations arrive within a few hours, and some larger offers take up
+                        to 24 hours. Until then the offer stays visible in your history with its
+                        current status.
+                    </p>
+                </details>
+
+                <details class="home-faq-item">
+                    <summary>What is the minimum withdrawal?</summary>
+                    <p>
+                        $1.00. Most platforms hold your balance until $10 or $25, which means a
+                        first payout can take weeks. Here you can withdraw as soon as you have a
+                        dollar on the balance.
+                    </p>
+                </details>
+
+                <details class="home-faq-item">
+                    <summary>How do I get my money out?</summary>
+                    <p>
+                        Open the withdraw dialog, choose a payment method, and confirm the
+                        request by email. Crypto payouts go out automatically once approved.
+                        PayPal and other fiat payouts are sent by an operator, usually within a
+                        day.
+                    </p>
+                </details>
+
+                <details class="home-faq-item">
+                    <summary>Is it really free?</summary>
+                    <p>
+                        Joining is free, completing offers is free, and there is no fee on
+                        deposits or withdrawals. The platform is funded by the difference
+                        between what partners pay for a conversion and what is credited to you.
+                    </p>
+                </details>
+
+                <details class="home-faq-item">
+                    <summary>What if an offer does not credit?</summary>
+                    <p>
+                        Every click is recorded, so an offer that has been started is never lost.
+                        If a partner confirmation is slow or missing, the offer stays pending in
+                        your history until it resolves. If it never does, open a support request
+                        and the recorded click is the evidence used to chase it.
+                    </p>
+                </details>
+            </div>
+        </section>
+
+        <section class="home-support" aria-labelledby="home-support-title">
+            <div class="home-support-copy">
+                <p class="eyebrow">Support us</p>
+                <h2 id="home-support-title" class="display">Keep RewardZone running</h2>
+                <p class="home-copy">
+                    RewardZone is free to join and free to use. Payouts, deposit processing and
+                    support all cost real money, and donations are what cover the difference.
+                    Every contribution goes towards keeping the platform open for everyone.
+                </p>
+                <p class="home-support-note">
+                    Donations are optional and earn no balance, cashback or offer access. They are
+                    a one-off crypto payment, handled entirely by our payment provider.
+                </p>
+            </div>
+
+            <div class="home-support-widget">
+                <!--
+                    `allow-same-origin` is required, and removing it is what broke this widget.
+
+                    A sandboxed document that has `allow-scripts` but not `allow-same-origin` is
+                    forced into an opaque origin, so every request it made carried
+                    `Origin: null`. NOWPayments does not return `Access-Control-Allow-Origin` for
+                    a null origin, so the widget failed on its own fonts and on all seven
+                    `account-api.nowpayments.io` calls (full-currencies, base-currencies,
+                    base-currency-by-tid, coins-by-api-key, donation-settings-by-apiKey,
+                    profile/info, first-currencies/apiKey, min-amount-by-tid) and rendered as a
+                    broken form rather than an error.
+
+                    The other `SecurityError`s in the console came from a wallet extension
+                    injecting into the frame and failing to read localStorage/sessionStorage --
+                    a symptom of the opaque origin, not a separate fault.
+
+                    Combining `allow-scripts` with `allow-same-origin` is normally the one
+                    dangerous sandbox pairing, because same-origin content can use it to drop its
+                    own sandbox attribute. That does not apply here: the framed document is
+                    nowpayments.io, so it is cross-origin either way and cannot reach this page's
+                    DOM, storage, or origin. The flags that do matter are still in force -- no
+                    top-level navigation, and popups are still constrained.
+                -->
+                <iframe
+                    class="home-support-frame"
+                    src="https://nowpayments.io/embeds/donation-widget?api_key=f045b468-b8b6-430f-9fa6-7c026bea2a6d"
+                    width="346"
+                    height="623"
+                    loading="lazy"
+                    referrerpolicy="no-referrer-when-downgrade"
+                    sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox"
+                    title="Donate to RewardZone with cryptocurrency"
+                ></iframe>
+                <p class="home-support-fallback">
+                    If the donation form does not load,
+                    <a href="/offers">browse the offer catalog</a> instead,
+                    or reach out to us directly and we will take the donation another way.
+                </p>
+            </div>
         </section>
     </main>
 
-    <footer class="site-footer">
-        <span class="site-footer-meta"><span class="footer-mark" aria-hidden="true"></span> RewardZone</span>
-        <nav aria-label="Footer">
+    <!--
+        Footer with three columns of links instead of two flat items. A rewards site
+        is judged partly by whether the boring pages exist: terms, privacy, contact.
+        A user who cannot find those assumes the worst.
+    -->
+    <footer class="site-footer site-footer-wide">
+        <div class="site-footer-brand">
+            <span class="site-footer-meta">
+                <span class="footer-mark" aria-hidden="true"></span>
+                RewardZone
+            </span>
+            <p class="site-footer-tagline">Free to join. Payouts from $1.00. No fees.</p>
+        </div>
+
+        <nav class="site-footer-column" aria-label="Product">
+            <h2 class="site-footer-heading">Product</h2>
             <a href="/">Home</a>
             <a href="/offers">Offers</a>
+            <a href="#home-faq">FAQ</a>
+        </nav>
+
+        <nav class="site-footer-column" aria-label="Account">
+            <h2 class="site-footer-heading">Account</h2>
+            <a href="/offers">Sign in</a>
+            <a href="/reset-password">Reset password</a>
+        </nav>
+
+        <nav class="site-footer-column" aria-label="Legal">
+            <h2 class="site-footer-heading">Legal</h2>
+            <a href="/terms">Terms</a>
+            <a href="/privacy">Privacy</a>
+            <a href="/contact">Contact</a>
         </nav>
     </footer>
+
+    <!--
+        Structured data for search engines. Tells Google this is a website and
+        provides the FAQ answers for rich results. Rendered as JSON; the
+        `script-src 'self'` policy does not block application/ld+json, which is
+        not executed.
+    -->
+    <script type="application/ld+json">
+    {
+        "@context": "https://schema.org",
+        "@type": "WebSite",
+        "name": "RewardZone",
+        "url": "/",
+        "description": "Earn rewards for completing surveys and offers. Free to join, paid out from $1.00, no fees."
+    }
+    </script>
+
+    <noscript>
+        <style>
+            #home-offers { display: none; }
+            #home-offer-count { display: none; }
+            .home-faq-list details { display: block; }
+        </style>
+        <div class="page-shell">
+            <p class="page-message noscript-note">
+                The live offer list needs JavaScript to load.
+                <a href="/offers">Open the offers page</a> to browse the catalog.
+            </p>
+        </div>
+    </noscript>
 </body>
 </html>

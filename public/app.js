@@ -20,9 +20,66 @@ const depositState = { options: null, method: 'crypto' };
  * The success screen must fire on the *transition*, not on the state. Without this, every
  * poll re-announced the same already-credited deposit forever -- which is also why the
  * old code needed a one-shot `depositHistorySignature` flag to stop it looping.
+ *
+ * Backed by `sessionStorage` rather than kept in memory, because an in-memory set starts empty
+ * on every page load: reloading the dashboard replayed the success screen for every deposit
+ * ever credited, which is the opposite of what a transition is supposed to mean.
+ *
+ * `sessionStorage` rather than `localStorage` is deliberate. The announcement is real
+ * information -- "your money arrived" -- and it should survive a reload, but not be suppressed
+ * forever. With `localStorage`, a user whose tab closed on the success screen would never be
+ * told about a credit that landed while they were away. Per-tab, and gone when the tab closes,
+ * is the right lifetime for "you have already been shown this".
+ *
+ * Same interface as the `Set` it replaces (`has` / `add`), so the call sites are unchanged and
+ * there is one place that owns the storage.
  */
-const creditedDepositsSeen = new Set();
-const withdrawState = { options: null, method: 'paypal', asset: '', network: '' };
+const CREDITED_SEEN_KEY = 'offerNetworkCreditedDepositsSeen';
+// Bounded so a long-lived tab cannot grow the entry without limit. Only the most recent
+// credits need remembering: anything older has long since been acknowledged, and the set is
+// only consulted to avoid repeating something the user has already seen.
+const CREDITED_SEEN_LIMIT = 50;
+
+/** Session storage throws rather than returning null when it is disabled or full. */
+function readCreditedSeen() {
+    try {
+        const raw = window.sessionStorage.getItem(CREDITED_SEEN_KEY);
+        const parsed = raw ? JSON.parse(raw) : [];
+        return new Set(Array.isArray(parsed) ? parsed.map(String) : []);
+    } catch {
+        // No storage, or corrupt contents. An empty set means announcements behave exactly as
+        // they did before persistence existed, which is a usable fallback.
+        return new Set();
+    }
+}
+
+const creditedSeen = readCreditedSeen();
+
+const creditedDepositsSeen = {
+    has(id) {
+        return creditedSeen.has(String(id));
+    },
+    add(id) {
+        creditedSeen.add(String(id));
+        // Most recent last, so trimming from the front drops the oldest.
+        if (creditedSeen.size > CREDITED_SEEN_LIMIT) {
+            for (const stale of creditedSeen) {
+                if (creditedSeen.size <= CREDITED_SEEN_LIMIT) break;
+                creditedSeen.delete(stale);
+            }
+        }
+        try {
+            window.sessionStorage.setItem(CREDITED_SEEN_KEY, JSON.stringify([...creditedSeen]));
+        } catch {
+            // Storage full or unavailable. The in-memory set still suppresses repeats for the
+            // rest of this page's life, so a repeat after a reload is a tolerable outcome
+            // versus an exception thrown out of a status poll.
+        }
+    }
+};
+// `codeFor` is the amount/coin/destination a confirmation code was issued for, or null. It
+// exists so an edit after the code arrived is caught in the form instead of at the server.
+const withdrawState = { options: null, method: 'paypal', asset: '', network: '', codeFor: null };
 const accountState = { balance: NaN };
 
 
@@ -62,6 +119,13 @@ document.addEventListener('DOMContentLoaded', () => {
     document.getElementById('withdraw-button').addEventListener('click', openWithdrawal);
     document.getElementById('account-form').addEventListener('submit', connectAccount);
     document.getElementById('withdraw-form').addEventListener('submit', submitWithdrawal);
+    document.getElementById('withdraw-code-send')?.addEventListener('click', sendWithdrawalCode);
+    document.getElementById('withdraw-code-resend')?.addEventListener('click', sendWithdrawalCode);
+    document.getElementById('withdraw-code')?.addEventListener('input', (event) => {
+        // Digits only, capped at six. A pasted "123 456" or an autocorrected one is the
+        // difference between a code that works and one of five attempts spent.
+        event.target.value = event.target.value.replace(/\D/g, '').slice(0, 6);
+    });
     document.getElementById('deposit-form').addEventListener('submit', createDeposit);
 
     document.querySelectorAll('[data-deposit-method]').forEach((button) => {
@@ -97,6 +161,7 @@ document.addEventListener('DOMContentLoaded', () => {
         // The bounds alone are not enough: the value already typed may now be outside them.
         clampDepositAmountToRange();
         updateDepositAmountHint();
+        updateCoinSummary();
         syncDepositPresets();
     });
 
@@ -1333,6 +1398,47 @@ function validateDepositAmount() {
 }
 
 /**
+ * States the floor for the coin currently chosen, so it stays on screen after the menu closes.
+ *
+ * The option labels read "from $X", which makes the choice informed before it is made but
+ * leaves the number behind once it is made. It is also the number a user is most likely to
+ * misread, so it is labelled explicitly: it is a floor, not a charge, and when it came from
+ * the provider it is that provider's volatile per-pair limit rather than this app's rule.
+ */
+function updateCoinSummary() {
+    const summary = document.getElementById('deposit-coin-summary');
+    if (!summary) return;
+
+    const select = document.getElementById('deposit-currency');
+    const code = select?.value;
+    if (!code) {
+        summary.hidden = true;
+        summary.replaceChildren();
+        return;
+    }
+
+    const name = cryptoCurrencyNames[code] || code.toUpperCase();
+    const providerMinimum = providerMinimumForSelectedCurrency();
+    const reported = Number(depositState.options?.minimums?.[code]);
+    const fromProvider = Number.isFinite(reported) && reported > 0;
+
+    const amount = document.createElement('strong');
+    amount.className = 'coin-summary-amount';
+    amount.textContent = providerMinimum ? formatBalance(providerMinimum) : 'any amount';
+
+    summary.replaceChildren(
+        document.createTextNode(`${name} accepts deposits from `),
+        amount,
+        document.createTextNode(
+            fromProvider
+                ? '. That is the payment provider\'s minimum for this network and it moves with their rates.'
+                : '. The payment provider\'s minimum for this network is not known right now, so this is our own limit.'
+        )
+    );
+    summary.hidden = false;
+}
+
+/**
  * The cheapest coin the provider will actually accept for the amount already in the box.
  *
  * Returns null when the selected coin is already the cheapest, when nothing else qualifies,
@@ -1504,6 +1610,7 @@ async function loadDepositOptions() {
         // form un-submittable on open with no visible reason why.
         clampDepositAmountToRange();
         updateDepositAmountHint();
+        updateCoinSummary();
         syncDepositPresets();
 
         // Fall back to whichever method actually works rather than leaving the user on
@@ -2052,6 +2159,7 @@ function updateWithdrawFields() {
 }
 
 function updateWithdrawSummary() {
+    renderWithdrawalConfirm();
     const summary = document.getElementById('withdraw-summary');
     const amount = Number(document.getElementById('withdraw-amount').value);
     const destination = document.getElementById('withdraw-address').value.trim();
@@ -2148,6 +2256,143 @@ function validateWithdrawalDestination() {
     return true;
 }
 
+/**
+ * Everything the server needs to describe this withdrawal, in one place.
+ *
+ * Both the code request and the final submit build their body from this, and the server binds
+ * the code to the same values. Two separate literals here would be how the two could drift
+ * apart, and the symptom would be a code that is rejected for reasons the user cannot see.
+ */
+function withdrawalRequestBody() {
+    const isCrypto = withdrawState.method === 'crypto';
+    return {
+        amount: Number(document.getElementById('withdraw-amount').value),
+        paymentMethod: withdrawState.method,
+        paymentAddress: document.getElementById('withdraw-address').value.trim(),
+        assetCode: isCrypto ? withdrawState.asset : null,
+        network: isCrypto ? withdrawState.network : null,
+        destinationTag: isCrypto
+            ? document.getElementById('withdraw-tag').value.trim() || null
+            : null
+    };
+}
+
+/** Shows what a code is about to authorise, and hides the step again. */
+function renderWithdrawalConfirm() {
+    const panel = document.getElementById('withdraw-confirm');
+    const facts = document.getElementById('withdraw-confirm-facts');
+    if (!panel || !facts) return;
+
+    const body = withdrawalRequestBody();
+    if (!validateWithdrawalDestination()) {
+        panel.hidden = true;
+        return;
+    }
+
+    const list = document.createElement('div');
+    const rows = [['Amount', formatBalance(body.amount)]];
+    if (body.paymentMethod === 'crypto' && body.assetCode) {
+        rows.push(['Coin', [body.assetCode, body.network].filter(Boolean).join(' on ')]);
+    } else {
+        rows.push(['Method', body.paymentMethod === 'paypal' ? 'PayPal' : 'Bank transfer']);
+    }
+    rows.push(['To', body.destinationTag ? `${body.paymentAddress} (${body.destinationTag})` : body.paymentAddress]);
+
+    for (const [term, value] of rows) {
+        const dt = document.createElement('dt');
+        dt.textContent = term;
+        const dd = document.createElement('dd');
+        dd.textContent = value;
+        list.append(dt, dd);
+    }
+    facts.replaceChildren(list);
+    panel.hidden = false;
+
+    // The code is bound to the amount and destination it was sent for. Editing either after the
+    // fact leaves a code the server will reject, so the step is re-armed here instead of letting
+    // the user type six digits at a dead code and spend one of five attempts finding out.
+    if (withdrawState.codeFor && withdrawalCodeTarget(body) !== withdrawState.codeFor) {
+        withdrawState.codeFor = null;
+        const codeInput = document.getElementById('withdraw-code');
+        if (codeInput) codeInput.value = '';
+        const send = document.getElementById('withdraw-code-send');
+        if (send) {
+            send.disabled = false;
+            send.textContent = 'Email me a new code';
+        }
+        const resend = document.getElementById('withdraw-code-resend');
+        if (resend) resend.hidden = false;
+        const hint = document.getElementById('withdraw-code-hint');
+        if (hint) {
+            hint.hidden = false;
+            hint.textContent = 'You changed the amount or destination, so the previous code no longer applies. Request a new one.';
+        }
+    }
+}
+
+/** The exact values the code is bound to, as one comparable string. */
+function withdrawalCodeTarget(body) {
+    return [body.amount, body.paymentMethod, body.assetCode, body.network, body.paymentAddress, body.destinationTag].join('|');
+}
+
+/** Disables confirmation once a code has been sent, and reports the window it is good for. */
+function markWithdrawalCodeSent(minutes) {
+    const send = document.getElementById('withdraw-code-send');
+    const resend = document.getElementById('withdraw-code-resend');
+    const hint = document.getElementById('withdraw-code-hint');
+    if (send) {
+        send.disabled = true;
+        send.textContent = 'Code sent';
+    }
+    if (resend) resend.hidden = false;
+    if (hint) {
+        hint.hidden = false;
+        hint.textContent = `Check your inbox. The code is good for ${minutes} minutes and only works for this amount and destination.`;
+    }
+    document.getElementById('withdraw-code')?.focus();
+}
+
+/** Asks the server for a code for exactly the withdrawal described on screen. */
+async function sendWithdrawalCode() {
+    const button = document.getElementById('withdraw-code-send');
+    const resend = document.getElementById('withdraw-code-resend');
+    const hint = document.getElementById('withdraw-code-hint');
+    const original = button?.textContent;
+    const body = withdrawalRequestBody();
+
+    if (button) {
+        button.disabled = true;
+        button.textContent = 'Sending...';
+    }
+    if (resend) resend.disabled = true;
+    if (hint) hint.hidden = true;
+
+    try {
+        const result = await requestJson('/api/user/withdrawals/code', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                Authorization: `Bearer ${sessionStorage.getItem(accountTokenKey)}`
+            },
+            body: JSON.stringify(body)
+        });
+        // Remembered only after the server confirms it sent one, so a failed request does not
+        // leave a code that was never issued being treated as valid.
+        withdrawState.codeFor = withdrawalCodeTarget(body);
+        markWithdrawalCodeSent(result.expiresInMinutes ?? 10);
+    } catch (error) {
+        if (hint) {
+            hint.hidden = false;
+            hint.textContent = error.message;
+        }
+        if (button) {
+            button.disabled = false;
+            button.textContent = original;
+        }
+        if (resend) resend.disabled = false;
+    }
+}
+
 async function submitWithdrawal(event) {
     event.preventDefault();
     const button = document.getElementById('withdraw-submit');
@@ -2158,39 +2403,66 @@ async function submitWithdrawal(event) {
         return;
     }
 
+    // The server will refuse a withdrawal without a matching code, and it is bound to the
+    // amount and destination. Caught here so the user is sent to the code step rather than
+    // shown a rejection they have not been given a way to fix.
+    const code = String(document.getElementById('withdraw-code')?.value || '').trim();
+    if (!/^\d{6}$/.test(code)) {
+        renderWithdrawalConfirm();
+        document.getElementById('withdraw-code')?.focus();
+        setFormMessage('withdraw-message', 'Enter the 6-digit code we emailed you.', 'error');
+        return;
+    }
+
     button.disabled = true;
     button.textContent = 'Submitting...';
     setFormMessage('withdraw-message', '');
 
     try {
-        const isCrypto = withdrawState.method === 'crypto';
         const result = await requestJson('/api/user/withdraw', {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
                 Authorization: `Bearer ${sessionStorage.getItem(accountTokenKey)}`
             },
-            body: JSON.stringify({
-                amount: Number(document.getElementById('withdraw-amount').value),
-                paymentMethod: withdrawState.method,
-                paymentAddress: document.getElementById('withdraw-address').value.trim(),
-                assetCode: isCrypto ? withdrawState.asset : null,
-                network: isCrypto ? withdrawState.network : null,
-                destinationTag: isCrypto
-                    ? document.getElementById('withdraw-tag').value.trim() || null
-                    : null
-            })
+            body: JSON.stringify({ ...withdrawalRequestBody(), code })
         });
 
         showWithdrawalConfirmation(result);
         document.getElementById('withdraw-amount').value = '';
         document.getElementById('withdraw-address').value = '';
         document.getElementById('withdraw-tag').value = '';
+        // The code is single-use and already spent server-side. Clearing it stops the next
+        // withdrawal from being submitted with a dead one, and stops it being read over a
+        // shoulder in the meantime.
+        document.getElementById('withdraw-code').value = '';
+        const panel = document.getElementById('withdraw-confirm');
+        if (panel) panel.hidden = true;
+        withdrawState.codeFor = null;
+        const send = document.getElementById('withdraw-code-send');
+        if (send) {
+            send.disabled = false;
+            send.textContent = 'Email me a code';
+        }
+        const resend = document.getElementById('withdraw-code-resend');
+        if (resend) resend.hidden = true;
+        const hint = document.getElementById('withdraw-code-hint');
+        if (hint) hint.hidden = true;
         updateWithdrawSummary();
         await refreshBalance();
         await loadWithdrawalHistory();
     } catch (error) {
         setFormMessage('withdraw-message', error.message, 'error');
+        // A refused code is spent or stale, so the step goes back to asking for a new one
+        // rather than leaving a user typing the same six digits at a dead code.
+        if (/code/i.test(error.message || '')) {
+            document.getElementById('withdraw-code').value = '';
+            const send = document.getElementById('withdraw-code-send');
+            if (send) {
+                send.disabled = false;
+                send.textContent = 'Email me a new code';
+            }
+        }
         handleUnauthorized(error);
     } finally {
         button.disabled = false;
@@ -2373,6 +2645,49 @@ function buildHistoryRow(item, kind) {
     }
 
     row.append(details, badge);
+
+    // A crypto deposit that has not been paid yet is a live instruction, not a record. Closing
+    // the panel by accident used to leave the customer with a row that said "waiting" and
+    // nothing about what to send, which is the state that strands money: the address is unpaid
+    // and the only copy of the amount was in the dialog that had just been dismissed.
+    //
+    // So the row is a button while it is payable. Not a link and not a `div` with a click
+    // handler -- a button, because it is reachable by keyboard, announced as a control, and
+    // activates on Enter and Space without any of that being re-implemented here.
+    if (kind === 'deposit' && item.payable && item.deposit_address) {
+        const reopen = document.createElement('button');
+        reopen.type = 'button';
+        reopen.className = 'history-reopen';
+        reopen.textContent = 'Show how to pay';
+        reopen.setAttribute('aria-label', `Show how to pay deposit #${item.id} of ${formatBalance(item.amount)}`);
+
+        reopen.addEventListener('click', () => {
+            const dialog = document.getElementById('deposit-dialog');
+            if (!dialog) return;
+            // The form is hidden, not removed: the customer has already paid for this one, and
+            // offering a second amount box next to a live address invites paying twice.
+            const form = document.getElementById('deposit-form');
+            if (form) form.hidden = true;
+            document.getElementById('deposit-provider-copy').hidden = true;
+            const title = document.getElementById('deposit-title');
+            if (title) title.textContent = 'Complete your deposit';
+            renderDepositInstructions({
+                payAmount: item.payAmount,
+                assetCode: item.asset_code,
+                network: item.network,
+                qrCodeSvg: item.qrCodeSvg,
+                expiresAt: item.expiresAt,
+                payAddress: item.deposit_address
+            });
+            if (!dialog.open) dialog.showModal();
+        });
+
+        row.append(reopen);
+        // The row's own class drives the affordance; set after appending so the button styles
+        // are in place when the check scripts read the markup.
+        row.classList.add('is-reopenable');
+    }
+
     return row;
 }
 

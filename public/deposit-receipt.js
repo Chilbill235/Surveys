@@ -64,6 +64,11 @@ function renderFacts(deposit) {
     rows.push(['Reference', `#${deposit.id}`]);
     if (deposit.deposit_address) rows.push(['Address', deposit.deposit_address]);
     rows.push(['Created', new Date(deposit.created_at).toLocaleString()]);
+    // Only while the deposit can still be paid. Once it is settled the deadline is history, and
+    // showing a timestamp in the past next to "credited" reads as a second problem.
+    if (deposit.expires_at && !terminalStatuses.has(String(deposit.status || '').toLowerCase())) {
+        rows.push(['Pay by', new Date(deposit.expires_at).toLocaleString()]);
+    }
     if (deposit.credited_at) {
         rows.push(['Credited', new Date(deposit.credited_at).toLocaleString()]);
     }

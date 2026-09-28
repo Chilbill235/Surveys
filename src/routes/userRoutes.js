@@ -279,22 +279,43 @@ router.get('/withdrawals', async (req, res) => {
 // Deposit history
 // ---------------------------------------------------------------------------
 
+/**
+ * The columns both deposit read endpoints project.
+ *
+ * Shared because these two queries answering the same question with different column lists is
+ * not a style preference. It already happened: `pay_amount` and `expires_at` were added to the
+ * history and not to the single-deposit lookup, so the receipt page -- whose entire purpose is
+ * showing a customer the exact figure they were originally told to send -- silently fell back
+ * to "send the exact amount" and told them nothing. The list and the detail view have to agree,
+ * so they are one list.
+ *
+ * `credited_at` is here for the same reason it was originally selected: `status = 'confirmed'`
+ * and "the money is on the balance" are the same thing only when the credit ran, and the person
+ * reading is the one who cannot tell the two apart.
+ */
+const DEPOSIT_COLUMNS = 'id, amount, pay_amount, expires_at, asset_code, currency_code, network, ' +
+    'deposit_address, checkout_url, status, credited_at, created_at';
+
 router.get('/deposits', async (req, res) => {
     try {
-        // `credited_at` is included for the same reason the single-deposit
-        // lookup includes it: `status = 'confirmed'` and "the money is on the
-        // balance" are the same thing only when the credit ran, and the user
-        // looking at their history is the one who cannot tell the two apart.
         const result = await pool.query(
-            `SELECT id, amount, asset_code, currency_code, network, deposit_address,
-                    checkout_url, status, credited_at, created_at
+            `SELECT ${DEPOSIT_COLUMNS}
              FROM deposits
              WHERE user_id = $1
              ORDER BY created_at DESC, id DESC
              LIMIT $2`,
             [req.user.id, HISTORY_PAGE_SIZE]
         );
-        return res.json(result.rows.map(withReceiptUrl));
+        return res.json(await Promise.all(result.rows.map(async (row) => {
+            const deposit = withReceiptUrl(row);
+            // A crypto deposit that is still awaiting payment is re-openable. The exact coin
+            // amount and the deadline are read from the row (migration 013) rather than
+            // recomputed, because the rate has moved since the deposit was created and the
+            // same address serves every amount. The QR is rendered only for these rows:
+            // generating one for a settled deposit is work whose result is never shown.
+            const instructions = await paymentController.payableInstructionsFor(row);
+            return instructions ? { ...deposit, ...instructions } : deposit;
+        })));
     } catch (error) {
         return sendDatabaseFailure(res, 'Deposit history error', error);
     }
@@ -320,8 +341,7 @@ router.get('/deposits/:id', async (req, res) => {
     }
     try {
         const result = await pool.query(
-            `SELECT id, amount, asset_code, currency_code, network, deposit_address, checkout_url,
-                    status, credited_at, created_at
+            `SELECT ${DEPOSIT_COLUMNS}
              FROM deposits
              WHERE id = $1 AND user_id = $2`,
             [depositId, req.user.id]
@@ -356,6 +376,7 @@ registerMethod(/^\/api\/user\/deposits\/\d{1,19}\/?$/, ['GET']);
 // bare verb. The plural is the readable form, so it is accepted as an alias for the create
 // endpoint rather than leaving two names for one action. Declared once, with both verbs,
 // so a GET to it is answered 405 with an `Allow` that names the verb that was wanted.
+router.post('/withdrawals/code', financialMutationLimit, payoutController.sendWithdrawalCode);
 router.post('/withdrawals', financialMutationLimit, payoutController.requestWithdrawal);
 registerMethod(/^\/api\/user\/withdrawals\/?$/, ['GET', 'POST']);
 registerMethod(/^\/api\/user\/withdraw\/?$/, ['POST']);

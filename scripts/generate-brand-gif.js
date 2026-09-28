@@ -366,6 +366,33 @@ function buildGif() {
 
 const output = path.join(__dirname, '..', 'public', 'brand.gif');
 const gif = buildGif();
+
+/**
+ * Refuses to replace the shipped mark unless explicitly told to.
+ *
+ * `public/brand.gif` is a hand-authored 240x240, 92-frame asset. This script draws a simpler
+ * 160x160 mark with 24 frames and 64 colours, and it is a reference implementation of the
+ * GIF89a/LZW encoding rather than the source of what is deployed.
+ *
+ * It used to write unconditionally, which meant running it -- to "fix" the asset, to see what
+ * it produced, or by accident -- replaced the real artwork with the placeholder and the only
+ * way to make the test suite green again was to leave it that way. Two files claiming to be the
+ * brand mark is not a state worth allowing, so the destructive path is now opt-in.
+ */
+const force = process.argv.includes('--force');
+
+if (!force && fs.existsSync(output)) {
+    const existing = fs.readFileSync(output);
+    const width = existing.readUInt16LE(6);
+    const height = existing.readUInt16LE(8);
+    console.log(
+        `public/brand.gif already exists (${existing.length} bytes, ${width}x${height}) and was left alone.\n` +
+        'The shipped mark is hand-authored artwork; this script is a reference encoder and writes a\n' +
+        'simpler placeholder. Pass --force to overwrite it anyway.'
+    );
+    process.exit(0);
+}
+
 fs.writeFileSync(output, gif);
 
 console.log(

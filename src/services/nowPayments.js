@@ -212,12 +212,36 @@ class NowPaymentsError extends Error {
         this.cause = cause;
     }
 
-    /** The provider's own words, when it gave any. */
+    /**
+     * The provider's own words, when it gave any.
+     *
+     * NOWPayments reports errors as `{ "error": { "code": "FAILURE", "message": "Minimum
+     * amount is 0.05 BCH, you have 0.002" } }` -- the useful text is nested one object deep.
+     * Only the flat `{ message }` and `{ error: "string" }` shapes were read, so on a real
+     * refusal this returned null and `createDeposit` answered every genuine provider
+     * rejection with a bare "Could not create a deposit with the selected provider." That
+     * threw away the one sentence naming the amount that would have worked, which is the
+     * entire reason the caller falls through to its own message instead of a 502.
+     *
+     * The nested form is therefore checked first, because it is what the provider actually
+     * sends; the flat forms stay supported for the endpoints and API versions that use them.
+     */
     get providerMessage() {
         if (!this.providerResponse || typeof this.providerResponse !== 'object') return null;
+
         const { message, error } = this.providerResponse;
-        const text = typeof message === 'string' ? message : typeof error === 'string' ? error : null;
-        return text && text.trim() ? text.trim() : null;
+        const nested = error && typeof error === 'object' ? error.message : null;
+
+        const candidates = [
+            nested,
+            typeof message === 'string' ? message : null,
+            typeof error === 'string' ? error : null
+        ];
+
+        for (const candidate of candidates) {
+            if (typeof candidate === 'string' && candidate.trim()) return candidate.trim();
+        }
+        return null;
     }
 
     /** True when the provider refused because the request was rate limited. */
@@ -613,6 +637,61 @@ async function getPaymentStatus(paymentId) {
 // ---------------------------------------------------------------------------
 
 /**
+ * A description of why a request never reached the provider, good enough to act on.
+ *
+ * `request` reports a transport failure as "could not be completed" and keeps the underlying
+ * error as `cause`. That is the right shape for a thrown exception, but it is useless in a
+ * log line: an operator reading "could not be completed" learns nothing, and the one detail
+ * that would identify the fault -- a proxy that will not authenticate, a name that does not
+ * resolve, a socket that was refused -- is a field away and gets discarded. The likeliest
+ * cause of a transport failure on the payout endpoints is a misconfigured `FIXIE_URL`, so the
+ * line also says whether the proxy is in play at all. Without that, "the proxy is broken" and
+ * "there is no proxy and NOWPayments refused the address" look identical from outside.
+ */
+function describeTransportFailure(error) {
+    const parts = [];
+    const cause = error?.cause;
+    if (cause) {
+        const code = cause.code ? ` (${cause.code})` : '';
+        parts.push(`${cause.message || String(cause)}${code}`);
+        // Undici nests the proxy's own failure inside a wrapper whose message is frequently
+        // just "fetch failed", so the informative text is usually one level further down.
+        if (cause.cause?.message) parts.push(`underlying: ${cause.cause.message}`);
+    }
+    parts.push(payoutProxyConfigured()
+        ? 'the request went out via FIXIE_URL'
+        : 'FIXIE_URL is unset, so the request went out directly');
+    return parts.join('; ');
+}
+
+/** Whether the whitelisted proxy is configured for this process. */
+function payoutProxyConfigured() {
+    return Boolean(String(process.env.FIXIE_URL || '').trim());
+}
+
+/**
+ * How long the provider address check is abandoned after a transport failure.
+ *
+ * The check runs on every crypto withdrawal and is metered through a proxy with a small
+ * monthly allowance, so a broken proxy is not a log line and nothing else: without this,
+ * every withdrawal would pay the full ten-second timeout and a metered request to learn
+ * something already known. The local format check carries the requests meanwhile.
+ *
+ * Shorter than the payout-minimum cool-off because this one guards a real risk -- an address
+ * that satisfies the regex but cannot receive anything, on a withdrawal whose balance is
+ * already debited -- whereas the minimum only affects a number shown to the user.
+ */
+const ADDRESS_VALIDATION_RETRY_MS = 5 * 60 * 1000;
+let addressValidationUnavailableUntil = 0;
+let addressValidationFailureReported = false;
+
+/** Ends the address-check cool-off, so the next withdrawal asks the provider again. */
+function resetAddressValidationAvailability() {
+    addressValidationUnavailableUntil = 0;
+    addressValidationFailureReported = false;
+}
+
+/**
  * Asks the provider whether an address can receive funds.
  *
  * `payoutOptions` checks addresses with per-network regular expressions, which catch the
@@ -627,6 +706,14 @@ async function validatePayoutAddress(address, currency, { extraId = null, logger
         return { checked: false, valid: null, reason: 'NOWPayments is not configured, so only the local address format was checked.' };
     }
 
+    // Inside the cool-off a previous withdrawal already established that the provider cannot be
+    // reached, so asking again costs a ten-second wait and a metered proxy request to learn the
+    // same thing. Reported as unchecked rather than skipped silently, so the caller's `checked`
+    // flag still means what it says.
+    if (Date.now() < addressValidationUnavailableUntil) {
+        return { checked: false, valid: null, reason: null };
+    }
+
     const body = {
         address: String(address),
         currency: String(currency).toLowerCase()
@@ -635,6 +722,8 @@ async function validatePayoutAddress(address, currency, { extraId = null, logger
 
     try {
         const result = await request('POST', '/v1/payout/validate-address', { body, timeoutMs: 10000, viaProxy: true });
+        addressValidationUnavailableUntil = 0;
+        addressValidationFailureReported = false;
         // The endpoint reports validity in a few shapes across API versions; any explicit
         // `false` is authoritative, and an absent flag is treated as "cannot tell" rather
         // than as permission, so a shape change fails closed towards the local check.
@@ -649,7 +738,21 @@ async function validatePayoutAddress(address, currency, { extraId = null, logger
         }
         return { checked: true, valid, reason: null };
     } catch (error) {
-        logger.warn(`NOWPayments address validation could not be completed (${error.message}); using the local address check only.`);
+        // Only a transport failure opens the cool-off. A provider that answered and reported
+        // the address as bad has given a real answer, and the next withdrawal deserves its own
+        // check -- cooling that off would let a user retry until the verdict changed.
+        if (!error?.status) {
+            addressValidationUnavailableUntil = Date.now() + ADDRESS_VALIDATION_RETRY_MS;
+            if (!addressValidationFailureReported) {
+                addressValidationFailureReported = true;
+                logger.warn(
+                    `NOWPayments address validation could not be reached: ${describeTransportFailure(error)}. ` +
+                    `Only the local address format check will run for the next ${Math.round(ADDRESS_VALIDATION_RETRY_MS / 60000)} minutes, ` +
+                    'so an address that looks right but sits on the wrong network will not be caught by the provider. ' +
+                    'If FIXIE_URL is set, it is the first thing to check.'
+                );
+            }
+        }
         return { checked: false, valid: null, reason: null };
     }
 }
@@ -1153,6 +1256,7 @@ module.exports = {
     feePaidByUserEnabled,
 
     validatePayoutAddress,
+    resetAddressValidationAvailability,
     getPayoutFee,
     getPayoutMinimum,
     isPayoutMinimumRefused,

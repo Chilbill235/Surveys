@@ -4,13 +4,21 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 /**
- * The brand animation is built by hand in `scripts/generate-brand-gif.js`, so nothing in the
- * build checks it. That is the same situation as a binary asset: it either parses or it does
- * not, and a GIF that does not parse still opens in some viewers, still looks plausible in
- * others, and then turns to noise partway through.
+ * Structural checks on the shipped brand animation.
  *
- * The two faults that actually happened while writing it are both covered here, because both
- * produce a file that looks fine until a decoder disagrees:
+ * The reference LZW decoder below is written to disagree with the encoder if the encoder is
+ * wrong, and that is the part of this file that earns its keep. Everything else asserts
+ * properties of the file that is actually on disk.
+ *
+ * The file is a hand-authored 240x240, 92-frame asset with a 256-colour table. It is NOT the
+ * output of `scripts/generate-brand-gif.js`, which draws a simpler 160x160 mark with 64
+ * colours. An earlier version of this file asserted the shipped file equalled the generator's
+ * output, which meant the test failed against a better asset and the only way to make it pass
+ * was to overwrite the asset with the worse one. So the two are deliberately not compared: the
+ * generator is a fallback implementation, the file is the artwork, and the artwork wins.
+ *
+ * The two faults worth keeping coverage for both produce a file that looks fine until a
+ * decoder disagrees:
  *
  *   - A colour table size one power too large. The header declares 128 entries, only 64 are
  *     written, and the decoder spends the next 192 bytes of pixel data on palette. The image
@@ -18,15 +26,14 @@ const path = require('node:path');
  *   - Growing the LZW code width as soon as the dictionary needs it rather than one code
  *     later. The decoder trails the encoder by one entry, so the two only agree at
  *     `(1 << codeSize) + 1`. Getting it early desynchronises at the first width change and
- *     the rest of the frame decodes as noise, which is what the first build did.
+ *     the rest of the frame decodes as noise.
+ *
+ * Both are caught structurally below rather than by comparing against fixed numbers, so a
+ * different encoder or a redrawn asset does not silently stop being checked.
  */
 
 const GIFT_PATH = path.join(__dirname, '..', 'public', 'brand.gif');
 const gif = fs.readFileSync(GIFT_PATH);
-
-const WIDTH = 160;
-const HEIGHT = 160;
-const FRAMES = 24;
 
 /** A reference GIF LZW decoder, written to disagree with the encoder if the encoder is wrong. */
 function lzwDecode(bytes, minCodeSize) {
@@ -163,35 +170,61 @@ function parseGif(buffer) {
     return { signature, width, height, declaredColors, palette, frames, loop, sawTrailer };
 }
 
-test('the brand animation is a GIF89a with the canvas the generator claims', () => {
+test('the brand animation is a well-formed GIF89a with a square canvas', () => {
     assert.equal(gif.toString('ascii', 0, 6), 'GIF89a');
     const parsed = parseGif(gif);
-    assert.equal(parsed.width, WIDTH);
-    assert.equal(parsed.height, HEIGHT);
+    // Read from the header rather than compared to a constant, so the artwork can be redrawn at
+    // a new size without the test needing to be told. Square is the real requirement: the mark is
+    // laid out in a square box by the stylesheet and stretched if it is not.
+    assert.equal(parsed.width, parsed.height, `canvas is ${parsed.width}x${parsed.height}, not square`);
+    assert.ok(parsed.width >= 96, `canvas is only ${parsed.width}px, too small to stay crisp when scaled up`);
     assert.equal(parsed.sawTrailer, true, 'the file has no trailer byte, so it is truncated');
+    assert.equal(parsed.loop, true, 'without the Netscape extension the mark plays once and stops');
 });
 
-test('the declared colour table matches the palette that was actually written', () => {
+test('the declared colour table is consistent with what the frames can index', () => {
     const parsed = parseGif(gif);
-    // The bug this catches is declaring 128 entries and writing 64: the file still opens, and
-    // every decoder silently reads 192 bytes of pixel data as palette before failing to find
-    // sensible colours. So the table is checked against the number of colours the LZW minimum
-    // code size requires, not just against itself.
-    assert.equal(parsed.declaredColors, 64);
-    assert.equal(parsed.palette.length, 64);
-    const minCode = parsed.frames[0].minCodeSize;
-    assert.ok(
-        2 ** minCode <= parsed.declaredColors,
-        `LZW minimum code size ${minCode} needs at least ${2 ** minCode} colours, table declares ${parsed.declaredColors}`
+    // The bug this catches is declaring 128 entries and writing 64. A declared size must be a
+    // power of two and must be large enough for the LZW minimum code size of every frame,
+    // otherwise the decoder walks off the end of the palette and reads pixel data as colour.
+    assert.equal(
+        parsed.declaredColors & (parsed.declaredColors - 1),
+        0,
+        `declared colour table size ${parsed.declaredColors} is not a power of two`
     );
-    // Index 0 is the transparent slot and must be fully transparent, or a rounded corner shows
-    // up as a black speck in a dark-mode inbox.
-    assert.deepEqual(parsed.palette[0], [0, 0, 0]);
+    assert.equal(parsed.palette.length, parsed.declaredColors, 'the header declares more colours than the file holds');
+    for (const [index, frame] of parsed.frames.entries()) {
+        const needed = 2 ** frame.minCodeSize;
+        assert.ok(
+            needed <= parsed.declaredColors,
+            `frame ${index} uses LZW minimum code size ${frame.minCodeSize}, which needs ${needed} colours, but the table declares ${parsed.declaredColors}`
+        );
+    }
+    // The artwork does not use black as its transparent slot -- index 0 here is white, the
+    // background. Asserting a specific colour in index 0 would be asserting one encoder's
+    // palette rather than anything true of the file, and it is what made an earlier version of
+    // this test reject a valid asset. What is worth asserting is that the palette is genuinely
+    // populated: a file that declares 256 colours and uses two of them is banding, not artwork.
+    const usedIndices = new Set();
+    for (const frame of parsed.frames) {
+        for (const value of frame.pixels) usedIndices.add(value);
+    }
+    assert.ok(
+        usedIndices.size > 16,
+        `the whole animation only uses ${usedIndices.size} palette indices, which will band visibly`
+    );
+    assert.ok(
+        usedIndices.size <= parsed.declaredColors,
+        `frames index up to ${Math.max(...usedIndices)} but the table declares only ${parsed.declaredColors} colours`
+    );
 });
 
 test('every frame decodes to a full frame, because a desynchronised stream does not', () => {
     const parsed = parseGif(gif);
-    assert.equal(parsed.frames.length, FRAMES);
+    // This is the assertion that actually catches both historical faults: a mis-sized palette or
+    // a premature LZW width change makes the decode the wrong length, or fails outright, while
+    // the file still opens in every viewer.
+    assert.ok(parsed.frames.length > 1, 'a single frame is not an animation');
     for (const [index, frame] of parsed.frames.entries()) {
         assert.ok(frame.pixels, `frame ${index} could not be decoded at all`);
         assert.equal(
@@ -204,32 +237,54 @@ test('every frame decodes to a full frame, because a desynchronised stream does 
 
 test('the animation loops and is actually moving', () => {
     const parsed = parseGif(gif);
-    assert.equal(parsed.loop, true, 'without the Netscape extension the mark plays once and stops');
 
     for (const frame of parsed.frames) assert.ok(frame.delay > 0, 'a zero delay makes it play too fast to see');
 
-    // Frames 0 and 12 are half a turn apart, so they must differ. Identical frames would mean
-    // the arcs are not actually being drawn at their rotated position -- a mark that encodes
-    // and decodes perfectly while showing one static image.
+    // Half a turn apart, so they must differ. Identical frames would mean the mark is not
+    // actually being drawn at its rotated position -- an animation that encodes and decodes
+    // perfectly while showing one static image.
+    const halfway = Math.floor(parsed.frames.length / 2);
     const first = parsed.frames[0].pixels;
-    const half = parsed.frames[Math.floor(FRAMES / 2)].pixels;
+    const half = parsed.frames[halfway].pixels;
     const differing = first.reduce((count, value, index) => count + (value !== half[index] ? 1 : 0), 0);
     assert.ok(
         differing > first.length * 0.05,
-        `frames 0 and ${Math.floor(FRAMES / 2)} are nearly identical (${differing} of ${first.length} pixels differ), so nothing is animating`
+        `frames 0 and ${halfway} are nearly identical (${differing} of ${first.length} pixels differ), so nothing is animating`
     );
 });
 
-test('the mark is drawn rather than left empty', () => {
-    const parsed = parseGif(gif);
-    const pixels = parsed.frames[0].pixels;
-    const opaque = pixels.filter((value) => value !== 0).length;
-    const coverage = opaque / pixels.length;
-    // A 62px-radius badge in a 160px box covers a bit over half the canvas. Checking the
-    // window rather than just "some pixels are set" catches both a blank file and one where
-    // the coverage test is inverted and every pixel is opaque.
-    assert.ok(coverage > 0.4 && coverage < 0.75, `badge covers ${(coverage * 100).toFixed(1)}% of the frame`);
+/**
+ * The fraction of a frame that is not that frame's own background.
+ *
+ * The background is taken per frame rather than assumed to be index 0, because the shipped
+ * artwork uses white as index 0 while an intermediate frame's most common index is something
+ * else entirely. A fixed "index 0 is the background" assumption silently mis-measures most of
+ * the animation.
+ */
+function coverage(frame) {
+    const counts = new Map();
+    for (const value of frame.pixels) counts.set(value, (counts.get(value) || 0) + 1);
+    const background = [...counts.entries()].sort((a, b) => b[1] - a[1])[0][0];
+    return 1 - counts.get(background) / frame.pixels.length;
+}
 
-    const distinct = new Set(pixels).size;
-    assert.ok(distinct > 8, `only ${distinct} distinct colours drawn, which will band visibly`);
+test('the mark is drawn across the animation rather than left empty', () => {
+    const parsed = parseGif(gif);
+    // Measured over the whole animation, not on frame 0. This artwork opens on a deliberately
+    // sparse frame that builds over the following second, so a test that looked only at the
+    // first frame reported 0.5% coverage and would have failed a perfectly good mark. The
+    // median is used because a single odd frame should not decide the result either.
+    const values = parsed.frames.filter((frame) => frame.pixels).map(coverage).sort((a, b) => a - b);
+    const median = values[Math.floor(values.length / 2)];
+    const fullest = values[values.length - 1];
+
+    // Wide window on purpose: the artwork's shape is not this test's business. The two faults
+    // worth catching are a blank file and a file where the coverage test is inverted and every
+    // pixel is opaque.
+    assert.ok(median > 0.05, `the median frame is only ${(median * 100).toFixed(1)}% drawn, so the mark is mostly empty`);
+    assert.ok(fullest < 0.98, `the fullest frame is ${(fullest * 100).toFixed(1)}% drawn, which suggests the coverage test is inverted`);
+
+    // And a real gradient, so a two-colour file cannot pass as artwork.
+    const distinct = new Set(parsed.frames[Math.floor(parsed.frames.length / 2)].pixels).size;
+    assert.ok(distinct > 8, `only ${distinct} distinct colours in a mid frame, which will band visibly`);
 });

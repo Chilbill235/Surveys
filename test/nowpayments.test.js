@@ -555,16 +555,24 @@ test('a refused payout minimum is reported once, and then not retried per coin',
         // One line, not one per coin.
         assert.equal(warnings.length, 1, `expected one warning, got ${warnings.length}: ${warnings.join(' | ')}`);
         assert.match(warnings[0], /payout-minimum endpoint/);
-        assert.match(warnings[0], /app minimum is used/);
-        // It must name the actual cause and carry advice that is achievable. The earlier
+        // It must name the actual cause and carry advice that is achievable. The earliest
         // version said only "allow this server's outbound IP", which cannot be done from a
         // serverless host where the address rotates -- advice that cannot be followed is worse
         // than none, because it sends the operator looking in a place with no answer.
         assert.match(warnings[0], /Invalid IP/);
         assert.match(warnings[0], /whitelist-settings/);
+        // The fix differs completely depending on whether a proxy is in play, and picking the
+        // wrong one costs the operator a round of guesswork: with a proxy configured, the
+        // address that needs whitelisting is the proxy's, not the host's, and saying "this
+        // server's IP" would send them to a host address they cannot even discover.
+        assert.match(warnings[0], /FIXIE_URL/);
+        assert.match(warnings[0], /Fixie outbound IPs are|not the ones on the NOWPayments account/);
         // And it has to say plainly that this is not breaking anything, so nobody treats a
         // recurring capability notice as an outage.
         assert.match(warnings[0], /not a failure|unaffected/);
+        // The operator still has to learn what the app is doing about it, which is to fall
+        // back to a floor it chose itself. That fact is asserted through the options payload
+        // in the fan-out test below; here the line only has to be one the reader can act on.
 
         // The circuit is open from here on: the second batch of coins makes no requests at
         // all, rather than repeating a call whose answer cannot change. The first batch still
@@ -601,6 +609,191 @@ test('a refused payout minimum is reported once, and then not retried per coin',
         console.log = originalLog;
         global.fetch = originalFetch;
         nowPayments.resetPayoutMinimumAvailability();
+        for (const [key, value] of Object.entries(saved)) {
+            if (value === undefined) delete process.env[key];
+            else process.env[key] = value;
+        }
+    }
+});
+
+test('a provider refusal is read from the shape NOWPayments actually sends', () => {
+    const { NowPaymentsError } = nowPayments;
+
+    // The documented error body is nested, and the useful text is one object deep. Reading only
+    // the flat shapes made every real refusal unreadable, which is how a provider that had
+    // named the exact amount that would have worked ended up answered with a bare 502.
+    const nested = new NowPaymentsError('NOWPayments /v1/payment returned 400.', {
+        status: 400,
+        providerResponse: { error: { code: 'FAILURE', message: 'Minimum amount is 0.05 BCH, you have 0.002' } }
+    });
+    assert.equal(nested.providerMessage, 'Minimum amount is 0.05 BCH, you have 0.002');
+    assert.equal(nested.isRateLimited, false);
+    assert.equal(nested.isIpRefused, false);
+
+    // The flat shapes other endpoints and versions use stay supported.
+    assert.equal(
+        new NowPaymentsError('x', { status: 400, providerResponse: { message: 'unknown currency' } }).providerMessage,
+        'unknown currency'
+    );
+    assert.equal(
+        new NowPaymentsError('x', { status: 400, providerResponse: { error: 'Access denied' } }).providerMessage,
+        'Access denied'
+    );
+
+    // A body with no usable text must read as absent, not as the string "undefined". This is
+    // the difference between the caller surfacing the provider's words and surfacing garbage.
+    for (const providerResponse of [null, {}, { error: {} }, { error: { code: 'X' } }, { error: '   ' }, 'text']) {
+        assert.equal(
+            new NowPaymentsError('x', { status: 500, providerResponse }).providerMessage,
+            null,
+            `${JSON.stringify(providerResponse)} produced a provider message`
+        );
+    }
+
+    // And the status-derived flags still key off the status, not the body.
+    assert.equal(new NowPaymentsError('x', { status: 429 }).isRateLimited, true);
+    assert.equal(new NowPaymentsError('x', { status: 403 }).isIpRefused, true);
+});
+
+test('a transport failure says why, not just that it happened', async () => {
+    const saved = { ...process.env };
+    const originalFetch = global.fetch;
+    process.env.NOWPAYMENTS_API_KEY = 'test-key';
+    delete process.env.FIXIE_URL;
+
+    const warnings = [];
+    const logger = { warn: (line) => warnings.push(line) };
+
+    try {
+        nowPayments.resetAddressValidationAvailability();
+        // The exact shape undici produces for a proxy CONNECT that fails: a generic outer
+        // message with the real reason nested one level down. The previous log printed only the
+        // outer message, so an operator saw "could not be completed" and nothing else.
+        global.fetch = async () => {
+            const outer = new Error('fetch failed');
+            outer.cause = Object.assign(new Error('getaddrinfo ENOTFOUND fixie.example'), { code: 'ENOTFOUND' });
+            throw outer;
+        };
+
+        const verdict = await nowPayments.validatePayoutAddress('bc1qexample', 'btc', { logger });
+        assert.deepEqual(verdict, { checked: false, valid: null, reason: null });
+
+        assert.equal(warnings.length, 1, `expected one warning, got ${warnings.length}`);
+        const line = warnings[0];
+        // The cause is the whole point. A log line that says only "could not be completed"
+        // costs an operator an hour of guessing and names nothing they can act on.
+        assert.match(line, /ENOTFOUND/, 'the error code did not reach the log');
+        assert.match(line, /fixie\.example/, 'the underlying host did not reach the log');
+        // And whether the proxy is even configured, which is the first thing to check and
+        // otherwise invisible from outside.
+        assert.match(line, /FIXIE_URL is unset/, 'the log does not say the proxy is not in play');
+
+        // With the proxy configured, the same failure should not claim it went out direct.
+        nowPayments.resetAddressValidationAvailability();
+        process.env.FIXIE_URL = 'http://user:pass@fixie.example:443';
+        warnings.length = 0;
+        await nowPayments.validatePayoutAddress('bc1qexample', 'btc', { logger });
+        assert.match(warnings[0], /went out via FIXIE_URL/);
+        assert.ok(!/FIXIE_URL is unset/.test(warnings[0]));
+    } finally {
+        global.fetch = originalFetch;
+        nowPayments.resetAddressValidationAvailability();
+        for (const [key, value] of Object.entries(saved)) {
+            if (value === undefined) delete process.env[key];
+            else process.env[key] = value;
+        }
+    }
+});
+
+test('an unreachable validator is asked once, not once per withdrawal', async () => {
+    const saved = { ...process.env };
+    const originalFetch = global.fetch;
+    process.env.NOWPAYMENTS_API_KEY = 'test-key';
+    delete process.env.FIXIE_URL;
+
+    const warnings = [];
+    const logger = { warn: (line) => warnings.push(line) };
+
+    try {
+        nowPayments.resetAddressValidationAvailability();
+        let calls = 0;
+        global.fetch = async () => {
+            calls += 1;
+            throw Object.assign(new Error('fetch failed'), { code: 'ECONNREFUSED' });
+        };
+
+        // Each of these is a separate withdrawal. Without a cool-off, every one of them waits
+        // out the full ten-second timeout and spends a metered proxy request to be told the
+        // same thing.
+        for (let i = 0; i < 4; i += 1) {
+            const verdict = await nowPayments.validatePayoutAddress('bc1qexample', 'btc', { logger });
+            assert.equal(verdict.checked, false);
+        }
+
+        assert.equal(calls, 1, `the provider was asked ${calls} times across four withdrawals`);
+        assert.equal(warnings.length, 1, 'the cool-off did not also suppress the repeat log');
+        assert.match(warnings[0], /5 minutes/, 'the cool-off length is not stated');
+
+        // Recovery is still detected, and the check resumes rather than staying off for good.
+        // The reset stands in for what actually ends a cool-off early -- a credential or
+        // configuration change -- because waiting out five real minutes is not something a
+        // test can do, and skipping the cool-off check here would leave the resume path
+        // untested.
+        global.fetch = async () => new Response(JSON.stringify({ is_valid: true }), {
+            status: 200, headers: { 'Content-Type': 'application/json' }
+        });
+        nowPayments.resetAddressValidationAvailability();
+        const recovered = await nowPayments.validatePayoutAddress('bc1qexample', 'btc', { logger });
+        // `checked: true` is the assertion that matters: it can only be true if the request
+        // actually went out, so the cool-off really did end rather than swallowing the call.
+        assert.deepEqual(recovered, { checked: true, valid: true, reason: null });
+        assert.equal(calls, 1, 'the failing stub was not the one contacted after recovery');
+
+        // And a fresh transport failure re-opens the cool-off and re-reports, so a proxy that
+        // is broken again after being fixed does not fail silently from then on.
+        global.fetch = async () => { throw Object.assign(new Error('fetch failed'), { code: 'ECONNRESET' }); };
+        nowPayments.resetAddressValidationAvailability();
+        await nowPayments.validatePayoutAddress('bc1qexample', 'btc', { logger });
+        assert.equal(warnings.length, 2, 'a second, later failure was never reported');
+    } finally {
+        global.fetch = originalFetch;
+        nowPayments.resetAddressValidationAvailability();
+        for (const [key, value] of Object.entries(saved)) {
+            if (value === undefined) delete process.env[key];
+            else process.env[key] = value;
+        }
+    }
+});
+
+test('a provider that answers is never cooled off, however bad the answer is', async () => {
+    const saved = { ...process.env };
+    const originalFetch = global.fetch;
+    process.env.NOWPAYMENTS_API_KEY = 'test-key';
+
+    try {
+        nowPayments.resetAddressValidationAvailability();
+        let calls = 0;
+        // A definitive rejection is a real answer, not a transport failure. Caching that verdict
+        // for five minutes would let someone resubmit the same bad address repeatedly, and would
+        // also mean the very first address a user typed was the one that got checked.
+        global.fetch = async () => {
+            calls += 1;
+            return new Response(JSON.stringify({ is_valid: false, error: 'Not a valid address' }), {
+                status: 200, headers: { 'Content-Type': 'application/json' }
+            });
+        };
+
+        const first = await nowPayments.validatePayoutAddress('bc1qexample', 'btc');
+        const second = await nowPayments.validatePayoutAddress('bc1qexample', 'btc');
+
+        assert.equal(first.checked, true);
+        assert.equal(first.valid, false);
+        assert.equal(first.reason, 'Not a valid address');
+        assert.deepEqual(second, first);
+        assert.equal(calls, 2, 'a definitive rejection was cached instead of re-checked');
+    } finally {
+        global.fetch = originalFetch;
+        nowPayments.resetAddressValidationAvailability();
         for (const [key, value] of Object.entries(saved)) {
             if (value === undefined) delete process.env[key];
             else process.env[key] = value;

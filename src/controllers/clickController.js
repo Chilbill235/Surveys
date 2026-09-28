@@ -135,6 +135,25 @@ function redirectNoStore(res, status, location) {
     return res.redirect(status, location);
 }
 
+/**
+ * Sends an error in the shape the caller can parse.
+ *
+ * The same handler serves a browser navigation (`GET /click/:offerId`, which is
+ * a redirect and never sees a body) and a JSON API call (`POST /api/click/:offerId`,
+ * which parses JSON). The success path already respects that split -- JSON for
+ * POST, redirect for GET -- but every error path used `res.send`, so a fetch
+ * caller received `"Invalid offer ID."` and failed on `.json()` rather than
+ * reading the reason. This makes the failure shape match the success shape.
+ *
+ * `isApi` is passed by the caller rather than read from `req.method`, because
+ * the redirect decision and the response-shape decision are the same decision
+ * and should not be able to drift.
+ */
+function sendError(res, isApi, status, message) {
+    if (isApi) return res.status(status).json({ error: message });
+    return res.status(status).send(message);
+}
+
 // ---------------------------------------------------------------------------
 // Click tracking
 // ---------------------------------------------------------------------------
@@ -164,15 +183,19 @@ async function loadOfferTrackingUrl(offerId) {
 }
 
 async function createTrackedClick(req, res, redirectImmediately) {
+    // `redirectImmediately` and the response shape are the same decision, so the
+    // flag is reused rather than read from `req.method` twice.
+    const isApi = !redirectImmediately;
+
     const offerId = req.params.offerId;
     if (!offerId || offerId.length > MAX_OFFER_ID_LENGTH) {
-        return res.status(400).send('Invalid offer ID.');
+        return sendError(res, isApi, 400, 'Invalid offer ID.');
     }
 
     try {
         const offer = await loadOfferTrackingUrl(offerId);
         if (offer.status === 'not_found') {
-            return res.status(404).send('Offer not found.');
+            return sendError(res, isApi, 404, 'Offer not found.');
         }
         if (offer.status === 'demo_unavailable') {
             // 404, because from this deployment's point of view the offer does not exist.
@@ -180,11 +203,16 @@ async function createTrackedClick(req, res, redirectImmediately) {
             // see in front of them is indistinguishable from a bug, and this one was
             // reported as a broken survey rather than as a disabled test offer.
             console.warn(`Refused a click on demo offer ${offerId}: demo mode is off in this deployment.`);
-            return res.status(404).send('That offer is a test offer and is not available in this environment.');
+            return sendError(
+                res,
+                isApi,
+                404,
+                'That offer is a test offer and is not available in this environment.'
+            );
         }
         if (offer.status === 'invalid') {
             console.error(`Offer ${offerId} has an invalid tracking URL.`);
-            return res.status(502).send('Offer tracking is temporarily unavailable.');
+            return sendError(res, isApi, 502, 'Offer tracking is temporarily unavailable.');
         }
 
         // The engage handler is what actually redirects to the advertiser, but a
@@ -193,13 +221,14 @@ async function createTrackedClick(req, res, redirectImmediately) {
         const problem = advertiserUrlProblem(offer.url, req);
         if (problem) {
             console.error(`Offer ${offerId} rejected: ${problem}`);
-            return res.status(502).send(problem);
+            return sendError(res, isApi, 502, problem);
         }
 
         const clickId = uuidv4();
         const engageUrl = buildEngageUrl(clickId);
         if (!engageUrl) {
-            return res.status(503).send('The public tracking URL is not configured.');
+            console.error('Cannot build the engage URL: the public base URL is not configured.');
+            return sendError(res, isApi, 503, 'The public tracking URL is not configured.');
         }
 
         const userId = req.user?.id ?? null;
@@ -217,8 +246,11 @@ async function createTrackedClick(req, res, redirectImmediately) {
         }
         return res.json({ redirectUrl: engageUrl });
     } catch (error) {
-        console.error('Tracking Error:', error.message);
-        return res.status(500).send('Tracking error occurred.');
+        // The offer id is in the log line, not only in the message the user
+        // sees. A bare `Tracking Error: <message>` used to be the only record
+        // of the failure, and it named neither the offer nor the click.
+        console.error(`Tracking Error for offer ${offerId}:`, error.message);
+        return sendError(res, isApi, 500, 'Tracking error occurred.');
     }
 }
 
@@ -260,16 +292,32 @@ async function engageClick(req, res) {
                     `Click ${clickId} is for a demo offer, but demo mode is off in this ` +
                     'deployment, so it cannot be completed here. Returning to the catalog.'
                 );
+
+                // The query parameter is set through `URL.searchParams` rather than by
+                // concatenating `?notice=...` onto the URL string. The concatenated form
+                // only produced a correct URL because `buildPublicUrl` currently returns
+                // a URL with no query string; if that ever changed -- `ENGAGE_CATALOG_PATH`
+                // gaining a parameter, or the resolver adding a `ref` -- the result would
+                // be `...?ref=x?notice=...`, which the browser would parse as a single
+                // `ref` value and silently drop the notice.
                 const catalogUrl = buildPublicUrl(ENGAGE_CATALOG_PATH);
+                if (catalogUrl) {
+                    catalogUrl.searchParams.set('notice', 'demo-unavailable');
+                    return redirectNoStore(res, 302, catalogUrl.toString());
+                }
                 // The relative fallback keeps the notice. Returning a bare `/offers` here
                 // would land the user on the catalog with no explanation, which is the
                 // dead end this branch exists to avoid -- and it would do so exactly when
                 // the deployment is misconfigured enough that `buildPublicUrl` fails.
-                const fallback = `${ENGAGE_CATALOG_PATH}?notice=demo-unavailable`;
-                return redirectNoStore(res, 302, catalogUrl ? `${catalogUrl.toString()}?notice=demo-unavailable` : fallback);
+                return redirectNoStore(
+                    res,
+                    302,
+                    `${ENGAGE_CATALOG_PATH}?notice=demo-unavailable`
+                );
             }
             const demoUrl = buildPublicUrl(DEMO_PATH);
             if (!demoUrl) {
+                console.error('Cannot build the demo URL: the public base URL is not configured.');
                 return res.status(503).send('The public tracking URL is not configured.');
             }
             demoUrl.searchParams.set('click_id', clickId);
@@ -294,7 +342,9 @@ async function engageClick(req, res) {
         advertiserUrl.searchParams.set(clickParameter, clickId);
         return redirectNoStore(res, 302, advertiserUrl.toString());
     } catch (error) {
-        console.error('Engage Tracking Error:', error.message);
+        // The click id is in the log line for the same reason it is in the
+        // others: a bare message did not identify which click failed.
+        console.error(`Engage Tracking Error for click ${clickId}:`, error.message);
         return res.status(500).send('Tracking error occurred.');
     }
 }
