@@ -17,17 +17,22 @@
     "check:frontend": "node scripts/check-frontend.js",
     "check:responsive": "node scripts/check-responsive.js",
     "check:contrast": "node scripts/check-contrast.js",
-    "check": "npm run check:frontend && npm run check:responsive && npm run check:contrast"
+    "check:a11y": "node scripts/check-a11y.js",
+    "icons": "node scripts/generate-icons.js && node scripts/inject-icons.js",
+    "check": "npm run check:frontend && npm run check:responsive && npm run check:contrast && npm run check:a11y"
   },
   "dependencies": {
+    "@vercel/analytics": "^2.0.1",
     "axios": "^1.6.0",
     "cors": "^2.8.5",
     "dotenv": "^16.3.1",
     "express": "^4.18.2",
     "helmet": "^8.3.0",
     "jsonwebtoken": "^9.0.2",
+    "next": "^16.3.6",
     "pg": "^8.11.3",
     "qrcode": "^1.5.4",
+    "react": "^19.3.0",
     "stripe": "^22.6.2",
     "uuid": "^9.0.1"
   },

@@ -420,6 +420,13 @@ async function withPayoutFetch(run, { verifyStatus = 200, payoutBody = { batch_w
                 status: verifyStatus, headers: { 'Content-Type': 'application/json' }
             });
         }
+        // The documented form: the batch id is in the path, not the body. Matched before the
+        // bare `/v1/payout` rule, which would otherwise swallow it.
+        if (/\/v1\/payout\/[^/]+\/verify$/.test(target)) {
+            return new Response(JSON.stringify({ success: true }), {
+                status: verifyStatus, headers: { 'Content-Type': 'application/json' }
+            });
+        }
         if (target.endsWith('/v1/payout')) {
             return new Response(JSON.stringify(payoutBody), {
                 status: 200, headers: { 'Content-Type': 'application/json' }
@@ -453,11 +460,14 @@ test('verifying a batch posts the batch id and a six-digit code, and is refused 
     assert.ok(auth, 'payout endpoints need a JWT, which comes from the account credentials');
     assert.equal(auth.body.email, 'ops@example.test');
 
-    const verify = seen.find((call) => call.url.endsWith('/v1/payout/verify'));
-    assert.ok(verify, 'the verify endpoint was not called');
-    // The id must be the one that was created, or the confirmation applies to nothing.
-    assert.equal(verify.body.batch_withdrawal_id, 'batch-1');
-    assert.match(verify.body.verification_code, /^\d{6}$/);
+    const verify = seen.find((call) => call.url.endsWith('/v1/payout/batch-1/verify'));
+    assert.ok(verify, `the documented verify endpoint was not called; saw ${seen.map((c) => c.url).join(', ')}`);
+    // The id goes in the path, per the provider's API reference. The widely-circulated
+    // alternative puts it in the body, which the provider answers with a 404 -- and a 404 read
+    // as "bad 2FA code" sends the operator to debug their authenticator instead.
+    assert.match(verify.url, /\/v1\/payout\/batch-1\/verify$/);
+    assert.equal(verify.body.verification_code.length, 6);
+    assert.equal('batch_withdrawal_id' in verify.body, false, 'the id belongs in the path');
     assert.equal(verify.headers.Authorization, 'Bearer jwt-token');
 
     // Without a secret there is no code to generate, and the call must not be attempted: an
@@ -496,3 +506,104 @@ test('a batch carries the callback URL, so a finished payout is noticed', async 
     assert.equal('ipn_callback_url' in noCallback.body, false);
 });
 
+
+/**
+ * The payout-minimum endpoint is restricted per NOWPayments account and answers 403 for an
+ * account that has not enabled it. The provider's own text ends in the literal "undefined",
+ * because it cannot resolve the caller's IP.
+ *
+ * These pin the two things that made that restriction painful before: it was reported once
+ * per coin, so fourteen identical warnings, and the endpoint was re-requested for every coin
+ * on every refresh even though the answer could not change.
+ */
+test('a refused payout minimum is reported once, and then not retried per coin', async () => {
+    const saved = Object.fromEntries(
+        ['NOWPAYMENTS_API_KEY', 'NOWPAYMENTS_IPN_SECRET'].map((key) => [key, process.env[key]])
+    );
+    const originalFetch = global.fetch;
+    const warnings = [];
+    const recovery = [];
+    const originalWarn = console.warn;
+    const originalLog = console.log;
+    let calls = 0;
+
+    process.env.NOWPAYMENTS_API_KEY = 'test-key';
+    process.env.NOWPAYMENTS_IPN_SECRET = 'test-ipn-secret';
+    console.warn = (...args) => warnings.push(args.join(' '));
+    console.log = (...args) => recovery.push(args.join(' '));
+
+    global.fetch = async (url) => {
+        if (String(url).includes('/payout-withdrawal/min-amount/')) {
+            calls += 1;
+            // The provider's literal response, including its unresolved "undefined".
+            return new Response(
+                JSON.stringify({ error: 'Access denied | Invalid IP - undefined' }),
+                { status: 403, headers: { 'Content-Type': 'application/json' } }
+            );
+        }
+        return originalFetch(url, {});
+    };
+
+    try {
+        nowPayments.resetPayoutMinimumAvailability();
+
+        const coins = ['usdttrc20', 'eth', 'usdterc20', 'btc', 'usdtmatic', 'usdcerc20', 'bch', 'ltc', 'sol', 'doge', 'xrp'];
+        const results = await Promise.all(coins.map((coin) => nowPayments.getPayoutMinimum(coin)));
+
+        // Every coin still resolves, so the withdrawal form keeps working.
+        assert.deepEqual(results, coins.map(() => null));
+        // One line, not one per coin.
+        assert.equal(warnings.length, 1, `expected one warning, got ${warnings.length}: ${warnings.join(' | ')}`);
+        assert.match(warnings[0], /payout-minimum endpoint/);
+        assert.match(warnings[0], /app minimum is used/);
+        // It must name the actual cause and carry advice that is achievable. The earlier
+        // version said only "allow this server's outbound IP", which cannot be done from a
+        // serverless host where the address rotates -- advice that cannot be followed is worse
+        // than none, because it sends the operator looking in a place with no answer.
+        assert.match(warnings[0], /Invalid IP/);
+        assert.match(warnings[0], /whitelist-settings/);
+        // And it has to say plainly that this is not breaking anything, so nobody treats a
+        // recurring capability notice as an outage.
+        assert.match(warnings[0], /not a failure|unaffected/);
+
+        // The circuit is open from here on: the second batch of coins makes no requests at
+        // all, rather than repeating a call whose answer cannot change. The first batch still
+        // costs one request per coin, because they are all started before the first refusal
+        // has landed -- which is why the caller fetches concurrently.
+        const afterFirstBatch = calls;
+        await Promise.all(coins.map((coin) => nowPayments.getPayoutMinimum(coin)));
+        assert.equal(calls, afterFirstBatch, 'a later refresh must not re-request a refused endpoint');
+
+        // Still exactly one warning: the later refusals are silent, not merely coalesced.
+        assert.equal(warnings.length, 1);
+
+        // Once the cool-off is cleared the endpoint is tried again, and a success both returns
+        // a real minimum and reports availability.
+        nowPayments.resetPayoutMinimumAvailability();
+        global.fetch = async (url) => {
+            if (String(url).includes('/payout-withdrawal/min-amount/')) {
+                return new Response(JSON.stringify({ min_amount: 7.5 }), {
+                    status: 200, headers: { 'Content-Type': 'application/json' }
+                });
+            }
+            return originalFetch(url, {});
+        };
+        assert.equal(await nowPayments.getPayoutMinimum('usdttrc20'), 7.5);
+
+        // Recovery is announced. Silence on recovery is indistinguishable from never having
+        // retried, so an operator who fixed the dashboard would have no way to confirm it.
+        assert.ok(
+            recovery.some((line) => /now answering/i.test(line)),
+            `expected a recovery line, got: ${recovery.join(' | ')}`
+        );
+    } finally {
+        console.warn = originalWarn;
+        console.log = originalLog;
+        global.fetch = originalFetch;
+        nowPayments.resetPayoutMinimumAvailability();
+        for (const [key, value] of Object.entries(saved)) {
+            if (value === undefined) delete process.env[key];
+            else process.env[key] = value;
+        }
+    }
+});

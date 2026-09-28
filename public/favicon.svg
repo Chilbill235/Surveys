@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" role="img" aria-label="RewardZone">
+  <defs>
+    <linearGradient id="rz" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="rgb(212,251,82)"/>
+      <stop offset="1" stop-color="rgb(196,238,57)"/>
+    </linearGradient>
+  </defs>
+  <rect x="4.5" y="4.5" width="91" height="91" rx="22" fill="url(#rz)"/>
+  <g fill="rgb(19,28,74)">
+    <path d="M24 22h22a15 15 0 0 1 0 30H24z"/>
+    <path d="M46 22h-4v8h4a4 4 0 0 0 0-8z" fill="url(#rz)"/>
+    <path d="M44 48h10.5L68 78H56.5z"/>
+  </g>
+</svg>

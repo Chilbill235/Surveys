@@ -146,7 +146,47 @@ button { cursor: pointer; }
 button:disabled { cursor: not-allowed; }
 
 input[type='number'] { font-variant-numeric: tabular-nums; }
-select { appearance: none; background-image: linear-gradient(45deg, transparent 50%, var(--muted) 50%), linear-gradient(135deg, var(--muted) 50%, transparent 50%); background-position: right 16px center, right 11px center; background-size: 5px 5px, 5px 5px; background-repeat: no-repeat; padding-right: 34px !important; }
+
+/**
+ * The select is a real `<select>`, not a custom listbox.
+ *
+ * This is a deliberate choice, and the reason is mobile. A JavaScript listbox can be styled
+ * exactly how you like, and it will look wrong on the platform that matters most: phones
+ * render the OS picker for a native `<select>`, which is a full-height, thumb-friendly wheel
+ * that behaves the way the user already knows. Replacing it with a styled div makes the
+ * desktop dropdown prettier and the phone one worse, and hands keyboard and screen-reader
+ * behaviour to code that would then be ours to get right.
+ *
+ * What can be improved is the closed state, which is the only part this stylesheet owns: the
+ * chevron, the height, the padding, and the hover and disabled states. The popup that opens
+ * is drawn by the operating system and no page can restyle it.
+ */
+select {
+    appearance: none;
+    /* A mask rather than a background-image, so the chevron is painted in the current text
+       colour and follows dark mode automatically. A data-URI background cannot reference
+       `currentColor`, which is why the earlier version needed a hard-coded grey that went
+       invisible against a dark control. */
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 8'%3E%3Cpath d='M1 1.5 6 6.5 11 1.5' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 8'%3E%3Cpath d='M1 1.5 6 6.5 11 1.5' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+    -webkit-mask-repeat: no-repeat;
+    mask-repeat: no-repeat;
+    -webkit-mask-position: right 15px center;
+    mask-position: right 15px center;
+    -webkit-mask-size: 12px 8px;
+    mask-size: 12px 8px;
+    padding-right: 40px;
+    /* Long option text is ellipsised rather than widening the control or clipping under the
+       chevron, which is what a plain select does with a currency name it cannot fit. */
+    text-overflow: ellipsis;
+}
+/* The chevron must not sit on top of a disabled control, where it would read as an enabled
+   affordance. */
+select:disabled {
+    -webkit-mask-image: none;
+    mask-image: none;
+    padding-right: 12px;
+}
 
 :focus-visible {
     outline: 3px solid var(--coral-500);
@@ -396,22 +436,42 @@ h1, h2, h3, h4 { line-height: 1.15; text-wrap: balance; font-weight: 400; }
 /* 6. Buttons --------------------------------------------------------------- */
 
 .button {
-    min-height: 42px;
+    /* 44px is the smallest target a thumb can reliably hit; the mobile breakpoint lifts
+       this again. It was 42px, which is below the guideline and measurably harder to hit
+       one-handed. */
+    min-height: 44px;
     display: inline-flex;
     align-items: center;
     justify-content: center;
     gap: 8px;
     border: 1px solid transparent;
-    border-radius: var(--r-sm);
-    padding: 0 16px;
+    /* Matches the form controls. A 6px button next to a 10px input in the same column reads
+       as two different systems rather than one form. */
+    border-radius: var(--r-md);
+    padding: 0 18px;
     font-weight: 700;
     text-decoration: none;
     white-space: nowrap;
-    transition: background-color 0.16s var(--ease), color 0.16s var(--ease), border-color 0.16s var(--ease), transform 0.12s var(--ease), box-shadow 0.16s var(--ease);
+    /* Two transitions, not one: the colours ease, the lift is immediate. Easing a transform
+       makes a press feel like the button is lagging behind the finger. */
+    transition: background-color 0.16s var(--ease), color 0.16s var(--ease), border-color 0.16s var(--ease), box-shadow 0.16s var(--ease), transform 0.12s var(--ease);
 }
 
 .button:active:not(:disabled) { transform: translateY(1px); }
-.button:disabled { opacity: 0.5; }
+
+/* Disabled is a real state here, not an error: the deposit and withdraw buttons are disabled
+   until an account is connected, which is a normal step rather than something broken. So it
+   is dimmed and desaturated but keeps its shape and its label -- the button still says what
+   it would do, which is what tells the user what to do next. */
+.button:disabled {
+    cursor: not-allowed;
+    opacity: 0.45;
+    /* Belt and braces: several variants lift on hover, and a lift that still fires on a
+       disabled button reads as "press me". */
+    transform: none;
+    box-shadow: none;
+}
+.button:disabled:hover { transform: none; }
 
 .button-light { color: #fff; border-color: rgb(255 255 255 / 0.5); background: rgb(255 255 255 / 0.08); }
 .button-light:hover:not(:disabled) { background: rgb(255 255 255 / 0.18); border-color: rgb(255 255 255 / 0.7); }
@@ -871,14 +931,48 @@ h1, h2, h3, h4 { line-height: 1.15; text-wrap: balance; font-weight: 400; }
 
 .form-control {
     width: 100%;
-    min-height: 44px;
+    /* 48px rather than the 44px minimum. A thumb needs the target, and on a phone the
+       difference between 44 and 48 is the difference between hitting the field and hitting
+       the gap above it. Inputs, selects, and the primary buttons all sit at this height so
+       the form reads as one column. */
+    min-height: 48px;
     border: 1px solid var(--line-strong);
-    border-radius: var(--r-sm);
-    padding: 10px 12px;
+    border-radius: var(--r-md);
+    padding: 11px 13px;
     color: var(--ink);
     background: var(--surface);
     outline: none;
-    transition: border-color 0.16s var(--ease), box-shadow 0.16s var(--ease);
+    transition: border-color 0.16s var(--ease), box-shadow 0.16s var(--ease), background-color 0.16s var(--ease);
+}
+/* The border, not a background tint. On a fielded form a filled background on hover makes the
+   control read as selected, and several of these sit directly above each other. */
+.form-control:hover:not(:disabled):not(:focus) { border-color: var(--indigo-700); }
+.form-control:focus {
+    /* The focus ring is the page's coral, matching `:focus-visible` everywhere else, so
+       keyboard focus is the same colour everywhere in the product. */
+    border-color: var(--coral-500);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--coral-500) / 0.28);
+}
+/* Disabled controls previously kept full-strength text and a live border, so they looked
+   available and only refused to respond. Both the text and the border are stepped back. */
+.form-control:disabled {
+    color: var(--faint);
+    background: var(--surface-2);
+    border-color: var(--line);
+    cursor: not-allowed;
+}
+/* A browser's own autofill background is a near-opaque yellow that survives any background
+   token and makes the field unreadable in dark mode. The inset shadow is the only way to
+   tint it, and `-webkit-text-fill-color` is needed because Chrome forces its own text colour
+   too. The delay is not a delay: the transition is set to 0 so the browser's fill lands
+   instantly, which is what stops the field flashing from one colour to another. */
+.form-control:-webkit-autofill,
+.form-control:-webkit-autofill:hover,
+.form-control:-webkit-autofill:focus {
+    -webkit-text-fill-color: var(--ink);
+    caret-color: var(--ink);
+    box-shadow: 0 0 0 1000px var(--surface-2) inset;
+    transition: background-color 0s 0s;
 }
 .form-control::placeholder { color: var(--faint); }
 textarea.form-control { min-height: 96px; resize: vertical; }
@@ -1022,9 +1116,13 @@ textarea.form-control { min-height: 96px; resize: vertical; }
 }
 
 .amount-presets { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin-top: 10px; }
-.amount-presets button { min-height: 40px; border: 1px solid var(--line-strong); border-radius: var(--r-sm); color: var(--heading); background: var(--surface); font-weight: 700; transition: border-color 0.16s var(--ease), background-color 0.16s var(--ease), color 0.16s var(--ease); }
+/* 44px and the shared radius, so the four preset chips line up with the button next to them
+   instead of being a row of smaller, differently-shaped pills. */
+.amount-presets button { min-height: 44px; border: 1px solid var(--line-strong); border-radius: var(--r-md); color: var(--heading); background: var(--surface); font-weight: 700; transition: border-color 0.16s var(--ease), background-color 0.16s var(--ease), color 0.16s var(--ease); }
 .amount-presets button:hover { border-color: var(--indigo-700); color: var(--accent); }
-.amount-presets button.is-active { border-color: var(--indigo-900); color: var(--indigo-900); background: var(--lime-400); }
+/* Selected state uses an inset ring rather than a thicker border, so choosing a preset does
+   not resize the chip and shift the row by two pixels. */
+.amount-presets button.is-active { border-color: var(--indigo-900); color: var(--indigo-900); background: var(--lime-400); box-shadow: inset 0 0 0 1px var(--indigo-900); }
 
 .deposit-method-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
 .deposit-method-option {
@@ -1045,11 +1143,22 @@ textarea.form-control { min-height: 96px; resize: vertical; }
 .deposit-method-option strong { font-size: var(--step-0); }
 .deposit-method-option span { color: var(--muted); font-size: var(--step--1); }
 .deposit-method-option:hover:not(:disabled) { border-color: var(--indigo-700); background: var(--indigo-050); }
-.deposit-method-option.is-active { border: 2px solid var(--indigo-700); padding: 9px 12px; background: var(--indigo-100); box-shadow: var(--shadow-sm); }
+/* Selection is drawn as an inset ring rather than a 2px border with compensating padding.
+   The old version had to shrink the padding by a pixel to hold the box still, which works
+   only until anyone changes the padding -- and selecting a payment method is exactly the
+   moment a card must not jump, because the two cards are side by side in a grid and a
+   resize moves the one you did not pick. */
+.deposit-method-option.is-active {
+    border-color: var(--indigo-700);
+    background: var(--indigo-100);
+    box-shadow: inset 0 0 0 2px var(--indigo-700), var(--shadow-sm);
+}
 .deposit-method-option:disabled { color: var(--faint); background: var(--surface-2); cursor: not-allowed; }
 .deposit-method-option:disabled span { color: var(--muted); }
 
-#deposit-currency { min-height: 46px; font-weight: 700; }
+/* No height override: the select already sits at the shared 48px control height, and a 46px
+   override left it two pixels shorter than the amount field directly above it. */
+#deposit-currency { font-weight: 700; }
 #deposit-submit { min-height: 50px; margin-top: 8px; font-size: var(--step-0); }
 
 .deposit-instructions {
@@ -1123,11 +1232,15 @@ textarea.form-control { min-height: 96px; resize: vertical; }
 }
 
 .max-button {
-    min-height: 30px;
+    /* The same height as the field it sits inside. It was 30px beside a 48px input, which
+       made the row look like a text field with a stray tag on the end, and left a target far
+       below the size of a thumb. Matching the input is what makes it read as part of the
+       control rather than as a separate object. */
+    min-height: 48px;
     flex: 0 0 auto;
     border: 1px solid var(--line-strong);
     border-radius: var(--r-pill);
-    padding: 0 14px;
+    padding: 0 18px;
     color: var(--accent);
     background: var(--surface);
     font-size: var(--step--1);
@@ -1557,13 +1670,21 @@ textarea.form-control { min-height: 96px; resize: vertical; }
     .action-bar-item { min-height: 50px; font-size: 0.66rem; }
 
     .balance-card { flex-direction: column; align-items: stretch; gap: 12px; }
-    .balance-card .max-button { width: 100%; min-height: 40px; }
+    /* Full width at this size, and still at the shared control height. The old value here was
+       40px, which made the button *smaller* on a phone than on a desktop -- the opposite of
+       what a touch target should do. */
+    .balance-card .max-button { width: 100%; min-height: 48px; }
     .receipt-qr svg { width: 168px; height: 168px; }
     .confirmation-steps li { padding-left: 30px; }
 }
 
 @media (pointer: coarse) {
-    .button, .icon-button, .amount-presets button, .choice, .deposit-method-option, .auth-mode-button, .start-button { min-height: 48px; }
+    /* Every interactive surface a finger can land on, at one shared height, so a form reads
+       as a single column of equal rows on a phone. `.max-button` and `#deposit-submit` are
+       listed for the same reason: they are buttons in that column, and a check that does not
+       name them cannot catch one quietly dropping below the rest. */
+    .button, .icon-button, .amount-presets button, .choice, .deposit-method-option,
+    .auth-mode-button, .start-button, .max-button, .deposit-method-options button { min-height: 48px; }
     .catalog-filters .form-control, .search-field input, .sort-field select { height: 48px; }
     .filter-chip { min-height: 48px; }
     .form-control { min-height: 48px; }

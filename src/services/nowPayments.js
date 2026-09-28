@@ -574,29 +574,111 @@ async function getPayoutFee(currency, amount) {
 /**
  * Minimum NOWPayments will payout for a coin, in that coin, or null when unknown.
  *
- * This endpoint is access-restricted: on an account that has not enabled it the provider
- * answers 403 "Access denied | Invalid IP", which is a configuration fact rather than a
- * fault, and is reported as such instead of being swallowed. The caller falls back to its
- * own floor, so an unavailable minimum never blocks a withdrawal.
+ * This endpoint is access-restricted on the provider side. An account that has not enabled it
+ * gets 403 "Access denied | Invalid IP", and the provider cannot even name the address it
+ * thinks is calling -- its own response ends in the literal text "undefined". That is a
+ * configuration fact about the NOWPayments account, not a fault here, and the caller already
+ * falls back to the app's own floor, so an unavailable minimum never blocks a withdrawal.
+ *
+ * That fallback is also why the refusal is not worth logging loudly, or retrying hard. It was
+ * previously reported once per coin per refresh: fourteen identical warnings, and fourteen
+ * HTTP requests that cannot succeed, every time the limits cache expired. The state below
+ * makes it one log line and no requests at all until the cool-off expires, and any later
+ * refusal is silent because it has already been reported.
  */
+let payoutMinimumUnavailableUntil = 0;
+let payoutMinimumRefusalReported = false;
+
+/**
+ * Whether this process has seen a refusal, and so owes the operator a confirmation if the
+ * endpoint starts working.
+ *
+ * Deliberately not cleared by `resetPayoutMinimumAvailability`, which only ends the cool-off.
+ * Recovery is a fact about the account, not about the timer: if the endpoint answers after a
+ * refusal, the operator should hear that, whether or not something restarted the cool-off in
+ * between. It is cleared only by the recovery itself, so exactly one confirmation is logged
+ * per refusal.
+ */
+let payoutMinimumRefusalSeen = false;
+
+/** In-flight requests, so two concurrent callers for one coin cause one HTTP request. */
+const payoutMinimumInFlight = new Map();
+
+/** How long to stop asking after a refusal, and how to undo it when configuration changes. */
+const PAYOUT_MINIMUM_RETRY_MS = 15 * 60 * 1000;
+
 async function getPayoutMinimum(currency) {
     const coin = String(currency).toLowerCase();
-    try {
-        const result = await request('GET', `/v1/payout-withdrawal/min-amount/${encodeURIComponent(coin)}`, {
-            timeoutMs: 8000
-        });
-        const minimum = Number(result?.min_amount ?? result?.amount);
-        if (Number.isFinite(minimum) && minimum > 0) return minimum;
-        return null;
-    } catch (error) {
-        if (error instanceof NowPaymentsError && error.status === 403) {
-            console.warn(
-                `NOWPayments refused the payout minimum for ${coin} (${error.providerMessage ?? error.message}). ` +
-                'This endpoint is not enabled for the account, so the app minimum is used instead.'
-            );
+    if (Date.now() < payoutMinimumUnavailableUntil) return null;
+
+    // The caller fetches every coin concurrently, so without this a second caller for the
+    // same coin would repeat a request that is already in flight.
+    if (payoutMinimumInFlight.has(coin)) return payoutMinimumInFlight.get(coin);
+
+    const inFlight = (async () => {
+        try {
+            const result = await request('GET', `/v1/payout-withdrawal/min-amount/${encodeURIComponent(coin)}`, {
+                timeoutMs: 8000
+            });
+            const minimum = Number(result?.min_amount ?? result?.amount);
+            if (Number.isFinite(minimum) && minimum > 0) {
+                // The endpoint answered, so any earlier refusal no longer applies.
+                if (payoutMinimumRefusalSeen) {
+                    // Said positively as well as negatively. Without it the only sign that a
+                    // dashboard change had taken effect is the absence of a warning, which is
+                    // indistinguishable from a process that simply has not re-checked yet.
+                    console.log(
+                        'NOWPayments is now answering the payout-minimum endpoint; provider ' +
+                        'payout minimums are in use.'
+                    );
+                }
+                payoutMinimumUnavailableUntil = 0;
+                payoutMinimumRefusalReported = false;
+                payoutMinimumRefusalSeen = false;
+                return minimum;
+            }
+            return null;
+        } catch (error) {
+            if (error instanceof NowPaymentsError && error.status === 403) {
+                payoutMinimumUnavailableUntil = Date.now() + PAYOUT_MINIMUM_RETRY_MS;
+                if (!payoutMinimumRefusalReported) {
+                    payoutMinimumRefusalReported = true;
+                    payoutMinimumRefusalSeen = true;
+                    console.warn(
+                        `NOWPayments refused the payout-minimum endpoint (${error.providerMessage ?? error.message}). ` +
+                        'It is restricted per account, so the app minimum is used for every coin and no further ' +
+                        `requests will be made for ${Math.round(PAYOUT_MINIMUM_RETRY_MS / 60000)} minutes. ` +
+                        'This is a capability notice, not a failure: withdrawals are unaffected. ' +
+                        'To enable provider payout minimums, either whitelist this server\'s IPv4 and IPv6 in the ' +
+                        'NOWPayments dashboard, or -- if the outbound address rotates, as it does on serverless ' +
+                        'hosting -- request that IP whitelisting be disabled at ' +
+                        'https://account.nowpayments.io/whitelist-settings'
+                    );
+                }
+            }
+            return null;
+        } finally {
+            payoutMinimumInFlight.delete(coin);
         }
-        return null;
-    }
+    })();
+
+    payoutMinimumInFlight.set(coin, inFlight);
+    return inFlight;
+}
+
+/**
+ * Ends the cool-off, so the next check asks the provider again.
+ *
+ * Exists so a deployment whose NOWPayments access was just enabled does not sit out the rest
+ * of the cool-off showing app minimums, and so a test can start from a clean slate.
+ *
+ * It does not clear `payoutMinimumRefusalSeen`. A refusal still owes the operator a
+ * confirmation if the endpoint recovers, and that debt outlives the cool-off, so re-arming the
+ * check here cannot silence the follow-up.
+ */
+function resetPayoutMinimumAvailability() {
+    payoutMinimumUnavailableUntil = 0;
+    payoutMinimumRefusalReported = false;
 }
 
 /**
@@ -624,6 +706,15 @@ async function submitPayoutBatch(entries, { logger = console, ipnCallbackUrl = n
     const list = Array.isArray(entries) ? entries : [];
     if (list.length === 0) return { batchId: null, withdrawals: [] };
 
+    // `payoutId` is our correlation key back to a withdrawal, and the provider's own docs do not
+    // list it among the accepted per-withdrawal fields. It has never been confirmed against a
+    // funded account, so the first live send is the real test. If the batch is refused with
+    // `withdrawals[0] does not match any of the allowed types`, the field is not accepted under
+    // that name: drop it from the body and match the response on `address` instead, which is
+    // unique per claim because a withdrawal row is claimed once. Nothing else needs to change --
+    // the response mapping below already falls back across `payoutId`/`payout_id`, and
+    // `withdrawalIdFromPayoutId` is only reached for entries we sent, so a response keyed some
+    // other way is not applied rather than applied to the wrong row.
     const body = {
         withdrawals: list.map((entry) => {
             const record = {
@@ -804,6 +895,17 @@ function twoFactorConfigured() {
  * have consumed most of the token's five-minute life, and a verify that fails on an expired
  * token would be reported as a rejected 2FA code, which sends the operator looking in exactly
  * the wrong place.
+ *
+ * The batch id goes in the *path*, as the provider's own API reference documents:
+ *
+ *     POST /v1/payout/:batch-withdrawal-id/verify   body: { "verification_code": "123456" }
+ *
+ * A widely-circulated integration snippet instead posts to `/v1/payout/verify` with the id in
+ * the body. That form is tried only if the documented path answers 404, which is unambiguous
+ * -- a 404 means "no such endpoint here", not "rejected". Preferring the documented shape
+ * matters because sending the wrong one would otherwise be reported as a rejected 2FA code,
+ * which is indistinguishable from a bad code and sends the operator to check their
+ * authenticator instead of the integration.
  */
 async function verifyPayoutBatch(batchId, { verificationCode, logger = console } = {}) {
     const batch = String(batchId || '').trim();
@@ -821,11 +923,28 @@ async function verifyPayoutBatch(batchId, { verificationCode, logger = console }
         throw new NowPaymentsError('Could not generate a NOWPayments 2FA code from the configured secret.');
     }
 
-    await request('POST', '/v1/payout/verify', {
-        authToken: await getAuthToken(),
-        body: { batch_withdrawal_id: batch, verification_code: code },
-        timeoutMs: 20000
-    });
+    const encoded = encodeURIComponent(batch);
+    try {
+        await request('POST', `/v1/payout/${encoded}/verify`, {
+            authToken: await getAuthToken(),
+            body: { verification_code: code },
+            timeoutMs: 20000
+        });
+    } catch (error) {
+        const missingEndpoint = error instanceof NowPaymentsError
+            && (error.status === 404 || error.status === 405);
+        if (!missingEndpoint) throw error;
+
+        logger.warn(
+            `NOWPayments has no POST /v1/payout/{id}/verify endpoint (${error.status}); ` +
+            'falling back to the id-in-the-body form.'
+        );
+        await request('POST', '/v1/payout/verify', {
+            authToken: await getAuthToken(),
+            body: { batch_withdrawal_id: batch, verification_code: code },
+            timeoutMs: 20000
+        });
+    }
 
     logger.log(`Verified NOWPayments payout batch ${batch}; it is now released for sending.`);
     return { batchId: batch, verified: true };
@@ -919,6 +1038,7 @@ module.exports = {
     validatePayoutAddress,
     getPayoutFee,
     getPayoutMinimum,
+    resetPayoutMinimumAvailability,
     submitPayoutBatch,
     verifyPayoutBatch,
     getPayoutBatch,
