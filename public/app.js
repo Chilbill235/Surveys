@@ -77,6 +77,123 @@ const creditedDepositsSeen = {
         }
     }
 };
+/* ==========================================================================
+   Toast notifications
+   --------------------------------------------------------------------------
+   Side-of-screen toasts for deposits, withdrawals, and account events. Desktop
+   anchors top-right; mobile anchors bottom-center so a phone held in portrait
+   keeps them under the thumb. Each toast is dismissible and announced to
+   screen readers as a polite live region.
+   ========================================================================== */
+
+const toastRegion = document.getElementById('toast-region');
+let toastCount = 0;
+
+const TOAST_ICONS = {
+    success: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M3 8.5l3 3 7-7" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+    info: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="2"/><path d="M8 5v3M8 11.5v.5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>',
+    warning: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M8 2l6 11H2L8 2z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="M8 7v3M8 12.5v.5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>',
+    error: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M4 4l8 8M12 4L4 12" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></svg>'
+};
+
+function showToast(title, message, { tone = 'info', duration = 4500 } = {}) {
+    if (!toastRegion) return;
+    const id = ++toastCount;
+    const toast = document.createElement('div');
+    toast.className = `toast is-${tone}`;
+    toast.dataset.id = id;
+    toast.setAttribute('role', 'status');
+    toast.setAttribute('aria-live', 'polite');
+    toast.innerHTML = `
+        <span class="toast-icon" aria-hidden="true">${TOAST_ICONS[tone] || TOAST_ICONS.info}</span>
+        <div class="toast-body">
+            <div class="toast-title">${escapeHtml(title)}</div>
+            ${message ? `<div class="toast-message">${escapeHtml(message)}</div>` : ''}
+        </div>
+        <button class="toast-close" type="button" aria-label="Dismiss notification">&times;</button>
+    `;
+    toast.querySelector('.toast-close').addEventListener('click', () => dismissToast(id));
+    toastRegion.appendChild(toast);
+
+    if (duration > 0) {
+        setTimeout(() => dismissToast(id), duration);
+    }
+    return id;
+}
+
+function dismissToast(id) {
+    const toast = toastRegion.querySelector(`.toast[data-id="${id}"]`);
+    if (!toast) return;
+    toast.classList.add('is-leaving');
+    setTimeout(() => toast.remove(), 200);
+}
+
+function escapeHtml(value) {
+    return String(value ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+// Convenience wrappers matching the events that need them.
+function notifyDepositConfirmed(item) {
+    showToast(
+        'Deposit credited',
+        `${formatBalance(item.amount)} ${item.currency_code || 'USD'} added to your balance.`,
+        { tone: 'success' }
+    );
+}
+
+function notifyWithdrawalSubmitted(item) {
+    showToast(
+        'Withdrawal submitted',
+        `Your request to withdraw ${formatBalance(item.amount)} is being processed.`,
+        { tone: 'info' }
+    );
+}
+
+function notifyWithdrawalPaid(item) {
+    showToast(
+        'Withdrawal sent',
+        `${formatBalance(item.amount)} has been sent to your payment method.`,
+        { tone: 'success' }
+    );
+}
+
+function notifyWithdrawalFailed(item) {
+    showToast(
+        'Withdrawal failed',
+        item.failureReason || 'Your withdrawal could not be completed.',
+        { tone: 'error' }
+    );
+}
+
+function notifySessionExpired() {
+    showToast(
+        'Session expired',
+        'Sign in again to continue.',
+        { tone: 'warning' }
+    );
+}
+
+/**
+ * Withdrawal states already seen, so a transition can be announced once.
+ *
+ * Like `creditedDepositsSeen` but keyed on the status a withdrawal has reached,
+ * because the events that matter here are transitions into a terminal state --
+ * paid, failed -- not the fact that a row exists. A withdrawal that was already
+ * paid when the page loaded must not fire "your money has been sent" on every
+ * poll.
+ */
+const withdrawalStatesSeen = new Set();
+function markWithdrawalSeen(id, status) {
+    withdrawalStatesSeen.add(`${id}:${status}`);
+}
+function withdrawalStateSeen(id, status) {
+    return withdrawalStatesSeen.has(`${id}:${status}`);
+}
 // `codeFor` is the amount/coin/destination a confirmation code was issued for, or null. It
 // exists so an edit after the code arrived is caught in the form instead of at the server.
 const withdrawState = { options: null, method: 'paypal', asset: '', network: '', codeFor: null };
@@ -302,10 +419,15 @@ document.addEventListener('DOMContentLoaded', () => {
     // The page keeps itself current from here on. Seeded with the deposits that are already
     // credited so the first sync does not re-announce a payment that happened before the
     // page loaded, then started: the initial history read is what tells us which those are.
-    loadDepositHistory().finally(() => {
+    if (sessionStorage.getItem(accountTokenKey)) {
+        loadDepositHistory().finally(() => {
+            startLiveSync();
+            paintLiveIndicator();
+        });
+    } else {
         startLiveSync();
         paintLiveIndicator();
-    });
+    }
 
     document.addEventListener('visibilitychange', () => {
         if (document.hidden) return;
@@ -488,6 +610,22 @@ function applyLiveUpdate(payload) {
             if (isDialogOpen('deposit-dialog')) showDepositSuccess(item);
         }
     }
+
+    // A withdrawal reaching a terminal state is announced the same way, and for the same
+    // reason: the user is elsewhere on the page and should not have to poll their history
+    // to learn their money left or was returned. Only the transitions into paid and failed
+    // are announced -- a request sitting in `pending` is not an event, and saying so on
+    // every poll would be noise.
+    for (const item of withdrawals) {
+        const status = String(item.status || '').toLowerCase();
+        if (status === 'paid' && !withdrawalStateSeen(item.id, 'paid')) {
+            markWithdrawalSeen(item.id, 'paid');
+            notifyWithdrawalPaid(item);
+        } else if (status === 'failed' && !withdrawalStateSeen(item.id, 'failed')) {
+            markWithdrawalSeen(item.id, 'failed');
+            notifyWithdrawalFailed(item);
+        }
+    }
 }
 
 /**
@@ -622,6 +760,7 @@ function signOut() {
 function handleUnauthorized(error) {
     if (error.status !== 401) return false;
     signOut();
+    notifySessionExpired();
     return true;
 }
 
@@ -2284,7 +2423,7 @@ function renderWithdrawalConfirm() {
     if (!panel || !facts) return;
 
     const body = withdrawalRequestBody();
-    if (!validateWithdrawalDestination()) {
+    if (!body.paymentAddress) {
         panel.hidden = true;
         return;
     }
@@ -2429,6 +2568,7 @@ async function submitWithdrawal(event) {
         });
 
         showWithdrawalConfirmation(result);
+        notifyWithdrawalSubmitted(result);
         document.getElementById('withdraw-amount').value = '';
         document.getElementById('withdraw-address').value = '';
         document.getElementById('withdraw-tag').value = '';
@@ -2735,10 +2875,16 @@ function renderHistoryInto(containerId, items, kind, emptyText) {
 
 async function loadPaymentHistory(endpoint, containerId, kind) {
     const container = document.getElementById(containerId);
+    if (!container) return { settled: false, settledCount: 0 };
     container.textContent = 'Loading history...';
+    const token = sessionStorage.getItem(accountTokenKey);
+    if (!token) {
+        container.textContent = 'Sign in to view history.';
+        return { settled: false, settledCount: 0 };
+    }
     try {
         const items = await requestJson(endpoint, {
-            headers: { Authorization: `Bearer ${sessionStorage.getItem(accountTokenKey)}` }
+            headers: { Authorization: `Bearer ${token}` }
         });
         container.replaceChildren();
 
@@ -2825,6 +2971,12 @@ async function showDepositSuccess(deposit) {
 
     const receiptLink = document.getElementById('deposit-success-receipt');
     receiptLink.href = deposit.receipt_url || `/deposit/${deposit.id}`;
+
+    // A toast as well as the dialog: the dialog only appears when the poll that
+    // noticed the credit is running, which is while the deposit dialog is open.
+    // A payment that lands while the user is elsewhere on the page still needs
+    // to announce itself, and a toast is the only thing that does that.
+    notifyDepositConfirmed(deposit);
 
     dialog.showModal();
 }

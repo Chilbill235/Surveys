@@ -2291,6 +2291,91 @@ select.form-control:disabled { cursor: not-allowed; background-image: none; padd
     .site-footer-wide { grid-template-columns: minmax(0, 1fr); }
 }
 /* ==========================================================================
+   Toast notifications
+   --------------------------------------------------------------------------
+   Side-of-screen toasts for deposits, withdrawals, and account events. Desktop
+   anchors top-right; mobile anchors bottom-center so a phone held in portrait
+   keeps them under the thumb. Each toast is dismissible and announced to
+   screen readers as a polite live region.
+   ========================================================================== */
+
+.toast-region {
+    position: fixed;
+    z-index: 1000;
+    top: calc(var(--header-h) + 12px);
+    right: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    width: min(360px, calc(100% - 32px));
+    pointer-events: none;
+}
+
+.toast {
+    pointer-events: auto;
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    padding: 12px 14px;
+    border: 1px solid var(--line);
+    border-radius: var(--r-md);
+    background: var(--surface);
+    box-shadow: var(--shadow-lg);
+    animation: toast-in 0.22s var(--ease) both;
+}
+.toast.is-entering { animation: toast-in 0.22s var(--ease) both; }
+.toast.is-leaving { animation: toast-out 0.2s var(--ease) both; pointer-events: none; }
+
+.toast .toast-icon {
+    flex: 0 0 auto;
+    width: 22px;
+    height: 22px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.85rem;
+}
+.toast.is-success .toast-icon { background: var(--success-bg); color: var(--success); }
+.toast.is-info .toast-icon { background: var(--indigo-100); color: var(--indigo-700); }
+.toast.is-warning .toast-icon { background: var(--warning-bg); color: var(--warning); }
+.toast.is-error .toast-icon { background: var(--danger-bg); color: var(--danger); }
+
+.toast .toast-body { display: grid; gap: 2px; min-width: 0; }
+.toast .toast-title { font-weight: 700; font-size: var(--step--1); color: var(--heading); }
+.toast .toast-message { font-size: var(--step--2); color: var(--ink-soft); line-height: 1.45; }
+.toast .toast-close {
+    flex: 0 0 auto;
+    background: none;
+    border: 0;
+    color: var(--muted);
+    cursor: pointer;
+    font-size: 1.1rem;
+    line-height: 1;
+    padding: 0 0 0 8px;
+}
+.toast .toast-close:hover { color: var(--ink); }
+
+@keyframes toast-in {
+    from { opacity: 0; transform: translateX(12px); }
+    to { opacity: 1; transform: translateX(0); }
+}
+@keyframes toast-out {
+    from { opacity: 1; transform: translateX(0); }
+    to { opacity: 0; transform: translateX(12px); }
+}
+
+@media (max-width: 640px) {
+    .toast-region {
+        top: auto;
+        bottom: calc(56px + 10px);
+        right: 8px;
+        left: 8px;
+        width: auto;
+    }
+    .toast { width: 100%; }
+}
+/* ==========================================================================
    Touch targets
    --------------------------------------------------------------------------
    Last in the file on purpose.

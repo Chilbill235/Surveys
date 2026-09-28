@@ -149,4 +149,43 @@ const port = defaultPort;
 
 app.listen(port, () => {
     console.log(`Offer network API listening on port ${port}`);
+
+    // ---------------------------------------------------------------------------
+    // Automatic crypto payouts
+    // ---------------------------------------------------------------------------
+    //
+    // Crypto withdrawals are paid by the provider on their own schedule, and the
+    // operator has to be told when one is ready. The endpoint above is the trigger;
+    // this is the timer. It runs the preflight and, if configured, claims and sends
+    // whatever is waiting -- the same path a human operator would take, which is
+    // the point: there is one implementation of "send these", and it is exercised
+    // by both.
+    //
+    // The interval is one minute. Shorter burns polling the provider API on every
+    // tick for a queue that is usually empty; longer leaves a user staring at a
+    // "processing" withdrawal for a long time. One minute is the compromise.
+    const AUTO_PAYOUT_INTERVAL_MS = 60_000;
+
+    async function runAutoPayoutsTick() {
+        try {
+            const autoPayouts = require('./src/services/autoPayouts');
+            const preflight = autoPayouts.preflight();
+            if (!preflight.ready) return;
+
+            const { claimed, skipped } = await autoPayouts.claimPayoutCandidates({
+                limit: 20,
+                convertToCoin: autoPayouts.usdToCoin
+            });
+            if (claimed.length === 0) return;
+
+            const outcome = await autoPayouts.submitClaimedPayouts(claimed);
+            console.log(`Auto-payouts: claimed ${claimed.length}, submitted ${outcome.submitted}, skipped ${skipped.length}.`);
+        } catch (error) {
+            console.error('Auto-payouts tick failed:', error.message);
+        }
+    }
+
+    // First tick after a short delay so startup logs settle.
+    setTimeout(runAutoPayoutsTick, 5000);
+    setInterval(runAutoPayoutsTick, AUTO_PAYOUT_INTERVAL_MS);
 });
