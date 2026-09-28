@@ -12,7 +12,7 @@ const { reconcilePendingDeposits } = require('../src/services/depositReconciliat
 const { creditConfirmedDeposit } = require('../src/services/depositCredit');
 const { markWithdrawalPaid, refundWithdrawal, refundSourceId } = require('../src/services/withdrawalResolution');
 const { resetCryptoDepositOptionsCache } = require('../src/controllers/paymentController');
-const { registerOrExplain } = require('./helpers/register');
+const { registerOrExplain } = require('../helpers/register');
 
 /**
  * Mints a bearer token the auth middleware will actually accept.
@@ -678,7 +678,8 @@ test('NOWPayments deposit addresses persist and signed confirmations credit once
     const priorNowApi = process.env.NOWPAYMENTS_API_KEY;
     const priorNowIpn = process.env.NOWPAYMENTS_IPN_SECRET;
     const priorNowBaseUrl = process.env.NOWPAYMENTS_API_BASE_URL;
-    const originalFetch = global.fetch;
+    const undici = require('undici');
+    const originalFetch = undici.fetch;
     const originalQuery = pool.query;
     const originalConnect = pool.connect;
     const jwtSecret = 'nowpayments-integration-test-secret';
@@ -778,7 +779,7 @@ test('NOWPayments deposit addresses persist and signed confirmations credit once
         release: () => {}
     });
 
-    global.fetch = async (url, options) => {
+    undici.fetch = async (url, options) => {
         const target = String(url);
         if (target.startsWith(origin)) return originalFetch(url, options);
         assert.equal(options.headers['x-api-key'], 'test-api-key');
@@ -944,7 +945,7 @@ test('NOWPayments deposit addresses persist and signed confirmations credit once
         assert.equal(ledgerEntries.size, 1);
         assert.ok(ledgerEntries.has(`${userId}|nowpayments:${providerPaymentId}`));
     } finally {
-        global.fetch = originalFetch;
+        undici.fetch = originalFetch;
         pool.query = originalQuery;
         pool.connect = originalConnect;
         if (priorEnvironment === undefined) delete process.env.NODE_ENV;
@@ -967,7 +968,8 @@ test('deposit amounts a user would type are accepted, sub-cent precision is not'
     const priorSecret = process.env.JWT_SECRET;
     const priorNowApi = process.env.NOWPAYMENTS_API_KEY;
     const priorNowIpn = process.env.NOWPAYMENTS_IPN_SECRET;
-    const originalFetch = global.fetch;
+    const undici = require('undici');
+    const originalFetch = undici.fetch;
     const originalQuery = pool.query;
     const jwtSecret = 'deposit-amount-test-secret';
     const userId = 5150;
@@ -997,8 +999,8 @@ test('deposit amounts a user would type are accepted, sub-cent precision is not'
 
     // Every one of these is a plain decimal a user can type. `Math.round(1.1 * 100)`
     // is 110.00000000000001, so the previous `Math.round(x*100) !== x*100` check
-    // rejected several of them with a misleading "between $1 and $5,000" error.
-    global.fetch = async (url, options) => {
+     // rejected several of them with a misleading "between $1 and $5,000" error.
+    undici.fetch = async (url, options) => {
         // The test's own requests to the app must still reach the real server.
         const target = String(url);
         if (target.startsWith(origin)) return originalFetch(url, options);
@@ -1040,8 +1042,8 @@ test('deposit amounts a user would type are accepted, sub-cent precision is not'
             }
         }
         assert.deepEqual(accepted, ['1.1', '1.15', '2.29']);
-    } finally {
-        global.fetch = originalFetch;
+     } finally {
+        undici.fetch = originalFetch;
         pool.query = originalQuery;
         if (priorEnvironment === undefined) delete process.env.NODE_ENV;
         else process.env.NODE_ENV = priorEnvironment;
@@ -1112,6 +1114,9 @@ test('a non-finished NOWPayments status never credits, and a malformed signature
         if (/UPDATE withdrawals SET status = 'paid', provider_reference = \$1/i.test(normalized)) {
             if (knownBatch) knownBatch.status = 'paid';
             return { rows: [{ id: knownBatch?.id, user_id: 1, amount: '25.00', status: 'paid' }], rowCount: 1 };
+        }
+        if (/SELECT u\.email[\s\S]*FROM withdrawals w/i.test(normalized)) {
+            return { rows: [{ email: 'payout@example.com' }] };
         }
         throw new Error(`Unexpected test query: ${normalized}`);
     }
@@ -1264,7 +1269,8 @@ test('deposit options come from the merchant coin list and the provider minimums
     const priorNowApi = process.env.NOWPAYMENTS_API_KEY;
     const priorNowIpn = process.env.NOWPAYMENTS_IPN_SECRET;
     const priorBaseUrl = process.env.APP_BASE_URL;
-    const originalFetch = global.fetch;
+    const undici = require('undici');
+    const originalFetch = undici.fetch;
     const originalQuery = pool.query;
     const jwtSecret = 'provider-options-test-secret';
     const userId = 4242;
@@ -1292,7 +1298,7 @@ test('deposit options come from the merchant coin list and the provider minimums
         throw new Error(`Unexpected test query: ${query}`);
     };
 
-    global.fetch = async (url, options) => {
+    undici.fetch = async (url, options) => {
         const target = String(url);
         if (target.startsWith(origin)) return originalFetch(url, options);
         requestedPaths.push(target);
@@ -1443,7 +1449,7 @@ test('deposit options come from the merchant coin list and the provider minimums
         assert.equal(unlisted.status, 400);
         assert.match((await unlisted.json()).error, /supported cryptocurrency/);
     } finally {
-        global.fetch = originalFetch;
+        undici.fetch = originalFetch;
         pool.query = originalQuery;
         resetCryptoDepositOptionsCache();
         if (priorEnvironment === undefined) delete process.env.NODE_ENV;
@@ -2137,9 +2143,12 @@ function withdrawalClient({ status = 'pending', amount = '500.00', userId = 3, f
         state,
         query: async (query, params = []) => {
             const normalized = query.replace(/\s+/g, ' ').trim();
-            if (/SELECT id, user_id, amount, status, provider_reference[\s\S]*FROM withdrawals/i.test(normalized)) {
+            if (/SELECT w\.id, w\.user_id, w\.amount, w\.status, w\.provider_reference[\s\S]*FROM withdrawals/i.test(normalized)) {
                 if (status === 'missing') return { rows: [] };
                 return { rows: [{ id: params[0], user_id: userId, amount, status, provider_reference: null }] };
+            }
+            if (/SELECT u\.email[\s\S]*FROM withdrawals w/i.test(normalized)) {
+                return { rows: [{ email: 'recipient@example.com' }] };
             }
             if (normalized.startsWith('SELECT status FROM withdrawals')) {
                 return { rows: [{ status }] };
@@ -2262,11 +2271,14 @@ test('withdrawal review endpoints resolve a request and refuse to do it twice', 
         query: async (query, params = []) => {
             const normalized = query.replace(/\s+/g, ' ').trim();
             if (/^(BEGIN|COMMIT|ROLLBACK)$/i.test(normalized)) return { rows: [] };
-            if (/SELECT id, user_id, amount, status, provider_reference/.test(normalized)) {
+            if (/SELECT w\.id, w\.user_id, w\.amount, w\.status, w\.provider_reference/.test(normalized)) {
                 return { rows: [{ id: 12, user_id: 1, amount: '500.00', status: withdrawalStatus, provider_reference: null }] };
             }
             if (normalized.startsWith('SELECT status FROM withdrawals')) {
                 return { rows: [{ status: withdrawalStatus }] };
+            }
+            if (/SELECT u\.email[\s\S]*FROM withdrawals w/i.test(normalized)) {
+                return { rows: [{ email: 'test@example.com' }] };
             }
             if (/UPDATE withdrawals SET status = 'failed'/.test(normalized)) {
                 const claimed = withdrawalStatus === 'pending' || withdrawalStatus === 'processing';

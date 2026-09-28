@@ -79,6 +79,9 @@ const RESET_LIMIT_PER_EMAIL = 3;
 const RESET_LIMIT_PER_IP = 10;
 const RESET_LIMIT_PER_SUBMIT_IP = 10;
 
+const LOGIN_WINDOW_SECONDS = 15 * 60;
+const LOGIN_MAX_FAILED_ATTEMPTS = 10;
+
 const JWT_EXPIRES_IN = '12h';
 const JWT_ISSUER = 'offer-network-api';
 
@@ -133,13 +136,24 @@ function isValidPasswordShape(password) {
         && password.length <= PASSWORD_MAX_LENGTH;
 }
 
+/**
+ * A login attempt only needs a non-empty password string. The length policy is
+ * enforced at registration: a password accepted on sign-up will still validate
+ * against this check. Requiring the full policy on login means an account whose
+ * password predates the policy can never sign in, and the error message tells the
+ * user their password is wrong when the real situation is that it is too short.
+ */
+function isValidLoginPassword(password) {
+    return typeof password === 'string' && password.length > 0;
+}
+
 /** The user fields safe to return to the client, wherever a user is serialised. */
 function publicUser(user) {
     return {
         id: user.id,
         email: user.email,
         balance: user.balance,
-        demo_balance: user.demo_balance,
+        demoBalance: user.demo_balance,
     };
 }
 
@@ -369,8 +383,8 @@ const authController = {
 
             const passwordHash = await hashPassword(password);
             const username = `member_${randomUUID().replaceAll('-', '').slice(0, 16)}`;
-const result = await client.query(
-            `INSERT INTO users (username, email, password_hash, email_verified_at)
+            const result = await client.query(
+                `INSERT INTO users (username, email, password_hash, email_verified_at)
              VALUES ($1, $2, $3, $4)
              RETURNING id, email, balance, demo_balance, token_version`,
             // Confirmed at creation only on the development path above; production always
@@ -623,7 +637,7 @@ const result = await client.query(
         // message is deliberately identical for both branches so an attacker
         // cannot distinguish "invalid email" from "wrong password" by status
         // code and message alone.
-        if (!isValidEmail(email) || !isValidPasswordShape(password)) {
+        if (!isValidEmail(email) || !isValidLoginPassword(password)) {
             return res.status(400).json({ error: 'Enter a valid email and password.' });
         }
         if (!process.env.JWT_SECRET) {
@@ -643,6 +657,23 @@ const result = await client.query(
             // so the response time does not reveal registration status.
             const matches = await verifyPassword(password, user?.password_hash);
             if (!user || !matches || user.is_banned) {
+                // Rate limiting lives here, not in middleware, so only a failed credential
+                // check counts against the budget. Successful logins and the 403 path for
+                // an unconfirmed account must not consume an attempt: a user retrying their
+                // password, or a freshly registered user going through confirmation, is not
+                // an attack. Only a wrong password (or unknown address, which pays the same
+                // scrypt cost) moves the counter.
+                const rate = await consumeRateLimit({
+                    bucket: `login:ip:${clientIp(req)}`,
+                    maxAttempts: LOGIN_MAX_FAILED_ATTEMPTS,
+                    windowSeconds: LOGIN_WINDOW_SECONDS,
+                });
+                if (!rate.allowed) {
+                    return res.status(429).json({
+                        error: 'Too many failed sign-in attempts. Try again in a few minutes.',
+                        retryAfterSeconds: rate.retryAfterSeconds,
+                    });
+                }
                 return res.status(401).json({ error: 'Email or password is incorrect.' });
             }
 
@@ -805,6 +836,46 @@ const result = await client.query(
                 return res.status(503).json({ error: 'This service is temporarily unavailable.' });
             }
             return res.status(500).json({ error: 'Could not reset your password right now.' });
+        }
+    },
+
+    /**
+     * Signs out the current session by bumping `token_version`.
+     *
+     * A client that only deletes its local token is still vulnerable: if the token was
+     * intercepted, the copy continues working until it expires or is overwritten by a
+     * fresh sign-in. Bumping `token_version` invalidates every token signed at the old
+     * version across all devices, which is what "sign out everywhere" actually means.
+     *
+     * The endpoint is idempotent: bumping the version again is harmless, and a caller
+     * with no session to revoke is handled the same as one whose token was already
+     * stale.
+     */
+    logout: async (req, res) => {
+        const ip = clientIp(req);
+        try {
+            const client = await pool.connect();
+            try {
+                await client.query('BEGIN');
+                await client.query(
+                    'UPDATE users SET token_version = token_version + 1 WHERE id = $1',
+                    [req.user.id]
+                );
+                await client.query('COMMIT');
+            } catch (error) {
+                await client.query('ROLLBACK').catch(() => {});
+                throw error;
+            } finally {
+                client.release();
+            }
+
+            return res.json({ signedOutEverywhere: true });
+        } catch (error) {
+            console.error('Logout Error:', error.message);
+            if (isDatabaseUnreachable(error)) {
+                return res.status(503).json({ error: 'This service is temporarily unavailable.' });
+            }
+            return res.status(500).json({ error: 'Could not end your session right now.' });
         }
     },
 };

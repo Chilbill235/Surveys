@@ -539,7 +539,16 @@ async function syncNow() {
             paintLiveIndicator();
             return false;
         }
-        if (!response.ok) throw new Error(`Sync failed (${response.status})`);
+        if (!response.ok) {
+            const error = new Error(`Sync failed (${response.status})`);
+            error.status = response.status;
+            if (handleUnauthorized(error)) {
+                // The session is gone: stop the live-sync loop, there is nothing left to poll.
+                stopLiveSync();
+                return false;
+            }
+            throw error;
+        }
 
         const payload = await response.json();
         liveState.version = payload.version;
@@ -751,8 +760,20 @@ function setHint(id, text, isError) {
     hint.classList.toggle('is-error', Boolean(isError));
 }
 
-/** Ends a session and returns the user to the sign-in dialog. */
+/** Ends a session: invalidates the server-side token, then clears the local copy. */
 function signOut() {
+    const token = sessionStorage.getItem(accountTokenKey);
+    if (token) {
+        // Fire-and-forget: the local token is cleared immediately below, so a
+        // server call that is still in flight when the tab closes does not delay
+        // the sign-out. The fetch is not awaited because callers (handleUnauthorized,
+        // handleAccountButton) treat this as synchronous.
+        fetch('/api/auth/logout', {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${token}` },
+            body: '{}'
+        }).catch(() => {});
+    }
     sessionStorage.removeItem(accountTokenKey);
     syncAccountControls();
 }
@@ -1244,7 +1265,7 @@ async function resendVerificationCode() {
 /** Everything that has to happen once a session exists, for either sign-in route. */
 function completeSignIn(data) {
     sessionStorage.setItem(accountTokenKey, data.token);
-    applyBalance(data.user.balance, data.user.demo_balance);
+    applyBalance(data.user.balance, data.user.demoBalance);
     // The bar and the header have to agree the moment a session exists, because the
     // header controls were disabled for a signed-out visitor and the mirrored ones were
     // disabled to match. `syncAccountControls` is what lifts both, and it also enables
