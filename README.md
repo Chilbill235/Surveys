@@ -190,10 +190,25 @@ vocabularies. The details that matter for money:
   failed. The merchant list is intersected with a reviewed set, so an unreviewed coin is
   not offered either.
 - **The minimum is per currency pair, and it is much higher than $1.** `GET /v1/min-amount`
-  is quoted for each coin and applied to the amount the user submits. On the account this
-  was last verified against, the floor for USD→BTC was **$18.80**, so the app's previous
-  flat `$1` accepted every amount the provider was going to refuse. The picker states the
-  real floor and changes it when the coin changes.
+  is quoted for each coin. On the account this was last verified against, the floor for
+  USD→BTC was **$18.80** and for USD→BCH **$18.79**, so an amount of $1 is genuinely below
+  what NOWPayments will accept for those pairs. That figure is volatile — it moves with
+  fees and volume — which is why it is kept strictly separate from the app's own limits:
+
+  | | Enforced on | Source |
+  |---|---|---|
+  | App range, **$1.00 – $5,000.00** | the amount box's `min`/`max` | `appMinimumUsd` / `appMaximumUsd` |
+  | Provider per-coin range | payment creation, and shown as guidance | `minimums` / `maximums` |
+
+  Both are reported by `GET /api/user/payment-options`. The amount box enforces only the
+  app's range, so the advertised $1.00 minimum is actually usable; the provider's floor is
+  stated in the hint and in the coin's own picker entry, and is refused server-side with a
+  precise message before any deposit row is written.
+
+  These were previously collapsed into one figure, which made the box's `min` jump to
+  $18.79 whenever a high-floor coin was selected: the advertised minimum was unreachable,
+  and the visible symptom was the amount silently rewriting itself to a number the user
+  never typed.
 - **Callbacks have two shapes and share one URL.** A payment body carries `payment_id` and
   `payment_status`; a payout body carries `id` and a `status` from a separate uppercase
   vocabulary. A payout callback used to fail the payment field checks and be answered 400,
@@ -274,6 +289,43 @@ still debited and nothing in the app able to notice.
 
 Both actions are single-shot. A second call reports `409` rather than repeating the write,
 because a retried operator action and a contradictory one are different problems.
+
+#### Calling them
+
+Use the operator script rather than typing the request by hand:
+
+```bash
+# Reads CRON_SECRET from the environment, or from .env.local
+npm run withdrawals -- list
+npm run withdrawals -- paid 42 "PAYPAL-REF-88123"
+npm run withdrawals -- refund 42 "PayPal account could not be verified"
+
+# Against a deployment rather than the local server
+BASE_URL=https://your-deployment.vercel.app npm run withdrawals -- list
+```
+
+The secret is read from the environment or `.env.local` and never from an argument, so it
+cannot end up in shell history or in `ps` output.
+
+Two things about these endpoints are easy to get wrong by hand, and both have produced a
+false "this endpoint does not exist":
+
+- **The state-changing endpoints are POST-only.** A browser address bar can only send
+  `GET`, so opening `…/withdrawals/42/refund` there sent the wrong verb, matched no route,
+  and fell through to the catch-all's `{"error":"API route not found."}` — true about the
+  request, false about the endpoint. A known path reached with the wrong verb is now
+  answered `405` with an `Allow` header naming the verb to use. Unknown paths still get a
+  plain `404`, so a typo never looks like a real endpoint.
+- **A wrong `CRON_SECRET` answers `404`, deliberately**, to keep the endpoint
+  undiscoverable. That is why the `405` is only returned to a caller who already holds the
+  secret: an unauthenticated caller still sees `404`, exactly as before. In production an
+  *unset* `CRON_SECRET` answers `503` naming the variable, which is the case that means
+  "nobody set this up" rather than "you sent the wrong thing".
+
+The same `405` handling covers the user-facing withdrawal API, so
+`GET /api/user/withdraw` names the correct verb instead of reporting the route missing.
+`POST /api/user/withdrawals` is also accepted as an alias for the create action, which was
+otherwise spelled `/withdraw` while its list was `/withdrawals`.
 
 ## Reconciling the books
 

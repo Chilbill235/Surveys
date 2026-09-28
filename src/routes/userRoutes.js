@@ -5,6 +5,7 @@ const requireAuth = require('../middlewares/requireAuth');
 const pool = require('../config/db');
 const paymentController = require('../controllers/paymentController');
 const { rateLimitByIp } = require('../services/security');
+const { register: registerMethod } = require('./methodRegistry');
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -341,5 +342,21 @@ router.get('/payment-options', paymentController.providerOptions);
 router.get('/withdrawal-options', payoutController.withdrawalOptions);
 router.post('/deposits', financialMutationLimit, paymentController.createDeposit);
 router.post('/withdraw', financialMutationLimit, payoutController.requestWithdrawal);
+
+// Declared alongside the routes above so a request that reaches the right path with the
+// wrong verb is answered 405 rather than falling through to the generic "API route not
+// found" -- which reads as the endpoint not existing when it does.
+registerMethod(/^\/api\/user\/payment-options\/?$/, ['GET']);
+registerMethod(/^\/api\/user\/withdrawal-options\/?$/, ['GET']);
+registerMethod(/^\/api\/user\/deposits\/?$/, ['GET', 'POST']);
+registerMethod(/^\/api\/user\/deposits\/\d{1,19}\/?$/, ['GET']);
+
+// The list and the create action disagree on naming: one is the plural noun, the other a
+// bare verb. The plural is the readable form, so it is accepted as an alias for the create
+// endpoint rather than leaving two names for one action. Declared once, with both verbs,
+// so a GET to it is answered 405 with an `Allow` that names the verb that was wanted.
+router.post('/withdrawals', financialMutationLimit, payoutController.requestWithdrawal);
+registerMethod(/^\/api\/user\/withdrawals\/?$/, ['GET', 'POST']);
+registerMethod(/^\/api\/user\/withdraw\/?$/, ['POST']);
 
 module.exports = router;

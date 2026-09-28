@@ -8,6 +8,7 @@ const authRoutes = require('./routes/authRoutes');
 const publicRoutes = require('./routes/publicRoutes');
 const userRoutes = require('./routes/userRoutes');
 const maintenanceRoutes = require('./routes/maintenanceRoutes');
+const { methodsFor } = require('./routes/methodRegistry');
 const paymentController = require('./controllers/paymentController');
 const { isDemoModeEnabled } = require('./services/demoMode');
 
@@ -141,6 +142,41 @@ app.use(maintenanceRoutes);
 app.use('/api/auth', authRoutes);
 app.use('/', publicRoutes);
 app.use('/api/user', userRoutes);
+
+// A known path reached with the wrong verb is 405, not 404. This has to sit ahead of the
+// 404 handlers below: the routes have already declined to match, so by the time a request
+// arrives here the only thing left to tell apart "wrong URL" from "wrong verb" is the
+// registry the route modules populated.
+//
+// Without it, opening the POST-only refund endpoint in a browser answered
+// `{"error":"API route not found."}` -- a statement that was true only in the sense that no
+// route matched the request, and false about the thing the operator actually asked: the
+// endpoint exists, and a GET was the wrong way to reach it.
+app.use('/api', (req, res, next) => {
+    // `req.path` inside a mounted router is relative to the mount, so the registry is asked
+    // about the full path.
+    const pathname = req.originalUrl.split('?')[0];
+    const allowed = methodsFor(pathname);
+    if (!allowed) return next();
+
+    // OPTIONS is the CORS preflight and discovery verb, and is answered for every known
+    // path regardless of what the caller sent. Advertised so a client can find the verb.
+    const verbs = allowed.includes('OPTIONS') ? allowed : [...allowed, 'OPTIONS'];
+    res.set('Allow', verbs.join(', '));
+
+    // 200 with a body, not 204: a 204 must carry no body, and the body-less response drops
+    // the `Allow` header this exists to publish.
+    if (req.method === 'OPTIONS') {
+        return res.status(200).json({ allowed: verbs });
+    }
+    if (allowed.includes(req.method)) return next();
+
+    return res.status(405).json({
+        error: `${req.method} is not allowed for this endpoint.`,
+        allowed: verbs,
+        hint: `Use ${verbs.filter((verb) => verb !== 'OPTIONS').join(' or ')} with ${pathname}.`,
+    });
+});
 
 // 404 Handlers
 app.use('/api', (req, res) => res.status(404).json({ error: 'API route not found.' }));

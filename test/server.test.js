@@ -1269,6 +1269,14 @@ test('deposit options come from the merchant coin list and the provider minimums
         // never offered even if it is in the reviewed set.
         assert.deepEqual([...options.cryptoCurrencies].sort(), ['btc', 'doge', 'usdt']);
 
+        // The app's own limits are reported separately from the provider's, because they do
+        // different jobs: these two bound the amount box, and they are what the advertised
+        // "$1.00 minimum" is enforced from on the client. Folding the provider's volatile
+        // per-coin floor into the box's minimum is what made a $1 deposit unsubmittable on
+        // every coin NOWPayments charges $18 to.
+        assert.equal(options.appMinimumUsd, 1);
+        assert.equal(options.appMaximumUsd, 5000);
+
         // The picker floor is the smallest per-currency minimum, and each currency carries
         // its own. The app's own $1 floor still wins where the provider quotes less.
         assert.equal(options.minimumUsd, 2.5);
@@ -1307,13 +1315,17 @@ test('deposit options come from the merchant coin list and the provider minimums
 
         // A deposit the provider's own floor rules out is refused with that floor named,
         // rather than being accepted by the app and refused later by the provider.
+        //
+        // The amount box deliberately allows this, because the app's advertised minimum is
+        // $1.00; the provider's volatile per-pair floor is caught here instead, before the
+        // deposit row is written, so nothing is left behind in the history.
         const belowProviderFloor = await fetch(`${origin}/api/user/deposits`, {
             method: 'POST',
             headers: { ...headers, 'Content-Type': 'application/json' },
             body: JSON.stringify({ amount: 5, method: 'crypto', currency: 'btc' })
         });
         assert.equal(belowProviderFloor.status, 400);
-        assert.match((await belowProviderFloor.json()).error, /minimum deposit in BTC is \$18\.80/);
+        assert.match((await belowProviderFloor.json()).error, /NOWPayments accepts BTC deposits from \$18\.80/);
 
         // A coin the provider does not offer is refused before any deposit row is written.
         const unlisted = await fetch(`${origin}/api/user/deposits`, {
@@ -2218,6 +2230,37 @@ test('withdrawal review endpoints resolve a request and refuse to do it twice', 
         const wrongSecret = await fetch(`${origin}/api/maintenance/withdrawals/12/paid?secret=wrong`, { method: 'POST' });
         assert.equal(wrongSecret.status, 404);
         assert.equal(balance, 500);
+
+        // The same must hold for the wrong *verb*. `GET` on the POST-only refund endpoint is
+        // what a browser address bar sends, and it used to fall through to the catch-all and
+        // answer `{"error":"API route not found."}` -- a statement that was true only about
+        // the request and false about the endpoint, leaving an operator unable to tell a
+        // wrong URL from a wrong verb. It must stay a 404 to an unauthenticated caller, and
+        // only become a 405 for one who already holds the secret.
+        const wrongVerbUnauthenticated = await fetch(
+            `${origin}/api/maintenance/withdrawals/12/refund?secret=wrong`,
+            { method: 'GET' }
+        );
+        assert.equal(wrongVerbUnauthenticated.status, 404);
+
+        // Authenticated, the verb is named rather than hidden.
+        const wrongVerb = await fetch(
+            `${origin}/api/maintenance/withdrawals/12/refund?secret=withdrawal-cron-secret`,
+            { method: 'GET' }
+        );
+        assert.equal(wrongVerb.status, 405);
+        assert.match(wrongVerb.headers.get('allow') || '', /POST/);
+        const wrongVerbBody = await wrongVerb.json();
+        assert.equal(wrongVerbBody.allowed.includes('POST'), true);
+        assert.equal(balance, 500);
+
+        // A path that is not a maintenance route at all stays a plain 404. The 405 must never
+        // stand in for "no such endpoint", or a typo would look like a real one.
+        const unknownMaintenancePath = await fetch(
+            `${origin}/api/maintenance/withdrawals/12/send?secret=withdrawal-cron-secret`,
+            { method: 'POST' }
+        );
+        assert.equal(unknownMaintenancePath.status, 404);
     } finally {
         pool.connect = originalConnect;
         pool.query = originalQuery;

@@ -317,6 +317,18 @@ async function fetchCryptoDepositOptions() {
 
     return {
         cryptoCurrencies: currencies,
+        // The app's own limits, which are what the amount box enforces.
+        //
+        // These are deliberately separate from the provider figures below. The provider's
+        // per-coin minimum is a volatile, pair-specific fact -- Bitcoin Cash genuinely
+        // refuses anything under about $18.79 today, and that number moves with fees and
+        // volume. It is reported to the browser so the user can be told before submitting,
+        // but it is not allowed to become the input's `min`. Pinning the box to it meant a
+        // $1 deposit -- which this app explicitly advertises as its minimum -- was
+        // unsubmittable for a whole class of coins, with the reason surfacing only as a
+        // clamped amount the user never typed.
+        appMinimumUsd: MIN_DEPOSIT_USD,
+        appMaximumUsd: MAX_DEPOSIT_USD,
         // The picker-level minimum is the smallest per-currency floor, so a user is
         // never blocked from the amount box by a limit that only applies to a
         // different coin.
@@ -325,6 +337,9 @@ async function fetchCryptoDepositOptions() {
         // reason: a low-capped coin must not shrink the box for every other coin.
         // The frontend narrows this to the selected coin via `maximums`.
         maximumUsd: largest > 0 ? largest : MAX_DEPOSIT_USD,
+        // The provider's per-coin windows. Informational: these are shown as guidance and
+        // enforced at payment creation, where a refusal is still caught before any money
+        // moves.
         minimums,
         maximums,
     };
@@ -375,6 +390,8 @@ async function providerOptions(req, res) {
 
     let crypto = {
         cryptoCurrencies: [],
+        appMinimumUsd: MIN_DEPOSIT_USD,
+        appMaximumUsd: MAX_DEPOSIT_USD,
         minimumUsd: MIN_DEPOSIT_USD,
         maximumUsd: MAX_DEPOSIT_USD,
         minimums: {},
@@ -464,10 +481,16 @@ async function createDeposit(req, res) {
             return res.status(400).json({ error: 'Choose a supported cryptocurrency.' });
         }
 
+        // The provider's floor is enforced here rather than in the form, because it is a
+        // volatile, pair-specific figure: the browser's amount box deliberately accepts
+        // anything from the app's own $1.00 so the advertised minimum is actually usable.
+        // This is the last point at which a doomed payment can be refused, and it is
+        // refused before the deposit row exists, so nothing is left in the history.
         const required = cryptoOptions?.minimums?.[payCurrency] ?? MIN_DEPOSIT_USD;
         if (amount < required) {
             return res.status(400).json({
-                error: `The minimum deposit in ${payCurrency.toUpperCase()} is $${required.toFixed(2)}.`,
+                error: `NOWPayments accepts ${payCurrency.toUpperCase()} deposits from ` +
+                    `$${required.toFixed(2)}. Enter that amount or more to continue.`,
             });
         }
 

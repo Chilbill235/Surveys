@@ -939,6 +939,14 @@ textarea.form-control { min-height: 96px; resize: vertical; }
 }
 .amount-field .form-control { padding-left: 32px; font-weight: 700; font-variant-numeric: tabular-nums; }
 
+/* The native stepper is drawn inside the input's right edge, which is exactly where the
+   absolute "USD" suffix sits -- the two overlapped, and the spinner arrows sat on top of
+   the currency label. Only the *visual* spinners are removed; the arrow keys still step
+   the value, so nothing is taken away from anyone who uses them. */
+.amount-field input[type='number'] { -moz-appearance: textfield; appearance: textfield; }
+.amount-field input[type='number']::-webkit-outer-spin-button,
+.amount-field input[type='number']::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+
 .form-message { min-height: 20px; margin: 10px 0 4px; color: var(--muted); font-size: var(--step--1); line-height: 1.5; }
 .form-message.is-error { color: var(--danger); font-weight: 600; }
 .form-message.is-success { color: var(--success); font-weight: 600; }

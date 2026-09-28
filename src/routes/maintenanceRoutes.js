@@ -1,6 +1,7 @@
 const express = require('express');
 const { createHash, timingSafeEqual } = require('node:crypto');
 const router = express.Router();
+const { register: registerMethod, methodsFor } = require('./methodRegistry');
 const { reconcilePendingDeposits } = require('../services/depositReconciliation');
 const { listUnresolvedWithdrawals, sendWithdrawal, reverseWithdrawal } = require('../services/withdrawalResolution');
 const ipnLog = require('../services/ipnLog');
@@ -14,7 +15,6 @@ const { resolvePublicBaseUrl, isPubliclyReachable } = require('../services/publi
 const RECONCILE_PATH = '/api/maintenance/reconcile-deposits';
 const IPN_DIAGNOSTICS_PATH = '/api/maintenance/ipn-diagnostics';
 const WITHDRAWALS_PATH = '/api/maintenance/withdrawals';
-
 /**
  * A withdrawal id fits in a Postgres BIGINT (up to 19 digits), so anything
  * longer is not a valid id and does not need to reach the database. The bound
@@ -24,6 +24,22 @@ const WITHDRAWAL_ID_PATTERN = /^\d{1,19}$/;
 
 /** Provider references are opaque strings; the bound is just to prevent abuse. */
 const MAX_PROVIDER_REFERENCE_LENGTH = 200;
+
+/**
+ * The maintenance paths, as anchored patterns for the method registry.
+ *
+ * The literal paths above are what the routes are registered against; these are what the
+ * registry matches against to tell a wrong method apart from a wrong URL. Both are declared
+ * next to each other deliberately -- the point of the registry is that the verb list cannot
+ * drift away from the routes it describes.
+ */
+const MAINTENANCE_METHODS = {
+    reconcile: /^\/api\/maintenance\/reconcile-deposits\/?$/,
+    ipnDiagnostics: /^\/api\/maintenance\/ipn-diagnostics\/?$/,
+    listWithdrawals: /^\/api\/maintenance\/withdrawals\/?$/,
+    markPaid: /^\/api\/maintenance\/withdrawals\/\d{1,19}\/paid\/?$/,
+    refund: /^\/api\/maintenance\/withdrawals\/\d{1,19}\/refund\/?$/
+};
 
 /**
  * The refund reason is shown to the user in their withdrawal history, so it is
@@ -397,6 +413,50 @@ async function handleRefund(req, res) {
 router.get(WITHDRAWALS_PATH, handleListWithdrawals);
 router.post(`${WITHDRAWALS_PATH}/:id/paid`, handleMarkPaid);
 router.post(`${WITHDRAWALS_PATH}/:id/refund`, handleRefund);
+
+// Declared after the routes so the file reads top-to-bottom as description, then
+// registration. `register` only records what the routes above already accept.
+registerMethod(MAINTENANCE_METHODS.reconcile, ['GET', 'POST']);
+registerMethod(MAINTENANCE_METHODS.ipnDiagnostics, ['GET', 'POST']);
+registerMethod(MAINTENANCE_METHODS.listWithdrawals, ['GET']);
+registerMethod(MAINTENANCE_METHODS.markPaid, ['POST']);
+registerMethod(MAINTENANCE_METHODS.refund, ['POST']);
+
+/**
+ * Answers a maintenance path that no route matched.
+ *
+ * The access check runs first, deliberately. These endpoints answer a wrong secret with
+ * 404 so they stay undiscoverable, and a 405 placed ahead of the check would advertise both
+ * the existence of the endpoint and its verb to anyone who guessed the URL -- which is the
+ * one thing the 404-on-wrong-secret rule exists to prevent. Authorising first keeps
+ * "unauthenticated" and "unauthorised" answering exactly as they did before, and only lets a
+ * caller who has already proved they hold the secret learn which verb was wanted.
+ *
+ * Requests that reach the app and match nothing still fall through to the ordinary 404.
+ */
+router.use((req, res, next) => {
+    if (!req.path.startsWith('/api/maintenance')) return next();
+    if (!enforceAccess(req, res)) return;
+
+    const allowed = methodsFor(req.path);
+    if (!allowed) return next();
+
+    const verbs = [...allowed, 'OPTIONS'];
+    res.set('Allow', verbs.join(', '));
+    // Answered 200 rather than 204 on purpose: a 204 must carry no body, and the body-less
+    // response drops the very `Allow` header this exists to publish, so the discovery
+    // request answered without the information it was asked for.
+    if (req.method === 'OPTIONS') {
+        return res.status(200).json({ ok: true, allowed: verbs });
+    }
+    if (allowed.includes(req.method)) return next();
+
+    return res.status(405).json({
+        error: `${req.method} is not allowed for this endpoint.`,
+        allowed: verbs,
+        hint: `Use ${allowed.join(' or ')} with ${req.path}.`,
+    });
+});
 
 // ---------------------------------------------------------------------------
 // Exports

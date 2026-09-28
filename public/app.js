@@ -79,7 +79,12 @@ document.addEventListener('DOMContentLoaded', () => {
             amount.focus();
         });
     });
-    document.getElementById('deposit-amount').addEventListener('input', syncDepositPresets);
+    document.getElementById('deposit-amount').addEventListener('input', () => {
+        syncDepositPresets();
+        // Re-checked on every keystroke so the "provider will refuse this" state appears and
+        // clears as the amount crosses the floor, rather than only after a failed submit.
+        validateDepositAmount();
+    });
     document.getElementById('deposit-max').addEventListener('click', setMaximumDepositAmount);
     document.getElementById('deposit-currency').addEventListener('change', () => {
         clearDepositMessage();
@@ -1012,9 +1017,9 @@ function clampDepositAmountToRange() {
     const corrected = current < minimum ? minimum : maximum;
     input.value = corrected.toFixed(2);
     if (current < minimum) {
-        setFormMessage('deposit-message', `Raised to ${formatBalance(corrected)}, the minimum for this coin.`);
+        setFormMessage('deposit-message', `Raised to ${formatBalance(corrected)}, the lowest this app accepts.`);
     } else {
-        setFormMessage('deposit-message', `Reduced to ${formatBalance(corrected)}, the maximum for this coin.`);
+        setFormMessage('deposit-message', `Reduced to ${formatBalance(corrected)}, the most this app accepts.`);
     }
 }
 
@@ -1026,13 +1031,32 @@ function clampDepositAmountToRange() {
  * only the smallest of those, so it is the per-currency value that has to be applied
  * while the user changes coins.
  */
+/**
+ * The floor the amount box itself enforces: the app's own $1.00.
+ *
+ * This is deliberately NOT the selected coin's provider minimum. Pinning `min` to a
+ * volatile, pair-specific figure meant the advertised $1.00 minimum was unreachable for
+ * every coin NOWPayments happens to charge $18 to, and the visible symptom was the amount
+ * silently jumping to a number the user never typed. The provider's real floor is
+ * reported separately by `providerMinimumForSelectedCurrency`, shown as guidance, and
+ * still enforced at payment creation.
+ */
 function minimumForSelectedCurrency() {
-    const options = depositState.options;
-    if (!options) return 1;
-    if (depositState.method !== 'crypto') return options.minimumUsd;
+    const appMinimum = depositState.options?.appMinimumUsd;
+    return Number.isFinite(appMinimum) && appMinimum > 0 ? appMinimum : 1;
+}
+
+/**
+ * The coin's real provider floor, or null when the provider has not imposed one.
+ */
+function providerMinimumForSelectedCurrency() {
+    if (depositState.method !== 'crypto') return null;
     const currency = document.getElementById('deposit-currency')?.value;
-    const perCurrency = options.minimums?.[currency];
-    return Number.isFinite(perCurrency) && perCurrency > 0 ? perCurrency : options.minimumUsd;
+    const perCurrency = depositState.options?.minimums?.[currency];
+    // Only meaningful when it sits above the app's own floor; otherwise it is noise.
+    return Number.isFinite(perCurrency) && perCurrency > minimumForSelectedCurrency()
+        ? perCurrency
+        : null;
 }
 
 /**
@@ -1055,21 +1079,52 @@ function maximumForSelectedCurrency() {
 /**
  * States the limit that actually applies right now, so the reason a coin was rejected is
  * visible before the user submits rather than after.
+ *
+ * Two facts, deliberately kept apart. The app's own range is the headline, because that is
+ * what the box accepts. The provider's per-coin floor is appended as a second sentence, so
+ * someone who types a $5 BCH deposit learns why it is refused *before* they submit rather
+ * than from a server error afterwards.
  */
 function updateDepositAmountHint() {
     const hint = document.getElementById('deposit-amount-hint');
     if (!hint) return;
     const options = depositState.options;
     if (!options) return;
+
     const minimum = minimumForSelectedCurrency();
     const maximum = maximumForSelectedCurrency();
-    if (depositState.method === 'crypto') {
+    const providerMinimum = providerMinimumForSelectedCurrency();
+
+    let text = `Minimum ${formatBalance(minimum)}. Maximum ${formatBalance(maximum)}.`;
+    if (providerMinimum) {
         const currency = document.getElementById('deposit-currency')?.value;
-        const name = cryptoCurrencyNames[currency] || String(currency || '').toUpperCase();
-        hint.textContent = `Minimum ${formatBalance(minimum)} in ${name}. Maximum ${formatBalance(maximum)}.`;
-    } else {
-        hint.textContent = `Minimum ${formatBalance(minimum)}. Maximum ${formatBalance(maximum)}.`;
+        const symbol = cryptoCurrencyNames[currency] || String(currency || '').toUpperCase();
+        text += ` ${symbol} deposits start at ${formatBalance(providerMinimum)}.`;
     }
+    hint.textContent = text;
+    validateDepositAmount();
+}
+
+/**
+ * Warns about an amount the provider will refuse, before the user submits.
+ *
+ * The box accepts anything from the app's $1.00, so a $5 Bitcoin Cash deposit is
+ * submittable and then rejected by NOWPayments with a server error. Saying so while the
+ * amount is still being typed turns a failed submission into a visible, correctable
+ * field. It only annotates: it never rewrites the amount, because an amount the user
+ * typed and is still editing is not ours to silently replace.
+ */
+function validateDepositAmount() {
+    const hint = document.getElementById('deposit-amount-hint');
+    if (!hint) return;
+    const providerMinimum = providerMinimumForSelectedCurrency();
+    if (!providerMinimum) {
+        hint.classList.remove('is-error');
+        return;
+    }
+    const amount = Number(document.getElementById('deposit-amount').value);
+    const below = Number.isFinite(amount) && amount > 0 && amount < providerMinimum;
+    hint.classList.toggle('is-error', below);
 }
 
 async function loadDepositOptions() {
@@ -1111,15 +1166,17 @@ async function loadDepositOptions() {
         currencySelect.replaceChildren(...options.cryptoCurrencies.map((currency) => {
             const option = document.createElement('option');
             option.value = currency;
-            // The per-coin minimum is shown in the list itself. It used to be revealed only
-            // after choosing, by the hint under the amount box, so a user whose amount was
-            // below Bitcoin's floor picked the coin first and was then told it was too small.
+            // The provider's own floor is shown in the list itself, phrased as a starting
+            // point rather than a hard limit, because that is what it is: NOWPayments will
+            // refuse a smaller payment, but the box accepts anything from the app's $1.00.
+            // Putting the figure here means it is known *before* the coin is chosen, instead
+            // of only after, when a sub-minimum amount is already in the box.
             const name = cryptoCurrencyNames[currency] || currency.toUpperCase();
             const minimum = options.minimums?.[currency];
             const maximum = options.maximums?.[currency];
             const range = [];
-            if (Number.isFinite(minimum) && minimum > 0) range.push(`min ${formatBalance(minimum)}`);
-            if (Number.isFinite(maximum) && maximum > 0) range.push(`max ${formatBalance(maximum)}`);
+            if (Number.isFinite(minimum) && minimum > 0) range.push(`from ${formatBalance(minimum)}`);
+            if (Number.isFinite(maximum) && maximum > 0) range.push(`up to ${formatBalance(maximum)}`);
             option.textContent = range.length ? `${name} (${range.join(', ')})` : name;
             return option;
         }));
@@ -1236,7 +1293,7 @@ function syncDepositPresets() {
         button.classList.toggle('is-active', selected && usable);
         button.disabled = !usable;
         button.setAttribute('aria-pressed', String(selected && usable));
-        button.title = usable ? '' : `Outside the ${minimum} to ${maximum} range for this coin`;
+        button.title = usable ? '' : `Outside the ${formatBalance(minimum)} to ${formatBalance(maximum)} range this app accepts`;
     });
 }
 
@@ -1245,6 +1302,7 @@ function setMaximumDepositAmount() {
     const input = document.getElementById('deposit-amount');
     input.value = maximumForSelectedCurrency().toFixed(2);
     syncDepositPresets();
+    validateDepositAmount();
     input.focus();
 }
 
