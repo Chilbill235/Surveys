@@ -36,6 +36,12 @@ router.post('/reset-password', resetLimit, authController.resetPassword);
 router.post('/verify-email', authController.verifyEmail);
 router.post('/resend-verification', authController.resendVerification);
 
+// Magic link: sends a single-use sign-in link to the email on file, bypassing the code
+// entry step for an unconfirmed account.
+router.post('/magic-link', authController.sendMagicLink);
+// Consumes the token from the URL fragment and exchanges it for a session.
+router.post('/magic-link/consume', authController.consumeMagicLink);
+
 // Logout is a mutation, so it needs a valid session. Bumping `token_version` on the row
 // invalidates every token signed at the old version, which is what a server-side sign-out
 // requires -- deleting the local copy alone leaves an intercepted token alive until it expires.
@@ -47,6 +53,8 @@ registerMethod(/^\/api\/auth\/forgot-password\/?$/, ['POST']);
 registerMethod(/^\/api\/auth\/reset-password\/?$/, ['POST']);
 registerMethod(/^\/api\/auth\/verify-email\/?$/, ['POST']);
 registerMethod(/^\/api\/auth\/resend-verification\/?$/, ['POST']);
+registerMethod(/^\/api\/auth\/magic-link\/?$/, ['POST']);
+registerMethod(/^\/api\/auth\/magic-link\/consume\/?$/, ['POST']);
 registerMethod(/^\/api\/auth\/logout\/?$/, ['POST']);
 
 module.exports = router;

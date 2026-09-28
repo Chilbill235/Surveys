@@ -16,8 +16,11 @@ const {
     MAX_ATTEMPTS
 } = require('../services/verificationEmail');
 const { resolvePublicBaseUrl } = require('../services/publicBaseUrl');
+const { sendMagicLinkEmail } = require('../services/magicLinkEmail');
 
 const scryptAsync = promisify(scrypt);
+
+const MAGIC_LINK_WINDOW_MINUTES = 15;
 
 /**
  * One message for every failed verification, whatever the reason.
@@ -876,6 +879,150 @@ const authController = {
                 return res.status(503).json({ error: 'This service is temporarily unavailable.' });
             }
             return res.status(500).json({ error: 'Could not end your session right now.' });
+        }
+    },
+
+    /**
+     * Issues a magic link sign-in email.
+     *
+     * The address is not confirmed to exist or not exist: the response is identical
+     * either way, and the email is only actually sent if a live, unconfirmed account
+     * is found. This prevents the endpoint from being used to enumerate accounts or
+     * to spam an address that does not have one.
+     *
+     * The link itself is a random 32-byte token carried in the URL fragment. The
+     * token is hashed before storage, so a database read cannot produce a valid link.
+     * It is single-use and expires after a short window.
+     */
+    sendMagicLink: async (req, res) => {
+        const email = normaliseEmail(req.body.email);
+        if (!isValidEmail(email)) {
+            return res.status(400).json({ error: 'Enter a valid email address.' });
+        }
+
+        try {
+            const userResult = await pool.query(
+                'SELECT id, email, email_verified_at FROM users WHERE LOWER(email) = $1',
+                [email]
+            );
+            const user = userResult.rows[0];
+
+            if (user && !user.email_verified_at) {
+                const token = randomBytes(32).toString('hex');
+                const tokenHash = createHash('sha256').update(token).digest('hex');
+
+                await pool.query(
+                    `INSERT INTO magic_link_tokens (token_hash, user_id, email, expires_at)
+                     VALUES ($1, $2, $3, NOW() + ($4 || ' minutes')::interval)`,
+                    [tokenHash, user.id, user.email, MAGIC_LINK_WINDOW_MINUTES]
+                );
+
+                const delivery = await sendMagicLinkEmail({ to: user.email, token });
+                if (!delivery.sent) {
+                    console.error(`Magic link email was not delivered (${delivery.reason}).`);
+                }
+            }
+
+            // Same response whether or not the address has an account, to avoid
+            // revealing which addresses are registered.
+            return res.json({
+                message: 'If an unconfirmed account exists for that email, a magic link is on its way. The link expires in 15 minutes.',
+                expiresInMinutes: MAGIC_LINK_WINDOW_MINUTES
+            });
+        } catch (error) {
+            console.error('Send magic link Error:', error.message);
+            if (isDatabaseUnreachable(error)) {
+                return res.status(503).json({ error: 'This service is temporarily unavailable.' });
+            }
+            return res.status(500).json({ error: 'Could not send a magic link right now.' });
+        }
+    },
+
+    /**
+     * Consumes a magic link token and issues a session.
+     *
+     * The token is compared as a hash: the raw token is never stored. On success the
+     * row is deleted so it cannot be replayed, and the user's `token_version` is
+     * bumped so any prior stale tokens are invalidated.
+     *
+     * Because this endpoint is reached by a link in an email rather than a form
+     * submission, the token arrives in the request body from the frontend (which
+     * reads it from the URL fragment and removes the fragment from the address bar
+     * before navigating).
+     */
+    consumeMagicLink: async (req, res) => {
+        const rawToken = String(req.body?.token || '').trim();
+        if (!/^[0-9a-f]{64}$/i.test(rawToken)) {
+            return res.status(400).json({ error: 'This magic link is invalid or has expired.' });
+        }
+        if (!process.env.JWT_SECRET) {
+            return res.status(503).json({ error: 'Account login is not configured.' });
+        }
+
+        const tokenHash = createHash('sha256').update(rawToken).digest('hex');
+
+        let client;
+        try {
+            client = await pool.connect();
+            await client.query('BEGIN');
+
+            // Delete and return in one shot: single-use semantics with no race.
+            const found = await client.query(
+                `DELETE FROM magic_link_tokens
+                 WHERE token_hash = $1 AND used_at IS NULL AND expires_at > NOW()
+                 RETURNING user_id, email`,
+                [tokenHash]
+            );
+
+            if (found.rows.length === 0) {
+                await client.query('ROLLBACK');
+                client.release();
+                client = null;
+                return res.status(400).json({ error: 'This magic link is invalid or has expired.' });
+            }
+
+            const row = found.rows[0];
+
+            // Re-fetch the user with token_version so issueToken has the column it needs.
+            const userResult = await client.query(
+                `SELECT id, email, balance, demo_balance, is_banned, token_version
+                 FROM users
+                 WHERE id = $1 FOR UPDATE`,
+                [row.user_id]
+            );
+            const user = userResult.rows[0];
+
+            if (!user || user.is_banned) {
+                await client.query('ROLLBACK');
+                client.release();
+                client = null;
+                return res.status(400).json({ error: 'This magic link is invalid or has expired.' });
+            }
+
+            await client.query('COMMIT');
+            client.release();
+            client = null;
+
+            const token = issueToken(user);
+            if (!token) {
+                return res.status(503).json({ error: 'Account login is not configured.' });
+            }
+
+            sendAccountVerifiedEmail({ to: user.email }).catch((error) => {
+                console.error('Magic link sign-in thank-you email failed:', error.message);
+            });
+
+            return res.json({ token, user: publicUser(user) });
+        } catch (error) {
+            if (client) {
+                await client.query('ROLLBACK').catch(() => {});
+                client.release();
+            }
+            console.error('Consume magic link Error:', error.message);
+            if (isDatabaseUnreachable(error)) {
+                return res.status(503).json({ error: 'This service is temporarily unavailable.' });
+            }
+            return res.status(500).json({ error: 'Could not sign you in right now.' });
         }
     },
 };

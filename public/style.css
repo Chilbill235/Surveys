@@ -2312,6 +2312,223 @@ select.form-control:disabled { cursor: not-allowed; background-image: none; padd
    screen readers as a polite live region.
    ========================================================================== */
 
+/* ==========================================================================
+   Notification dropdown
+   --------------------------------------------------------------------------
+   A Rainbet-style bell in the header that drops down a panel of recent
+   processed rewards, deposits, and withdrawals. Toasts still fire for
+   immediate visibility; this dropdown keeps the history.
+   ========================================================================== */
+
+.notification-bell {
+    position: relative;
+    width: 40px;
+    height: 40px;
+    padding: 0;
+    border-radius: var(--r-sm);
+    color: var(--ink-soft);
+    background: var(--surface);
+    border: 1px solid var(--line);
+    transition: background-color 0.16s var(--ease), color 0.16s var(--ease), border-color 0.16s var(--ease);
+}
+.notification-bell:hover:not(:disabled) {
+    color: var(--heading);
+    background: var(--surface-2);
+    border-color: var(--indigo-700);
+}
+.notification-bell:focus-visible {
+    outline: 2px solid var(--coral-500);
+    outline-offset: 2px;
+}
+
+.notification-icon {
+    display: block;
+    width: 18px;
+    height: 18px;
+    margin: 0 auto;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%233d4457' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9'/%3E%3Cpath d='M13.73 21a2 2 0 0 1-3.46 0'/%3E%3C/svg%3E");
+    background-size: contain;
+    background-repeat: no-repeat;
+    background-position: center;
+    content: '';
+}
+.notification-bell:hover .notification-icon {
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23131c4a' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9'/%3E%3Cpath d='M13.73 21a2 2 0 0 1-3.46 0'/%3E%3C/svg%3E");
+}
+
+.notification-count {
+    position: absolute;
+    top: 4px;
+    right: 4px;
+    min-width: 18px;
+    height: 18px;
+    padding: 0 4px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    color: #fff;
+    font-size: 0.68rem;
+    font-weight: 700;
+    background: var(--danger);
+    border-radius: var(--r-pill);
+}
+
+.notification-dropdown {
+    position: absolute;
+    top: calc(var(--header-h) + 12px);
+    right: 16px;
+    z-index: 100;
+    width: min(360px, calc(100% - 32px));
+    max-height: min(50vh, 480px);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    color: var(--ink);
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--r-lg);
+    box-shadow: var(--shadow-lg);
+}
+
+.notification-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--line);
+    background: var(--surface-2);
+}
+.notification-header h3 {
+    margin: 0;
+    color: var(--heading);
+    font-size: var(--step-0);
+    font-weight: 700;
+}
+
+.notification-list {
+    overflow-y: auto;
+    flex: 1 1 auto;
+}
+
+.notification-empty {
+    padding: 18px;
+    color: var(--muted);
+    font-size: var(--step--1);
+    text-align: center;
+}
+
+.notification-item {
+    position: relative;
+    display: flex;
+    gap: 10px;
+    align-items: flex-start;
+    padding: 12px 14px;
+    border-bottom: 1px solid var(--line);
+    transition: background-color 0.16s var(--ease);
+}
+.notification-item:hover {
+    background: var(--surface-2);
+}
+.notification-item:last-child {
+    border-bottom: 0;
+}
+
+.notification-item-icon {
+    flex: 0 0 auto;
+    margin-top: 2px;
+    width: 20px;
+    height: 20px;
+    display: grid;
+    place-items: center;
+    border-radius: 50%;
+    font-size: 12px;
+}
+.notification-item.is-success .notification-item-icon {
+    background: var(--success-bg);
+    color: var(--success);
+}
+.notification-item.is-info .notification-item-icon {
+    background: var(--indigo-100);
+    color: var(--indigo-700);
+}
+.notification-item.is-warning .notification-item-icon {
+    background: var(--warning-bg);
+    color: var(--warning);
+}
+.notification-item.is-error .notification-item-icon {
+    background: var(--danger-bg);
+    color: var(--danger);
+}
+
+.notification-item-content {
+    min-width: 0;
+    flex: 1 1 auto;
+}
+.notification-item-title {
+    font-size: var(--step--1);
+    font-weight: 700;
+    color: var(--heading);
+    overflow-wrap: anywhere;
+}
+.notification-item-message {
+    margin: 2px 0 0;
+    font-size: var(--step--2);
+    color: var(--ink-soft);
+    line-height: 1.4;
+}
+
+.notification-item .notification-item-time {
+    flex: 0 0 auto;
+    margin-left: 10px;
+    color: var(--faint);
+    font-size: 0.68rem;
+    white-space: nowrap;
+}
+
+.notification-item.unread {
+    border-left: 3px solid var(--accent);
+    background: color-mix(in srgb, var(--indigo-100) 20%, transparent);
+}
+.notification-item.unread .notification-item-icon {
+    box-shadow: 0 0 0 2px var(--accent);
+}
+
+.notification-item-close {
+    flex: 0 0 auto;
+    margin-left: 8px;
+    border: 0;
+    border-radius: 4px;
+    padding: 2px 6px;
+    color: var(--faint);
+    background: transparent;
+    font-size: 15px;
+    line-height: 1;
+    cursor: pointer;
+    transition: color 0.16s var(--ease);
+}
+.notification-item-close:hover {
+    color: var(--danger);
+}
+
+@media (prefers-color-scheme: dark) {
+    .notification-dropdown {
+        background: var(--surface);
+        border-color: var(--line);
+    }
+    .notification-item.unread {
+        background: color-mix(in srgb, var(--indigo-100) 15%, transparent);
+    }
+}
+
+@media (max-width: 640px) {
+    .notification-dropdown {
+        top: calc(56px + 12px);
+        right: 8px;
+        left: 8px;
+    }
+}
+
 .toast-region {
     position: fixed;
     z-index: 1000;
@@ -2424,4 +2641,5 @@ select.form-control:disabled { cursor: not-allowed; background-image: none; padd
     .site-footer a { padding: 12px 4px; margin: -12px -4px; }
     .home-nav-link { padding: 12px 4px; margin: -12px -4px; }
     .home-text-link { padding: 12px 4px; margin: -12px -4px; }
+    .notification-bell { min-width: 48px; min-height: 48px; }
 }

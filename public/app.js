@@ -128,6 +128,181 @@ function dismissToast(id) {
     setTimeout(() => toast.remove(), 200);
 }
 
+/* ==========================================================================
+   Notification dropdown
+   --------------------------------------------------------------------------
+   A header bell that drops down a panel of recent notifications, mirroring the
+   toasts but keeping a dismissible history. Unread count is persisted in
+   `localStorage` so the badge survives a reload.
+   ========================================================================== */
+
+const NOTIFICATIONS_KEY = 'offerNetworkNotifications';
+const NOTIFICATIONS_LIMIT = 50;
+
+function loadNotifications() {
+    try {
+        const raw = window.localStorage.getItem(NOTIFICATIONS_KEY);
+        const parsed = raw ? JSON.parse(raw) : [];
+        return Array.isArray(parsed) ? parsed : [];
+    } catch {
+        return [];
+    }
+}
+
+function saveNotifications(list) {
+    try {
+        window.localStorage.setItem(NOTIFICATIONS_KEY, JSON.stringify(list.slice(-NOTIFICATIONS_LIMIT)));
+    } catch {
+        // Storage full or unavailable. The in-memory version still works for this tab.
+    }
+}
+
+let notificationStore = loadNotifications();
+
+function unreadCount() {
+    return notificationStore.filter((n) => !n.read).length;
+}
+
+function pushNotification({ title, message, tone = 'info', href = null }) {
+    notificationStore.push({
+        id: Date.now() + Math.random(),
+        title,
+        message,
+        tone,
+        href,
+        read: false,
+        timestamp: Date.now()
+    });
+    saveNotifications(notificationStore);
+    renderNotificationBell();
+    if (notificationDropdown && !notificationDropdown.hidden) {
+        renderNotificationList();
+    }
+}
+
+function markNotificationRead(id) {
+    notificationStore = notificationStore.map((n) =>
+        n.id === id ? { ...n, read: true } : n
+    );
+    saveNotifications(notificationStore);
+}
+
+function markAllNotificationsRead() {
+    notificationStore = notificationStore.map((n) => ({ ...n, read: true }));
+    saveNotifications(notificationStore);
+    renderNotificationList();
+    renderNotificationBell();
+}
+
+function dismissNotification(id) {
+    notificationStore = notificationStore.filter((n) => n.id !== id);
+    saveNotifications(notificationStore);
+    if (!notificationDropdown.hidden) renderNotificationList();
+    renderNotificationBell();
+}
+
+function renderNotificationBell() {
+    const bell = document.getElementById('notification-bell');
+    const count = document.getElementById('notification-count');
+    if (!bell || !count) return;
+
+    const countValue = unreadCount();
+    if (countValue > 0) {
+        bell.hidden = false;
+        count.textContent = String(countValue > 99 ? '99+' : countValue);
+        count.hidden = false;
+    } else {
+        bell.hidden = false;
+        count.hidden = true;
+    }
+}
+
+function renderNotificationList() {
+    const list = document.getElementById('notification-list');
+    if (!list) return;
+
+    const recent = [...notificationStore].reverse();
+    if (recent.length === 0) {
+        list.innerHTML = '<p class="notification-empty">No notifications yet.</p>';
+        return;
+    }
+
+    list.innerHTML = '';
+    const fragment = document.createDocumentFragment();
+    for (const item of recent) {
+        const el = document.createElement('div');
+        el.className = `notification-item is-${item.tone} ${item.read ? '' : 'unread'}`;
+        el.innerHTML = `
+            <span class="notification-item-icon" aria-hidden="true">${TOAST_ICONS[item.tone] || TOAST_ICONS.info}</span>
+            <div class="notification-item-content">
+                <div class="notification-item-title">${escapeHtml(item.title)}</div>
+                ${item.message ? `<div class="notification-item-message">${escapeHtml(item.message)}</div>` : ''}
+            </div>
+            <span class="notification-item-time">${formatTimeAgo(item.timestamp)}</span>
+            <button class="notification-item-close" type="button" aria-label="Dismiss">&times;</button>
+        `;
+
+        el.querySelector('.notification-item-close').addEventListener('click', () => dismissNotification(item.id));
+        el.addEventListener('click', (event) => {
+            if (event.target.closest('.notification-item-close')) return;
+            if (!item.read) markNotificationRead(item.id);
+            if (item.href) window.location.assign(item.href);
+        });
+        fragment.appendChild(el);
+    }
+    list.appendChild(fragment);
+}
+
+function formatTimeAgo(ts) {
+    const seconds = Math.round((Date.now() - ts) / 1000);
+    if (seconds < 60) return 'now';
+    const minutes = Math.round(seconds / 60);
+    if (minutes < 60) return `${minutes}m ago`;
+    const hours = Math.round(minutes / 60);
+    return `${hours}h ago`;
+}
+
+const notificationDropdown = document.getElementById('notification-dropdown');
+const notificationBell = document.getElementById('notification-bell');
+
+function toggleNotificationDropdown() {
+    if (!notificationDropdown || !notificationBell) return;
+    const isOpen = !notificationDropdown.hidden;
+    notificationDropdown.hidden = isOpen;
+    notificationBell.setAttribute('aria-expanded', String(!isOpen));
+    if (!isOpen) {
+        renderNotificationList();
+        markAllNotificationsRead();
+    }
+}
+
+function closeNotificationDropdown() {
+    if (!notificationDropdown || !notificationBell) return;
+    notificationDropdown.hidden = true;
+    notificationBell.setAttribute('aria-expanded', 'false');
+}
+
+function initNotifications() {
+    renderNotificationBell();
+    notificationBell?.addEventListener('click', (event) => {
+        event.stopPropagation();
+        toggleNotificationDropdown();
+    });
+
+    document.addEventListener('click', (event) => {
+        if (notificationDropdown && !notificationDropdown.hidden &&
+            !notificationDropdown.contains(event.target) &&
+            event.target !== notificationBell) {
+            closeNotificationDropdown();
+        }
+    });
+
+    document.getElementById('notification-mark-all')?.addEventListener('click', (event) => {
+        event.stopPropagation();
+        markAllNotificationsRead();
+    });
+}
+
 function escapeHtml(value) {
     return String(value ?? '')
         .replace(/&/g, '&amp;')
@@ -139,43 +314,38 @@ function escapeHtml(value) {
 
 // Convenience wrappers matching the events that need them.
 function notifyDepositConfirmed(item) {
-    showToast(
-        'Deposit credited',
-        `${formatBalance(item.amount)} ${item.currency_code || 'USD'} added to your balance.`,
-        { tone: 'success' }
-    );
+    const title = 'Deposit credited';
+    const message = `${formatBalance(item.amount)} ${item.currency_code || 'USD'} added to your balance.`;
+    showToast(title, message, { tone: 'success' });
+    pushNotification({ title, message, tone: 'success' });
 }
 
 function notifyWithdrawalSubmitted(item) {
-    showToast(
-        'Withdrawal submitted',
-        `Your request to withdraw ${formatBalance(item.amount)} is being processed.`,
-        { tone: 'info' }
-    );
+    const title = 'Withdrawal submitted';
+    const message = `Your request to withdraw ${formatBalance(item.amount)} is being processed.`;
+    showToast(title, message, { tone: 'info' });
+    pushNotification({ title, message, tone: 'info' });
 }
 
 function notifyWithdrawalPaid(item) {
-    showToast(
-        'Withdrawal sent',
-        `${formatBalance(item.amount)} has been sent to your payment method.`,
-        { tone: 'success' }
-    );
+    const title = 'Withdrawal sent';
+    const message = `${formatBalance(item.amount)} has been sent to your payment method.`;
+    showToast(title, message, { tone: 'success' });
+    pushNotification({ title, message, tone: 'success' });
 }
 
 function notifyWithdrawalFailed(item) {
-    showToast(
-        'Withdrawal failed',
-        item.failureReason || 'Your withdrawal could not be completed.',
-        { tone: 'error' }
-    );
+    const title = 'Withdrawal failed';
+    const message = item.failureReason || 'Your withdrawal could not be completed.';
+    showToast(title, message, { tone: 'error' });
+    pushNotification({ title, message, tone: 'error' });
 }
 
 function notifySessionExpired() {
-    showToast(
-        'Session expired',
-        'Sign in again to continue.',
-        { tone: 'warning' }
-    );
+    const title = 'Session expired';
+    const message = 'Sign in again to continue.';
+    showToast(title, message, { tone: 'warning' });
+    pushNotification({ title, message, tone: 'warning' });
 }
 
 /**
@@ -340,6 +510,11 @@ document.addEventListener('DOMContentLoaded', () => {
         setAuthMode('login');
         document.getElementById('account-email').focus();
     });
+    document.getElementById('verify-magic-link')?.addEventListener('click', sendMagicLink);
+
+    // Magic link returned from the email: read the token from the URL fragment
+    // and exchange it for a session silently.
+    checkMagicLinkReturn();
 
     document.getElementById('offer-search').addEventListener('input', (event) => {
         offerState.search = event.target.value.trim().toLowerCase();
@@ -407,6 +582,7 @@ document.addEventListener('DOMContentLoaded', () => {
     updateDepositFields();
     updateWithdrawFields();
     refreshBalance();
+    initNotifications();
     // The notice is shown once the catalog has finished loading, not before. `loadOffers`
     // owns `page-message` for the duration of its request -- it clears the box on the way
     // in and writes an error into it on the way out -- so setting a notice beforehand would
@@ -492,7 +668,19 @@ const liveState = {
     /** A deposit the user is waiting on, which is what justifies a fast interval. */
     awaitingDeposit: false,
     lastSyncedAt: 0,
-    consecutiveFailures: 0
+    consecutiveFailures: 0,
+    /**
+     * Balance the live sync last saw, so a reward that arrives between polls can be
+     * detected: the balance simply goes up, with no deposit row to explain it.
+     */
+    lastKnownBalance: NaN,
+    lastKnownDemoBalance: NaN,
+    /** Sum of deposit credits seen in the current update, so the balance delta can be
+     *  split between "money arrived" and "reward was credited". */
+    creditedDepositTotal: 0,
+    /** Sum of withdrawal refunds seen in the current update, so a returned withdrawal
+     * is not double-counted as a reward. */
+    refundedWithdrawalTotal: 0
 };
 
 /** How long to wait before the next check, given whether something is outstanding. */
@@ -575,6 +763,13 @@ async function syncNow() {
  * under the pointer, or replace a message they are reading.
  */
 function applyLiveUpdate(payload) {
+    const hadBalance = Number.isFinite(liveState.lastKnownBalance);
+    const hadDemo = Number.isFinite(liveState.lastKnownDemoBalance);
+
+    // Reset the per-update accumulators so they only reflect this poll.
+    liveState.creditedDepositTotal = 0;
+    liveState.refundedWithdrawalTotal = 0;
+
     if (typeof payload.balance === 'string' && payload.balance !== accountState.balance) {
         // `applyBalance` is the one place that writes the header and keeps the withdrawal
         // ceiling in step, so the live path routes through it rather than repeating it. A
@@ -616,6 +811,7 @@ function applyLiveUpdate(payload) {
         const credited = status === 'confirmed' || status === 'paid';
         if (credited && !creditedDepositsSeen.has(item.id)) {
             creditedDepositsSeen.add(item.id);
+            liveState.creditedDepositTotal += Number(item.amount) || 0;
             if (isDialogOpen('deposit-dialog')) showDepositSuccess(item);
         }
     }
@@ -632,8 +828,49 @@ function applyLiveUpdate(payload) {
             notifyWithdrawalPaid(item);
         } else if (status === 'failed' && !withdrawalStateSeen(item.id, 'failed')) {
             markWithdrawalSeen(item.id, 'failed');
+            liveState.refundedWithdrawalTotal += Number(item.amount) || 0;
             notifyWithdrawalFailed(item);
         }
+    }
+
+    // A reward from a completed offer or survey arrives as a plain balance increase with
+    // no deposit or withdrawal row to explain it. Detect that by comparing the delta
+    // against the credits and refunds already announced in this update.
+    if (hadBalance && typeof payload.balance === 'string') {
+        const prevBalance = liveState.lastKnownBalance;
+        const newBalance = Number(payload.balance);
+        const delta = newBalance - prevBalance;
+        const accounted = liveState.creditedDepositTotal + liveState.refundedWithdrawalTotal;
+
+        if (delta > 0 && delta > accounted + 0.01) {
+            const rewardAmount = delta - accounted;
+            const adjusted = Math.max(0, rewardAmount);
+            const title = 'Reward credited';
+            const message = `${formatBalance(adjusted)} credited to your balance from a completed offer.`;
+            showToast(title, message, { tone: 'success' });
+            pushNotification({ title, message, tone: 'success' });
+        }
+    }
+
+    // Track demo balance changes for demo reward notifications.
+    if (hadDemo && typeof payload.demoBalance === 'string' && payload.demoBalance !== String(liveState.lastKnownDemoBalance)) {
+        const prevDemo = liveState.lastKnownDemoBalance;
+        const newDemo = Number(payload.demoBalance);
+        const demoDelta = newDemo - prevDemo;
+        if (demoDelta > 0.01) {
+            const title = 'Demo reward credited';
+            const message = `${formatBalance(demoDelta)} demo added to your balance.`;
+            showToast(title, message, { tone: 'info' });
+            pushNotification({ title, message, tone: 'info' });
+        }
+    }
+
+    // Update the tracked previous balances for the next comparison.
+    if (typeof payload.balance === 'string') {
+        liveState.lastKnownBalance = Number(payload.balance);
+    }
+    if (typeof payload.demoBalance === 'string') {
+        liveState.lastKnownDemoBalance = Number(payload.demoBalance);
     }
 }
 
@@ -1085,6 +1322,14 @@ function syncAccountControls() {
     document.getElementById('deposit-button').disabled = !connected;
     document.getElementById('withdraw-button').disabled = !connected;
 
+    // The notification bell is only useful when signed in; hide it (and close any
+    // open dropdown) for a logged-out visitor.
+    const bell = document.getElementById('notification-bell');
+    if (bell) {
+        bell.hidden = !connected;
+        if (!connected) closeNotificationDropdown();
+    }
+
     // Mirror the header state onto the narrow-screen action bar.
     document.querySelectorAll('[data-mirror]').forEach((barButton) => {
         const target = document.getElementById(barButton.dataset.mirror);
@@ -1262,6 +1507,82 @@ async function resendVerificationCode() {
     }
 }
 
+/**
+ * Sends a magic link to the email shown on the confirm screen.
+ *
+ * The user has already proven they own the password (they just typed it on
+ * register or login), so no additional identity check is needed before sending
+ * the link. The link is single-use and expires in 15 minutes.
+ */
+async function sendMagicLink() {
+    const form = document.getElementById('account-form');
+    const email = form.dataset.verifyEmail || document.getElementById('account-email').value.trim();
+    const button = document.getElementById('verify-magic-link');
+
+    button.disabled = true;
+    button.textContent = 'Sending...';
+    setFormMessage('verify-message', '');
+
+    try {
+        const data = await requestJson('/api/auth/magic-link', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ email })
+        });
+        setFormMessage('verify-message', data.message || 'If an unconfirmed account exists for that email, a magic link is on its way.', 'success');
+        pushNotification({
+            title: 'Magic link sent',
+            message: 'Check your email for a sign-in link.',
+            tone: 'success'
+        });
+        // Auto-open the dialog if the user clicked the link from outside the sign-in dialog.
+        // If they are already on the verify step, leave them there.
+    } catch (error) {
+        setFormMessage('verify-message', error.message, 'error');
+    } finally {
+        button.disabled = false;
+        button.textContent = 'Send me a magic link instead';
+    }
+}
+
+/**
+ * Checks the URL fragment for a magic link token and exchanges it for a session
+ * if one is present. The fragment is removed from the URL before the exchange
+ * so it never lands in browser history or gets copied by the user.
+ */
+function checkMagicLinkReturn() {
+    const fragment = window.location.hash.startsWith('#') ? window.location.hash.slice(1) : '';
+    if (!fragment) return;
+    const params = new URLSearchParams(fragment);
+    const token = params.get('magic');
+    if (!token || !/^[0-9a-f]{64}$/i.test(token)) return;
+
+    // Remove the fragment from the address bar immediately, before any navigation.
+    window.history.replaceState(null, '', window.location.pathname + window.location.search);
+    window.location.hash = '';
+
+    exchangeMagicLink(token);
+}
+
+/** Exchanges a magic link token for a session, then signs the user in. */
+async function exchangeMagicLink(token) {
+    try {
+        const data = await requestJson('/api/auth/magic-link/consume', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ token })
+        });
+        pushNotification({
+            title: 'Signed in',
+            message: 'You are signed in via magic link.',
+            tone: 'success'
+        });
+        completeSignIn(data);
+    } catch (error) {
+        showToast('Magic link failed', error.message || 'Could not sign in with that link.', { tone: 'error' });
+    }
+}
+
 /** Everything that has to happen once a session exists, for either sign-in route. */
 function completeSignIn(data) {
     sessionStorage.setItem(accountTokenKey, data.token);
@@ -1343,10 +1664,12 @@ async function connectAccount(event) {
 function applyBalance(balance, demoBalance) {
     document.getElementById('user-balance').textContent = formatBalance(balance);
     document.getElementById('demo-balance').textContent = formatBalance(demoBalance);
-    // Kept in state so the withdrawal form can show what is actually available and cap the
-    // amount box. It was only ever rendered into the header, which the dialog covers, so
-    // the form asked for an amount with no indication of the ceiling.
     accountState.balance = Number(balance);
+    // Seed the live-sync baseline so reward detection works from the first poll,
+    // not the second one. Only set when NaN so a live update does not clobber
+    // the tracked previous balance before the delta comparison runs.
+    if (!Number.isFinite(liveState.lastKnownBalance)) liveState.lastKnownBalance = Number(balance);
+    if (!Number.isFinite(liveState.lastKnownDemoBalance)) liveState.lastKnownDemoBalance = Number(demoBalance ?? 0);
     syncWithdrawBalance();
 }
 
