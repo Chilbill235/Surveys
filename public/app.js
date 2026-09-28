@@ -1308,11 +1308,106 @@ function validateDepositAmount() {
     const providerMinimum = providerMinimumForSelectedCurrency();
     if (!providerMinimum) {
         hint.classList.remove('is-error');
+        updateDepositSwapOffer();
         return;
     }
     const amount = Number(document.getElementById('deposit-amount').value);
     const below = Number.isFinite(amount) && amount > 0 && amount < providerMinimum;
     hint.classList.toggle('is-error', below);
+    updateDepositSwapOffer();
+}
+
+/**
+ * The cheapest coin the provider will actually accept for the amount already in the box.
+ *
+ * Returns null when the selected coin is already the cheapest, when nothing else qualifies,
+ * or when no options have loaded. A coin with no reported floor is treated as accepting the
+ * app's own $1.00, because that is the only floor this app enforces itself.
+ */
+function cheapestCurrencyAccepting(amount) {
+    const options = depositState.options;
+    const select = document.getElementById('deposit-currency');
+    // `cryptoCurrencies` is checked for shape, not just for existence. This runs on every
+    // keystroke in the amount box, including before the first options request has resolved and
+    // again if that request fails, so it has to survive whatever `depositState.options` happens
+    // to be holding rather than assuming the fully-populated server shape.
+    if (!options || !select || !Array.isArray(options.cryptoCurrencies)) return null;
+    if (!Number.isFinite(amount) || amount <= 0) return null;
+
+    const current = select.value;
+    const appFloor = minimumForSelectedCurrency();
+    let best = null;
+
+    for (const code of options.cryptoCurrencies) {
+        if (code === current) continue;
+        const reported = Number(options.minimums?.[code]);
+        const floor = Number.isFinite(reported) && reported > 0 ? reported : appFloor;
+        if (floor > amount) continue;
+        if (!best || floor < best.floor) best = { code, floor };
+    }
+    return best;
+}
+
+/**
+ * Offers a one-tap switch to a coin that will take the amount already typed.
+ *
+ * The app advertises a $1.00 minimum, and that promise is only true of some coins: NOWPayments
+ * genuinely refuses a Bitcoin Cash deposit under about $18.79, and a handful of other pairs
+ * sit in the same range. Telling the user that the amount is too small is necessary and not
+ * sufficient, because the actionable part is not "type more" -- it is "use a different coin".
+ * Without this, the only way to discover a $1 deposit exists is to read every entry in the
+ * picker.
+ *
+ * Deliberately does not change the amount or the selected coin on its own. Switching a user's
+ * payment method because their amount was rejected is not a correction, it is a substitution,
+ * and the coin they pick is the one whose network and fees they agreed to. The button performs
+ * the change, so it is visible and reversible.
+ */
+function updateDepositSwapOffer() {
+    const offer = document.getElementById('deposit-swap-hint');
+    if (!offer) return;
+
+    const hide = () => {
+        offer.hidden = true;
+        offer.replaceChildren();
+    };
+
+    const providerMinimum = providerMinimumForSelectedCurrency();
+    const amount = Number(document.getElementById('deposit-amount')?.value);
+    if (!providerMinimum || !Number.isFinite(amount) || amount <= 0 || amount >= providerMinimum) {
+        hide();
+        return;
+    }
+
+    const cheaper = cheapestCurrencyAccepting(amount);
+    if (!cheaper) {
+        hide();
+        return;
+    }
+
+    const name = cryptoCurrencyNames[cheaper.code] || cheaper.code.toUpperCase();
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'swap-button';
+    button.textContent = `Use ${name} instead — from ${formatBalance(cheaper.floor)}`;
+
+    button.addEventListener('click', () => {
+        const select = document.getElementById('deposit-currency');
+        if (!select) return;
+        select.value = cheaper.code;
+        clearDepositMessage();
+        // Reuses the currency-change path so the amount bounds, the hint, and the presets all
+        // recompute from the new coin. Driving the select and dispatching is what keeps this
+        // button from being a second, subtly different implementation of the same change.
+        select.dispatchEvent(new Event('change'));
+        document.getElementById('deposit-amount')?.focus();
+    });
+
+    offer.replaceChildren(
+        document.createTextNode(`${formatBalance(amount)} is below the ${formatBalance(providerMinimum)} floor for this coin. `),
+        button
+    );
+    offer.hidden = false;
 }
 
 async function loadDepositOptions() {

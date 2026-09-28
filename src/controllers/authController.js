@@ -4,6 +4,7 @@ const jwt = require('jsonwebtoken');
 const pool = require('../config/db');
 const { consumeRateLimit } = require('../services/security');
 const { sendPasswordResetEmail } = require('../services/resetEmail');
+const { sendWelcomeEmail, sendAccountVerifiedEmail } = require('../services/accountEmails');
 const mailer = require('../services/mailer');
 const {
     generateCode,
@@ -373,6 +374,15 @@ const authController = {
                     console.error(`Verification email was not delivered (${delivery.reason}).`);
                 }
 
+                // The welcome is a second, independent message. It is sent without awaiting it
+                // and its failure is swallowed inside the mailer, because the account already
+                // exists by now: holding the response open to deliver a courtesy email would
+                // turn a slow provider into a failed registration, and awaiting it serially
+                // would double the time the user waits on the button they just pressed.
+                sendWelcomeEmail({ to: user.email }).catch((error) => {
+                    console.error('Welcome email failed:', error.message);
+                });
+
                 return res.status(201).json({
                     requiresVerification: true,
                     email: user.email,
@@ -485,6 +495,16 @@ const authController = {
             if (!token) {
                 return res.status(503).json({ error: 'Account login is not configured.' });
             }
+
+            // Sent here, and not during registration, because this is the only point at which
+            // the address is known to be real. A welcome sent on registration congratulates
+            // someone on an account they may not be able to use, and would have to be corrected
+            // by a follow-up if the code were never entered. Fire-and-forget for the same reason
+            // as registration: the session is already issued and the user is already waiting.
+            sendAccountVerifiedEmail({ to: user.email }).catch((error) => {
+                console.error('Verification thank-you email failed:', error.message);
+            });
+
             return res.json({ token, user: publicUser(user) });
         } catch (error) {
             if (client) {

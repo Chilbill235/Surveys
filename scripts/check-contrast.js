@@ -245,7 +245,14 @@ const PAIRS = [
     { fg: 'success', bg: 'success-bg', where: 'confirmation tick and success text' },
     { fg: 'warning', bg: 'warning-bg', where: 'warning text' },
     { fg: 'danger', bg: 'danger-bg', where: 'error text' },
-    { fg: 'danger', bg: 'surface', where: 'error text on a card' }
+    { fg: 'danger', bg: 'surface', where: 'error text on a card' },
+
+    // The "use a different coin" button in the deposit form. It is a filled button rather
+    // than another warning paragraph, so the pair is the button's own text against the
+    // warning colour, and the surrounding paragraph is already covered by warning/warning-bg
+    // above. Worth its own entry because a filled button is the one place a semantic colour
+    // stops being text and becomes a background, and the contrast maths is different.
+    { fg: 'surface', bg: 'warning', where: 'swap-coin button label' }
 ];
 
 // ---------------------------------------------------------------------------

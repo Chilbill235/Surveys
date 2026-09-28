@@ -1,5 +1,6 @@
 const { createHash, randomInt, timingSafeEqual } = require('node:crypto');
 const { sendEmail, isEmailConfigured } = require('./mailer');
+const { renderEmail, renderEmailText } = require('./emailLayout');
 
 /**
  * Six-digit email verification.
@@ -82,28 +83,41 @@ function codeMatches(submittedCode, storedHash, userId) {
     return timingSafeEqual(computed, stored);
 }
 
-/** The text and HTML bodies for the verification message. */
+/**
+ * The text and HTML bodies for the verification message.
+ *
+ * The code is the point of the message, so it is the one element that is not a paragraph: it
+ * gets its own high-contrast cell, a monospace face, and wide letter spacing, because a
+ * six-digit number in body type is easy to misread and a misread code spends one of five
+ * attempts. The same digits are in the text alternative, so a client that renders no HTML at
+ * all can still complete the flow.
+ *
+ * Both bodies are produced by the shared layout so this message looks like the rest of the
+ * product rather than like a different sender, and so the text and HTML versions cannot drift
+ * apart -- which is how a message ends up saying "click here" in a form that has no button.
+ */
 function buildMessage({ code, minutes = CODE_LIFETIME_MINUTES }) {
     const subject = 'Confirm your RewardZone email';
-    const text = [
-        'Confirm your email address to finish creating your RewardZone account.',
-        '',
-        `Your confirmation code is ${code}`,
-        '',
-        `It expires in ${minutes} minutes. If it has expired, request a new one from the sign-in page.`,
-        'If you did not try to create an account, you can ignore this email and nothing will happen.'
-    ].join('\n');
+    const blocks = [
+        { type: 'code', value: code },
+        { type: 'callout', tone: 'neutral', text: `This code expires in ${minutes} minutes. Request a new one from the sign-in page if it has expired.` },
+        { type: 'paragraph', text: 'If you did not try to create an account, you can ignore this email and nothing will happen.' }
+    ];
 
-    // The code is repeated in a larger, spaced style so it can be read aloud or copied
-    // without ambiguity between characters, which is the whole point of sending it.
-    const html = [
-        '<p>Confirm your email address to finish creating your RewardZone account.</p>',
-        `<p style="font-size:28px;font-weight:700;letter-spacing:6px;margin:24px 0">${code}</p>`,
-        `<p>It expires in ${minutes} minutes. If it has expired, request a new one from the sign-in page.</p>`,
-        '<p>If you did not try to create an account, you can ignore this email and nothing will happen.</p>'
-    ].join('');
+    const shared = {
+        heading: 'Confirm your email',
+        intro: 'Enter this 6-digit code to finish creating your RewardZone account.',
+        blocks
+    };
 
-    return { subject, text, html };
+    return {
+        subject,
+        text: renderEmailText(shared),
+        html: renderEmail({
+            preheader: `${code} is your RewardZone confirmation code.`,
+            ...shared
+        })
+    };
 }
 
 /**

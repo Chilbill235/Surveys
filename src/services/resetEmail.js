@@ -1,4 +1,5 @@
 const { sendEmail, isEmailConfigured } = require('./mailer');
+const { renderEmail, renderEmailText } = require('./emailLayout');
 
 /**
  * Password reset delivery.
@@ -22,23 +23,30 @@ async function sendPasswordResetEmail({ to, resetUrl }) {
         return { sent: false, reason: 'email-not-configured' };
     }
 
+    const blocks = [
+        { type: 'callout', tone: 'neutral', text: 'This link expires in 60 minutes and can only be used once.' },
+        { type: 'paragraph', text: 'If you did not request this, ignore this email and your password stays unchanged. If someone else has your password, reset it here and then change it again.' }
+    ];
+
+    const shared = {
+        heading: 'Reset your password',
+        intro: 'Someone asked to reset the password for your RewardZone account. Choose a new one to carry on.',
+        blocks
+    };
+
     return sendEmail({
         to,
         subject: 'Reset your RewardZone password',
-        text: [
-            'Someone asked to reset the password for this RewardZone account.',
-            '',
-            `Open this link to choose a new password: ${resetUrl}`,
-            '',
-            'The link expires in 60 minutes and can only be used once.',
-            'If you did not request this, you can ignore this email and your password stays unchanged.'
-        ].join('\n'),
-        html: [
-            '<p>Someone asked to reset the password for this RewardZone account.</p>',
-            `<p><a href="${resetUrl}">Choose a new password</a></p>`,
-            '<p>The link expires in 60 minutes and can only be used once.</p>',
-            '<p>If you did not request this, you can ignore this email and your password stays unchanged.</p>'
-        ].join('')
+        text: renderEmailText({
+            ...shared,
+            action: { label: 'Choose a new password', url: resetUrl, note: 'Expires in 60 minutes. Single use.' }
+        }),
+        html: renderEmail({
+            preheader: 'A password reset was requested for your RewardZone account.',
+            ...shared,
+            action: { label: 'Choose a new password', url: resetUrl, note: 'If the button does not work, paste this link into your browser:' },
+            footnote: resetUrl
+        })
     });
 }
 

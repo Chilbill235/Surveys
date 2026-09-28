@@ -19,7 +19,7 @@
 <body class="has-action-bar">
     <header class="topbar">
         <a class="brand" href="/" aria-label="RewardZone home">
-            <span class="brand-mark" aria-hidden="true">R</span>
+            <img class="brand-mark" src="/brand.gif" alt="" width="36" height="36">
             <span>reward<span class="brand-light">zone</span></span>
         </a>
         <div class="account-tools">
@@ -248,6 +248,11 @@
                         <button type="button" data-deposit-amount="50">$50</button>
                     </div>
                     <p class="field-hint" id="deposit-amount-hint">Minimum $1.00. Maximum $5,000.00.</p>
+                    <!-- Appears only when the typed amount is under the selected coin's
+                         provider floor. It names a coin that will take the amount as it
+                         stands, because "too small" on its own gives the user nothing to do
+                         when the fix is to pick a different coin rather than type more. -->
+                    <p class="swap-hint" id="deposit-swap-hint" hidden></p>
                 </div>
 
                 <span class="form-label" id="deposit-method-label">Payment type</span>
