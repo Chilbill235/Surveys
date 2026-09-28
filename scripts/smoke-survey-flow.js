@@ -104,12 +104,43 @@ const asyncRun = (fn) => fn().catch((error) => {
         location.startsWith(process.env.APP_BASE_URL),
         location.slice(0, 60));
 
+    // The page asks what the database says the questions are, so the two cannot drift. This
+    // is the check that would have caught an answer offered by the page and refused by the
+    // server, which is the failure the hardcoded pair of definitions allowed.
+    const survey = await fetch(`${origin}/api/demo/survey`, {
+        headers: { Authorization: `Bearer ${session.token}` }
+    });
+    const surveyBody = await survey.json();
+    const asked = Array.isArray(surveyBody.questions) ? surveyBody.questions : [];
+    check('the survey is served from the database', survey.status === 200 && asked.length > 0,
+        `status ${survey.status}, ${asked.length} question(s)`);
+    check('every question is answerable and carries options',
+        asked.every((q) => q.key && q.prompt && Array.isArray(q.options) && q.options.length > 0),
+        asked.map((q) => q.key).join(', ') || 'none');
+    check('the survey requires a session',
+        (await fetch(`${origin}/api/demo/survey`)).status === 401);
+
+    // An answer that is not on the list must be refused, which is what keeps a stale page
+    // from recording a response to a question that no longer exists.
+    const invented = await fetch(`${origin}/api/demo/complete`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${session.token}` },
+        body: JSON.stringify({
+            clickId: engageTarget.searchParams.get('aff_sub'),
+            answers: { favorite: 'not-a-real-option', frequency: 'daily' }
+        })
+    });
+    check('an answer the survey never offered is refused', invented.status === 400,
+        `status ${invented.status}`);
+
     const complete = await fetch(`${origin}/api/demo/complete`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${session.token}` },
         body: JSON.stringify({
             clickId: engageTarget.searchParams.get('aff_sub'),
-            answers: { favorite: 'games', frequency: 'daily' }
+            // Built from what was actually asked, rather than hardcoded here -- which is the
+            // whole point of the endpoint existing.
+            answers: Object.fromEntries(asked.map((q) => [q.key, q.options[0].value]))
         })
     });
     const completeBody = await complete.json();

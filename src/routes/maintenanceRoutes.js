@@ -1,11 +1,13 @@
 const express = require('express');
 const { createHash, timingSafeEqual } = require('node:crypto');
 const router = express.Router();
+const pool = require('../config/db');
 const { register: registerMethod, methodsFor } = require('./methodRegistry');
 const { reconcilePendingDeposits } = require('../services/depositReconciliation');
 const { listUnresolvedWithdrawals, sendWithdrawal, reverseWithdrawal } = require('../services/withdrawalResolution');
 const ipnLog = require('../services/ipnLog');
 const nowPayments = require('../services/nowPayments');
+const autoPayouts = require('../services/autoPayouts');
 const { resolvePublicBaseUrl, isPubliclyReachable } = require('../services/publicBaseUrl');
 
 // ---------------------------------------------------------------------------
@@ -15,6 +17,8 @@ const { resolvePublicBaseUrl, isPubliclyReachable } = require('../services/publi
 const RECONCILE_PATH = '/api/maintenance/reconcile-deposits';
 const IPN_DIAGNOSTICS_PATH = '/api/maintenance/ipn-diagnostics';
 const WITHDRAWALS_PATH = '/api/maintenance/withdrawals';
+const AUTO_PAYOUTS_PREFLIGHT_PATH = '/api/maintenance/payouts/preflight';
+const AUTO_PAYOUTS_RUN_PATH = '/api/maintenance/payouts/run';
 /**
  * A withdrawal id fits in a Postgres BIGINT (up to 19 digits), so anything
  * longer is not a valid id and does not need to reach the database. The bound
@@ -38,7 +42,9 @@ const MAINTENANCE_METHODS = {
     ipnDiagnostics: /^\/api\/maintenance\/ipn-diagnostics\/?$/,
     listWithdrawals: /^\/api\/maintenance\/withdrawals\/?$/,
     markPaid: /^\/api\/maintenance\/withdrawals\/\d{1,19}\/paid\/?$/,
-    refund: /^\/api\/maintenance\/withdrawals\/\d{1,19}\/refund\/?$/
+    refund: /^\/api\/maintenance\/withdrawals\/\d{1,19}\/refund\/?$/,
+    payoutPreflight: /^\/api\/maintenance\/payouts\/preflight\/?$/,
+    payoutRun: /^\/api\/maintenance\/payouts\/run\/?$/
 };
 
 /**
@@ -421,6 +427,14 @@ registerMethod(MAINTENANCE_METHODS.ipnDiagnostics, ['GET', 'POST']);
 registerMethod(MAINTENANCE_METHODS.listWithdrawals, ['GET']);
 registerMethod(MAINTENANCE_METHODS.markPaid, ['POST']);
 registerMethod(MAINTENANCE_METHODS.refund, ['POST']);
+registerMethod(MAINTENANCE_METHODS.payoutPreflight, ['GET', 'POST']);
+// POST only, deliberately. A read-only GET is safe to expose, but a send is not: allowing it
+// on GET would mean a link preview, a crawler, or a browser prefetch could move money. The
+// dry run is on POST too, and is the default, so the safe operation is still one curl away.
+registerMethod(MAINTENANCE_METHODS.payoutRun, ['POST']);
+
+registerGetAndPost(AUTO_PAYOUTS_PREFLIGHT_PATH, handlePayoutPreflight);
+router.post(AUTO_PAYOUTS_RUN_PATH, handlePayoutRun);
 
 /**
  * Answers a maintenance path that no route matched.
@@ -457,6 +471,127 @@ router.use((req, res, next) => {
         hint: `Use ${allowed.join(' or ')} with ${req.path}.`,
     });
 });
+
+// ---------------------------------------------------------------------------
+// Automatic crypto payouts
+// ---------------------------------------------------------------------------
+
+/**
+ * Reports whether automatic payouts could run, and why not if they cannot.
+ *
+ * Separate from the run itself because the operator's first question is always "is this
+ * switched on and configured", and that is a different question from "did it send". It
+ * touches no user data, so it is safe to poll while setting things up.
+ */
+function handlePayoutPreflight(req, res) {
+    if (!enforceAccess(req, res)) return;
+    return res.json({ ok: true, preflight: autoPayouts.preflight() });
+}
+
+/**
+ * Claims and sends the eligible crypto withdrawals.
+ *
+ * `dryRun` is the default and it is not a formality. This endpoint moves real money to
+ * third-party wallet addresses with no human reading each one, so the safe reading of a
+ * request must be "tell me what you would do". A run that actually sends has to be asked for
+ * explicitly, and the response reports per-withdrawal what was claimed, sent, skipped, or
+ * left in an unknown state -- because a run that reported only a count could not tell an
+ * operator whether a silent failure had left a user waiting.
+ *
+ * PayPal and Venmo withdrawals are never in scope. NOWPayments cannot pay either, and the
+ * claim query filters on `payment_method = 'crypto'`, so they stay with the operator no
+ * matter what this endpoint is asked to do.
+ */
+async function handlePayoutRun(req, res) {
+    if (!enforceAccess(req, res)) return;
+
+    const preflight = autoPayouts.preflight();
+    if (!preflight.ready) {
+        // Reported as 409 rather than attempted. A run without the IPN secret would send
+        // money the app could never learn had arrived, and one without credentials would fail
+        // after the rows had already been claimed.
+        return res.status(409).json({
+            ok: false,
+            error: 'Automatic payouts are not ready to run.',
+            preflight
+        });
+    }
+
+    const dryRun = req.body?.dryRun !== false;
+    const limit = Math.min(Math.max(Number(req.body?.limit) || 10, 1), 50);
+
+    if (dryRun) {
+        // Claims nothing, so this is a count of what is waiting rather than a preview of
+        // specific rows: the real candidate list depends on the claim, and claiming would
+        // hold rows the operator then has to release.
+        const pending = await listCryptoPayoutQueue(limit);
+        return res.json({
+            ok: true,
+            dryRun: true,
+            preflight,
+            queued: pending.length,
+            withdrawals: pending,
+            hint: 'Send with {"dryRun": false} to claim and send these.'
+        });
+    }
+
+    const { claimed, skipped } = await autoPayouts.claimPayoutCandidates({
+        limit,
+        convertToCoin: usdToCoin
+    });
+    const outcome = await autoPayouts.submitClaimedPayouts(claimed);
+
+    return res.json({
+        ok: true,
+        dryRun: false,
+        preflight,
+        claimed: claimed.length,
+        submitted: outcome.submitted,
+        batchId: outcome.batchId,
+        // The number that matters most: rows whose fate the provider has not confirmed.
+        // They stay claimed on purpose and are listed for the operator to reconcile.
+        uncertain: outcome.uncertain,
+        skipped,
+        ...(outcome.error ? { error: outcome.error } : {})
+    });
+}
+
+/**
+ * USD to coin conversion for a payout, using the provider's own estimate.
+ *
+ * Done here rather than in the service so the conversion has one place to be swapped for a
+ * test double. Returning null on failure is deliberate: a withdrawal that cannot be priced
+ * is left for an operator rather than sent as a guessed amount.
+ */
+async function usdToCoin(usdAmount, ticker) {
+    const amount = Number(usdAmount);
+    if (!Number.isFinite(amount) || amount <= 0) return null;
+    const estimate = await nowPayments.request('GET', '/v1/estimate', {
+        query: { amount: amount, currency_from: 'usd', currency_to: String(ticker).toLowerCase() },
+        timeoutMs: 10000
+    });
+    const coin = Number(estimate?.estimated_amount);
+    return Number.isFinite(coin) && coin > 0 ? coin : null;
+}
+
+/** The crypto withdrawals currently waiting to be sent, for the dry run. */
+async function listCryptoPayoutQueue(limit) {
+    const result = await pool.query(
+        `SELECT w.id, w.amount, w.payment_address, w.asset_code, w.network, w.status,
+                w.payout_status, w.created_at
+         FROM withdrawals w
+         WHERE w.status = 'pending'
+           AND w.payment_method = 'crypto'
+           AND w.payout_status IS NULL
+         ORDER BY w.created_at ASC
+         LIMIT $1`,
+        [limit]
+    );
+    return result.rows;
+}
+
+registerMethod(MAINTENANCE_METHODS.payoutPreflight, ['GET']);
+registerMethod(MAINTENANCE_METHODS.payoutRun, ['POST']);
 
 // ---------------------------------------------------------------------------
 // Exports

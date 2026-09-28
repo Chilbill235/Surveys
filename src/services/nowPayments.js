@@ -596,6 +596,100 @@ async function getPayoutMinimum(currency) {
     }
 }
 
+/**
+ * Submits a batch of crypto payouts through the Mass Payouts API.
+ *
+ * The endpoint is a batch: one call carries many withdrawals, and the provider returns one
+ * `withdrawal` record per entry keyed by the `payoutId` the caller supplied. That caller
+ * key is the only way to map the response back to our rows, so it is required per entry and
+ * derived from the withdrawal id -- never a random value, because a value that could not be
+ * recomputed would make a response impossible to reconcile.
+ *
+ * This endpoint is the one place in the app that moves money out without a human, so the
+ * shape is deliberately narrow: it takes entries that have already been claimed, and it
+ * never decides *whether* to send. Callers must have recorded the claim durably first --
+ * see `autoPayouts` -- because a payout that is sent without a claim on file is a payout
+ * that can be sent again.
+ *
+ * `extraId` carries a destination tag or memo for the chains that route by one (XRP).
+ * Sending an XRP address with no tag is a transfer that confirms and delivers nothing.
+ */
+async function submitPayoutBatch(entries, { logger = console } = {}) {
+    if (!payoutsConfigured()) {
+        throw new NowPaymentsError('NOWPayments payouts are not configured: NOWPAYMENTS_EMAIL and NOWPAYMENTS_PASSWORD are required.');
+    }
+    const list = Array.isArray(entries) ? entries : [];
+    if (list.length === 0) return { batchId: null, withdrawals: [] };
+
+    const body = {
+        withdrawals: list.map((entry) => {
+            const record = {
+                payoutId: String(entry.payoutId),
+                address: String(entry.address),
+                currency: String(entry.currency).toLowerCase(),
+                amount: Number(entry.amount)
+            };
+            if (entry.extraId) record.extraId = String(entry.extraId);
+            return record;
+        })
+    };
+
+    const result = await request('POST', '/v1/payout', { body, timeoutMs: 30000 });
+
+    // The provider reports the batch under either spelling depending on version; both are
+    // read because the batch id is the only durable link back to our rows.
+    const batchId = result?.batch_withdrawal_id ?? result?.batchWithdrawalId ?? null;
+
+    // Per-entry results, when the provider sends them. Absent for some statuses, in which
+    // case the batch id is all we have and reconciliation re-reads the batch.
+    const reported = Array.isArray(result?.withdrawals) ? result.withdrawals : [];
+    const byPayoutId = new Map();
+    for (const item of reported) {
+        const key = String(item?.payoutId ?? item?.payout_id ?? '');
+        if (key) byPayoutId.set(key, item);
+    }
+
+    logger.log(`Submitted a NOWPayments payout batch${batchId ? ` ${batchId}` : ''} with ${list.length} withdrawal(s).`);
+
+    return {
+        batchId: batchId === null ? null : String(batchId),
+        withdrawals: list.map((entry) => {
+            const item = byPayoutId.get(String(entry.payoutId));
+            return {
+                payoutId: String(entry.payoutId),
+                providerWithdrawalId: item?.id === undefined || item?.id === null ? null : String(item.id),
+                status: typeof item?.status === 'string' ? item.status : null
+            };
+        })
+    };
+}
+
+/**
+ * Reads the current state of a submitted payout batch.
+ *
+ * Used by reconciliation, and it is the only way out of an unknown submission outcome: when
+ * the submit call fails in a way that leaves the caller unsure whether the provider acted
+ * (a timeout, a dropped connection), retrying the send is not safe, but asking what already
+ * happened is.
+ *
+ * Returns null when the provider cannot answer, so a caller can tell "no such batch" and
+ * "could not check" apart by treating null as unresolved rather than as a failure.
+ */
+async function getPayoutBatch(batchId) {
+    if (!payoutsConfigured()) return null;
+    const id = String(batchId || '').trim();
+    if (!id) return null;
+    try {
+        const result = await request('GET', `/v1/payout/${encodeURIComponent(id)}`, { timeoutMs: 10000 });
+        return result || null;
+    } catch (error) {
+        // A batch the provider does not know about is a real answer -- it means the
+        // submission never landed -- so it is reported rather than swallowed.
+        if (error instanceof NowPaymentsError && error.status === 404) return { notFound: true };
+        return null;
+    }
+}
+
 
 // ---------------------------------------------------------------------------
 // IPN
@@ -682,6 +776,8 @@ module.exports = {
     validatePayoutAddress,
     getPayoutFee,
     getPayoutMinimum,
+    submitPayoutBatch,
+    getPayoutBatch,
 
     sortKeysDeep,
     verifyIpnSignature,

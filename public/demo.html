@@ -39,10 +39,19 @@
             <form id="demo-form">
                 <div id="demo-fields" class="demo-fields"></div>
                 <p id="demo-message" class="form-message" role="status"></p>
-                <button id="demo-submit" class="button button-accent" type="submit">Complete demo task</button>
+                <div class="demo-actions">
+                    <button id="survey-back" class="button button-ghost" type="button" hidden>Back</button>
+                    <button id="demo-submit" class="button button-accent" type="submit">Complete demo task</button>
+                </div>
             </form>
 
             <div id="demo-result" class="demo-result" role="status" hidden></div>
+
+            <div class="demo-return" hidden>
+                <p id="return-countdown" class="demo-return-countdown" role="status" aria-live="polite"></p>
+                <a id="return-link" class="button button-light" href="/offers" hidden>Back to offers now</a>
+            </div>
+
             <p class="demo-disclaimer">The test-only balance cannot be withdrawn and is never converted to cash. Demo tasks are not available in production.</p>
         </section>
     </main>

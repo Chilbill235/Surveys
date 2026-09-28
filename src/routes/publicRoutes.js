@@ -8,6 +8,7 @@ const fraudDetection = require('../middlewares/fraudDetection');
 const requireAuth = require('../middlewares/requireAuth');
 const pool = require('../config/db');
 const { isDemoModeEnabled, describeDemoMode } = require('../services/demoMode');
+const { register: registerMethod } = require('./methodRegistry');
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -125,6 +126,9 @@ router.get('/offer/engage', clickController.engageClick);
 router.get('/click/:offerId', requireAuth, fraudDetection, clickController.trackClick);
 router.post('/api/click/:offerId', requireAuth, fraudDetection, clickController.createClick);
 router.post('/api/demo/complete', requireAuth, demoController.complete);
+router.get('/api/demo/survey', requireAuth, demoController.survey);
+registerMethod(/^\/api\/demo\/complete\/?$/, ['POST']);
+registerMethod(/^\/api\/demo\/survey\/?$/, ['GET']);
 
 // ---------------------------------------------------------------------------
 // Server-to-server postbacks from advertiser networks

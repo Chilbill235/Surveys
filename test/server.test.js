@@ -1051,6 +1051,10 @@ test('a non-finished NOWPayments status never credits, and a malformed signature
     let balance = 0;
     let depositStatus = 'pending';
     const ledger = [];
+    // A payout batch this test recognises, so a `FINISHED` callback can be shown to move a
+    // withdrawal to `paid`. Null means "no such batch", which is the state every other payout
+    // callback in this test is in.
+    let knownBatch = null;
 
     function runStubbedQuery(query, values = []) {
         const normalized = query.replace(/\s+/g, ' ').trim();
@@ -1076,6 +1080,18 @@ test('a non-finished NOWPayments status never credits, and a malformed signature
         if (/INSERT INTO balance_transactions/i.test(normalized)) {
             ledger.push(`${values[0]}|${values[2]}`);
             return { rows: [{ id: 1 }], rowCount: 1 };
+        }
+        // A payout callback is looked up by the batch id the provider sent. No row matches,
+        // which is the case most of this test exercises: a correctly signed callback about a
+        // batch this database has no record of must be acknowledged and must change nothing.
+        // `knownBatch` is set later to make one of them match, so that a finished payout for a
+        // batch we do know can be shown to actually move the withdrawal.
+        if (/SELECT id, status, payout_status FROM withdrawals WHERE batch_id/i.test(normalized)) {
+            return { rows: knownBatch ? [knownBatch] : [] };
+        }
+        if (/UPDATE withdrawals SET status = 'paid', provider_reference = \$1/i.test(normalized)) {
+            if (knownBatch) knownBatch.status = 'paid';
+            return { rows: [{ id: knownBatch?.id, user_id: 1, amount: '25.00', status: 'paid' }], rowCount: 1 };
         }
         throw new Error(`Unexpected test query: ${normalized}`);
     }
@@ -1154,6 +1170,11 @@ test('a non-finished NOWPayments status never credits, and a malformed signature
         // `payment_id`, no `order_id`, and a `status` from the separate uppercase payout
         // vocabulary. It must be acknowledged, because a 4xx is a failed delivery the
         // provider would keep retrying.
+        //
+        // This one is also an unknown batch, which is the only assertion available without a
+        // submitted payout on file: a signed callback naming a batch this database has never
+        // seen is recorded and applied to nothing. Crediting or refunding on the strength of
+        // an id that matches no row would be inventing a financial outcome.
         const payoutBody = {
             id: '777',
             batch_withdrawal_id: '888',
@@ -1179,6 +1200,30 @@ test('a non-finished NOWPayments status never credits, and a malformed signature
             body: JSON.stringify(payoutBody)
         });
         assert.equal(payout.status, 200);
+        assert.equal(balance, 25);
+
+        // The same callback, but for a batch this database does know about and reports as
+        // finished. This is the one that matters: it is the only event that tells a user their
+        // crypto actually left, so it has to move the withdrawal to `paid` and record the
+        // batch as its reference.
+        //
+        // The batch lookup is made to match this time, and the payout vocabulary is used
+        // rather than the deposit's own -- `FINISHED` here means sent, which is the collision
+        // that `classifyIpnBody` exists to prevent.
+        knownBatch = { id: 31, status: 'processing', payout_status: 'PROCESSING' };
+        const finishedBody = { ...payoutBody, batch_withdrawal_id: '999', status: 'FINISHED' };
+        const finishedSignature = createHmac('sha512', ipnSecret)
+            .update(JSON.stringify(sortKeysDeep(finishedBody)))
+            .digest('hex');
+        const finishedPayout = await fetch(`${origin}/api/payments/nowpayments/ipn`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'x-nowpayments-sig': finishedSignature },
+            body: JSON.stringify(finishedBody)
+        });
+        assert.equal(finishedPayout.status, 200);
+        assert.equal(knownBatch.status, 'paid');
+        // A finished payout is the user's money leaving, not arriving: the balance is
+        // untouched by the callback, because it was debited when the request was made.
         assert.equal(balance, 25);
     } finally {
 

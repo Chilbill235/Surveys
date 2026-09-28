@@ -1,18 +1,31 @@
 const pool = require('../config/db');
 const { isDemoModeEnabled } = require('../services/demoMode');
+const { loadSurveyQuestions, answersAreValid, sanitiseAnswers } = require('../services/surveyService');
 
 const clickIdPattern = /^[\da-f]{8}-(?:[\da-f]{4}-){3}[\da-f]{12}$/i;
-const favoriteOptions = new Set(['games', 'shopping', 'learning']);
-const frequencyOptions = new Set(['daily', 'weekly', 'rarely']);
-
-function validAnswers(offerType, answers) {
-    if (offerType === 'survey') {
-        return favoriteOptions.has(answers?.favorite) && frequencyOptions.has(answers?.frequency);
-    }
-    return answers?.completed === true;
-}
 
 const demoController = {
+    /**
+     * The survey the page should render.
+     *
+     * Served from the database rather than embedded in the page script so the questions the
+     * user is asked and the answers the server will accept cannot drift apart. Requires a
+     * session, like completion does, because it is only reachable by following a click and
+     * there is nothing useful to show without one.
+     */
+    survey: async (req, res) => {
+        if (!isDemoModeEnabled()) {
+            return res.status(404).json({ error: 'Demo rewards are not available in this deployment.' });
+        }
+        try {
+            const questions = await loadSurveyQuestions();
+            return res.json({ questions });
+        } catch (error) {
+            console.error('Could not load survey questions:', error.message);
+            return res.status(500).json({ error: 'Could not load the survey.' });
+        }
+    },
+
     complete: async (req, res) => {
         // Same gate as the catalog and the demo page. When this rejected while the catalog
         // showed the offer, a user could complete the survey and be told the reward did not
@@ -45,10 +58,22 @@ const demoController = {
             }
 
             const offer = click.rows[0];
-            if (!validAnswers(offer.offer_type, answers)) {
+            // Loaded once here and used for both the check and the stored payload, so what is
+            // validated and what is recorded cannot be two different definitions.
+            const questions = offer.offer_type === 'survey' ? await loadSurveyQuestions() : null;
+            if (offer.offer_type === 'survey') {
+                if (!await answersAreValid(answers, questions)) {
+                    await client.query('ROLLBACK');
+                    return res.status(400).json({ error: 'Answer every question before submitting.' });
+                }
+            } else if (answers?.completed !== true) {
                 await client.query('ROLLBACK');
                 return res.status(400).json({ error: 'Complete the demo task before submitting.' });
             }
+
+            // Only the questions that were actually asked are kept. An unrecognised key is
+            // dropped rather than written into `details` as if it were an answer.
+            const recorded = questions ? sanitiseAnswers(answers, questions) : { completed: true };
 
             const priorConversion = await client.query(
                 'SELECT status FROM conversions WHERE click_id = $1',
@@ -75,7 +100,7 @@ const demoController = {
             await client.query(
                 `INSERT INTO conversions (click_id, payout, status, details)
                  VALUES ($1, $2, 'approved', $3::jsonb)`,
-                [clickId, payout, JSON.stringify(answers)]
+                [clickId, payout, JSON.stringify(recorded)]
             );
             const updatedUser = await client.query(
                 'UPDATE users SET demo_balance = demo_balance + $1 WHERE id = $2 RETURNING demo_balance',

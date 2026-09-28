@@ -5,6 +5,7 @@ const { creditConfirmedDeposit, applyDepositStatus, targetStatusFor, knownProvid
 const { resolvePublicBaseUrl, isPubliclyReachable } = require('../services/publicBaseUrl');
 const { parseAmountInRange, amountsMatch, formatUsd } = require('../services/money');
 const nowPayments = require('../services/nowPayments');
+const { applyPayoutCallback } = require('../services/autoPayouts');
 const ipnLog = require('../services/ipnLog');
 
 // ---------------------------------------------------------------------------
@@ -669,11 +670,36 @@ async function nowPaymentsIpn(req, res) {
     // this endpoint.
     const callbackKind = nowPayments.classifyIpnBody(ipn);
     if (callbackKind === 'payout') {
-        // Payouts are not dispatched by this app, so there is no payout row to move.
-        // Acknowledged rather than rejected: a signed callback about a payout this
-        // build does not send is expected traffic, not an error worth retrying.
-        ipnLog.record({ outcome: 'accepted', detail: 'Payout callback acknowledged; this build sends no payouts.' });
-        return res.status(200).send('OK');
+        // This build now does send crypto payouts, so a payout callback is a state change and
+        // not a notice. It is applied through the same `sendWithdrawal` / `reverseWithdrawal`
+        // the operator endpoints use, which is what keeps the two invariants that matter: a
+        // withdrawal already marked paid cannot be refunded, and a refund is a balance write
+        // plus a ledger row inside one transaction.
+        try {
+            const applied = await applyPayoutCallback(ipn);
+            if (!applied.ok) {
+                // Signed, well-formed, and about a batch this database has no record of. That
+                // is a real configuration or history problem, but answering 4xx would put the
+                // callback on the provider's retry schedule forever. It is recorded as
+                // accepted and left visible in the diagnostics instead.
+                ipnLog.record({
+                    outcome: 'accepted',
+                    detail: `Payout callback ignored: ${applied.reason}${applied.batchId ? ` (${applied.batchId})` : ''}`
+                });
+                return res.status(200).send('OK');
+            }
+            ipnLog.record({
+                outcome: 'accepted',
+                detail: `Payout callback applied to withdrawal ${applied.withdrawalId}.`
+            });
+            return res.status(200).send('OK');
+        } catch (error) {
+            // A real failure to write. Answered 500 so the provider retries: a payout that
+            // finished while this write failed is exactly the case where losing the callback
+            // would leave a user told their money is moving when it has already moved.
+            console.error('Could not apply a payout callback:', error.message);
+            return refuse(500, 'Payout callback could not be recorded.');
+        }
     }
     if (callbackKind !== 'payment') {
         return refuse(400, 'Payload is neither a payment nor a payout callback.');

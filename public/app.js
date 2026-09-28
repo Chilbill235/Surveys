@@ -700,12 +700,28 @@ function renderOffers() {
         const id = document.createElement('span');
         id.className = 'offer-id';
         id.textContent = `OFFER ${offer.id}`;
+        // A survey and a partner task are different things to agree to, so the type is a
+        // badge on its own rather than a word buried in the partner line. Someone scanning
+        // for quick surveys can find them without reading every card.
         const type = document.createElement('span');
-        type.className = 'offer-type';
+        type.className = isSurvey ? 'offer-type is-survey' : 'offer-type';
+        type.textContent = isSurvey ? 'Survey' : 'Offer';
+        const partner = document.createElement('span');
+        partner.className = 'offer-partner';
         // The partner label is preferred over the tracking network name, which is written
         // for a tracking URL rather than for a person deciding whether to start a task.
-        type.textContent = `${isSurvey ? 'Survey' : 'Offer'} | ${offer.partner_label || offer.network_name || 'Partner'}`;
-        top.append(id, type);
+        partner.textContent = offer.partner_label || offer.network_name || 'Partner';
+        top.append(id, type, partner);
+
+        // Surveys are the only kind with a predictable length, and stating it is what a
+        // survey provider does. It is the question people actually ask before committing to
+        // one, and an unanswered "how long is this?" reads as an unbounded task.
+        if (isSurvey) {
+            const estimate = document.createElement('span');
+            estimate.className = 'offer-estimate';
+            estimate.textContent = '~2 min';
+            top.append(estimate);
+        }
 
         const heading = document.createElement('h2');
         heading.className = 'offer-title';
@@ -2044,8 +2060,45 @@ function buildHistoryRow(item, kind) {
     badge.className = `payment-status status-${refunded ? 'refunded' : status}`;
     badge.textContent = refunded ? 'Refunded' : (statusLabels[status] || status);
 
+    // A crypto withdrawal that is being sent by the provider carries its own progress, which
+    // is finer-grained than our own `processing`: the user's money is somewhere specific
+    // between "queued" and "sent", and "Processing" alone gives them nothing to look at. Only
+    // shown while the payout is genuinely in flight -- a `paid` withdrawal has already been
+    // said to have arrived, and repeating "sent" under a "Paid" badge is noise.
+    const payoutLabel = kind === 'withdrawal' && status === 'processing' ? payoutProgressLabel(item.payout_status) : null;
+    if (payoutLabel) {
+        const progress = document.createElement('span');
+        progress.className = 'payout-progress';
+        progress.textContent = payoutLabel;
+        details.append(progress);
+    }
+
     row.append(details, badge);
     return row;
+}
+
+/**
+ * The provider's payout stage, in words a user can act on.
+ *
+ * The provider's own vocabulary is deliberately not shown: `WAITING` and `REJECTED_NOT_CHECKED`
+ * are internal states, and rendering them raw tells the user nothing about whether their money
+ * is moving. Anything unrecognised falls back to the neutral "on its way" rather than
+ * guessing at a stage, and an unknown outcome -- the one case where the app genuinely does not
+ * know -- says so plainly instead of implying progress.
+ */
+function payoutProgressLabel(payoutStatus) {
+    switch (String(payoutStatus || '').toUpperCase()) {
+        case 'CREATING':
+        case 'NEW':
+            return 'Preparing your payout.';
+        case 'WAITING':
+        case 'PROCESSING':
+            return 'Sent to the network. This can take a few minutes.';
+        case 'SUBMISSION_UNKNOWN':
+            return 'Confirming with the payout provider. No action is needed from you.';
+        default:
+            return null;
+    }
 }
 
 /**

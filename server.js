@@ -1,4 +1,32 @@
 require('dotenv').config();
+
+/**
+ * Derives the local-facing URL variables from PORT.
+ *
+ * A developer changing the port in `.env` used to have to change APP_BASE_URL and
+ * CORS_ORIGIN to match, and getting it wrong produced two failures that look
+ * unrelated to the cause: a CORS block on every fetch from the browser (because the
+ * allowlist still named the old port), and a port-mismatch warning at startup
+ * (because the public origin still named the old port). Both are the same mistake,
+ * and neither is worth making twice.
+ *
+ * This runs before `require('./src/app')`, which reads CORS_ORIGIN at module load to
+ * configure the CORS middleware. It also runs before `resolvePublicBaseUrl()` is
+ * first called below.
+ *
+ * An explicit value always wins. On Vercel, APP_BASE_URL and CORS_ORIGIN are set in
+ * the project environment, so this block does nothing there and the production
+ * values are used exactly as before. Locally, neither is usually set, and both are
+ * filled in from PORT.
+ */
+(function deriveLocalUrlDefaults() {
+    const parsedPort = Number(process.env.PORT);
+    const port = Number.isInteger(parsedPort) && parsedPort > 0 ? parsedPort : 3001;
+    const localOrigin = `http://localhost:${port}`;
+    if (!process.env.APP_BASE_URL) process.env.APP_BASE_URL = localOrigin;
+    if (!process.env.CORS_ORIGIN) process.env.CORS_ORIGIN = localOrigin;
+})();
+
 const { resolvePublicBaseUrl, isPubliclyReachable, defaultPort } = require('./src/services/publicBaseUrl');
 
 const isProduction = process.env.NODE_ENV === 'production';
@@ -84,11 +112,18 @@ function validateRuntimeConfiguration() {
     // callback is delivered to whatever happens to be running there -- usually an older
     // build. It fails identically to "the provider is not sending", which is what makes it
     // worth an explicit check rather than a comment.
+    //
+    // A production deployment behind Vercel is exempt: the platform terminates HTTPS on
+    // 443 and forwards to the process, so a listen port that is not 443 is expected and
+    // the callback genuinely does arrive on 443. The exemption checks the *configured*
+    // port rather than the listen port, because those are the two values that have to
+    // agree for a callback to land.
     const listenPort = defaultPort;
     const configuredPort = publicBaseUrl.baseUrl.port
         ? Number(publicBaseUrl.baseUrl.port)
         : (publicBaseUrl.baseUrl.protocol === 'https:' ? 443 : 80);
-    if (configuredPort !== listenPort && !(publicBaseUrl.baseUrl.protocol === 'https:' && listenPort === 443)) {
+    const behindTlsProxy = publicBaseUrl.baseUrl.protocol === 'https:' && configuredPort === 443;
+    if (configuredPort !== listenPort && !behindTlsProxy) {
         console.warn(
             `Warning: APP_BASE_URL is ${publicBaseUrl.baseUrl.origin} but the server listens on port ` +
             `${listenPort}. Provider callbacks will be sent to port ${configuredPort}, which is not this ` +

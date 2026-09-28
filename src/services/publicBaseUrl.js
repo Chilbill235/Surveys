@@ -2,9 +2,59 @@
  * Port the app listens on when PORT is not set. `server.js` and the development
  * fallback below both read this so a locally built callback URL always matches the
  * port actually in use (a mismatch made every local deposit callback fail).
+ *
+ * A `PORT` of `0` asks the OS for any free port; it is rejected here because
+ * nothing can build a callback URL against a port it does not know.
  */
-const defaultPort = Number(process.env.PORT) || 3000;
+const portFromEnv = Number(process.env.PORT);
+const defaultPort = Number.isInteger(portFromEnv) && portFromEnv > 0
+    ? portFromEnv
+    : 3001;
 const defaultDevelopmentBaseUrl = `http://localhost:${defaultPort}`;
+
+/**
+ * Whether a hostname refers to this machine or the local network.
+ *
+ * Covers:
+ *   - loopback: `localhost`, `*.localhost`, `127.0.0.0/8`, `::1`
+ *   - RFC 1918 IPv4: `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`
+ *   - CGNAT: `100.64.0.0/10`
+ *   - link-local: `169.254.0.0/16`, `fe80::/10`
+ *   - IPv6 unique-local: `fc00::/7`
+ *   - mDNS / container suffixes: `*.local`, `*.internal`
+ *
+ * The check is by string, not by DNS resolution: a name that happens to resolve
+ * to a private address is still reachable if it is public DNS, and a private
+ * address that happens to have a public reverse is still private. Hostnames are
+ * compared literally because that is what ends up in the callback URL.
+ */
+function isLocalAddress(hostname) {
+    const host = String(hostname || '').toLowerCase();
+
+    if (host === 'localhost' || host.endsWith('.localhost')) return true;
+    if (host === '::1' || host === '0:0:0:0:0:0:0:1') return true;
+
+    // IPv4 literal, possibly with a port already stripped by URL parsing.
+    if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host)) {
+        const [a, b] = host.split('.').map(Number);
+        if (a === 127) return true;                     // 127.0.0.0/8
+        if (a === 10) return true;                      // 10.0.0.0/8
+        if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12
+        if (a === 192 && b === 168) return true;        // 192.168.0.0/16
+        if (a === 169 && b === 254) return true;        // 169.254.0.0/16
+        if (a === 100 && b >= 64 && b <= 127) return true; // 100.64.0.0/10
+        return false;
+    }
+
+    // IPv6 unique-local (fc00::/7) and link-local (fe80::/10), matched by prefix.
+    if (/^f[cd][\da-f]{2}:/i.test(host)) return true;
+    if (/^fe[89ab][\da-f]:/i.test(host)) return true;
+
+    // Docker, WSL, and mDNS names are resolvable only on their own network.
+    if (host.endsWith('.local') || host.endsWith('.internal')) return true;
+
+    return false;
+}
 
 /**
  * Resolves the public origin the app is reachable at.
@@ -34,10 +84,11 @@ function resolvePublicBaseUrl() {
     }
 
     if (isProduction) {
-        const hostname = parsed.hostname.toLowerCase();
-        const isLoopback = hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1' ||
-            hostname.endsWith('.localhost');
-        if (parsed.protocol !== 'https:' || isLoopback) {
+        // The local check is here so a deployment that set APP_BASE_URL to a LAN
+        // address gets the same clear error as one that set it to localhost. The
+        // previous version only caught the latter, so `10.0.0.5` slipped through
+        // and every provider callback was silently undeliverable.
+        if (parsed.protocol !== 'https:' || isLocalAddress(parsed.hostname)) {
             return {
                 ok: false,
                 error: 'APP_BASE_URL must be the public HTTPS origin in production, otherwise provider webhooks cannot reach the app.'
@@ -66,15 +117,7 @@ function isPubliclyReachable(baseUrl) {
     } catch {
         return false;
     }
-    const hostname = parsed.hostname.toLowerCase();
-    const isLoopback = hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1' ||
-        hostname.endsWith('.localhost') || /^127\./.test(hostname);
-    if (isLoopback) return false;
-    // A bare container or LAN hostname is not resolvable from the internet either. These
-    // are the names Docker and WSL hand out, and they are the other shape of this bug.
-    if (hostname.endsWith('.local') || hostname.endsWith('.internal')) return false;
-    return true;
+    return !isLocalAddress(parsed.hostname);
 }
 
-module.exports = { resolvePublicBaseUrl, isPubliclyReachable, defaultPort };
-
+module.exports = { resolvePublicBaseUrl, isPubliclyReachable, isLocalAddress, defaultPort };

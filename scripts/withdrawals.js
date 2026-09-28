@@ -16,6 +16,15 @@
  *   node scripts/withdrawals.js paid <id> <provider-reference>
  *   node scripts/withdrawals.js refund <id> "<reason the user will see>"
  *
+ * Automatic crypto payouts are the same idea with the sending step done by the provider:
+ *
+ *   node scripts/withdrawals.js preflight   # is it configured and switched on?
+ *   node scripts/withdrawals.js queue       # what would be sent (claims nothing)
+ *   node scripts/withdrawals.js send [10]   # actually sends
+ *
+ * `send` moves real money. It is a named command rather than a flag on something else so
+ * that it cannot happen as a side effect of looking.
+ *
  * The target defaults to the local server and is overridden with BASE_URL:
  *
  *   BASE_URL=https://your-deployment.vercel.app node scripts/withdrawals.js list
@@ -60,6 +69,36 @@ const COMMANDS = {
             method: 'POST',
             path: `/api/maintenance/withdrawals/${id}/refund`,
             body: { reason }
+        };
+    },
+
+    /**
+     * Reports whether automatic crypto payouts could run, and what is missing if not.
+     */
+    async preflight() {
+        return { method: 'GET', path: '/api/maintenance/payouts/preflight' };
+    },
+
+    /**
+     * Lists the crypto withdrawals waiting to be sent. The default, and a dry run.
+     */
+    async queue() {
+        return { method: 'POST', path: '/api/maintenance/payouts/run', body: { dryRun: true } };
+    },
+
+    /**
+     * Actually sends. This moves real money to wallet addresses with nobody reading each one,
+     * so it must be asked for by name rather than reached by omission.
+     */
+    async send(args) {
+        const limit = args[0] ? Number(args[0]) : 10;
+        if (!Number.isFinite(limit) || limit < 1) {
+            throw new Error('Usage: withdrawals.js send [limit]');
+        }
+        return {
+            method: 'POST',
+            path: '/api/maintenance/payouts/run',
+            body: { dryRun: false, limit }
         };
     }
 };

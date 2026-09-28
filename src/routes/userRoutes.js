@@ -257,6 +257,7 @@ router.get('/withdrawals', async (req, res) => {
         const result = await pool.query(
             `SELECT w.id, w.amount, w.payment_method, w.payment_address, w.asset_code, w.network,
                     w.status, w.failure_reason, w.created_at, w.paid_at,
+                    w.payout_status, w.payout_submitted_at,
                     r.created_at AS refunded_at
              FROM withdrawals w
              LEFT JOIN balance_transactions r

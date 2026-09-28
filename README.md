@@ -97,6 +97,7 @@ with `contentSecurityPolicy: false`, and with `frameguard: false`:
 | `NOWPAYMENTS_API_BASE_URL` | optional | Defaults to `https://api.nowpayments.io`. |
 | `NOWPAYMENTS_FIXED_RATE`, `NOWPAYMENTS_FEE_PAID_BY_USER` | optional | `POST /v1/payment` options. Default `false`. |
 | `NOWPAYMENTS_EMAIL`, `NOWPAYMENTS_PASSWORD` | for crypto payouts | JWT for the payout endpoints. Case-sensitive. |
+| `NOWPAYMENTS_AUTO_PAYOUTS` | optional | `true` sends eligible **crypto** withdrawals automatically. Unset means off. See [Automatic crypto payouts](#automatic-crypto-payouts). |
 | `RESEND_API_KEY`, `EMAIL_FROM` | for reset email | Sends password reset messages. |
 | `CORS_ORIGIN` | optional | Comma-separated extra browser origins. |
 | `TRUST_PROXY` | optional | Defaults to `true` on Vercel; set `false` to disable. |
@@ -267,6 +268,90 @@ XRPL routes by a destination tag as well as by address, and a correct XRP addres
 tag is unsendable in a way the address format cannot reveal. The withdrawal form asks for
 the tag when the selected asset needs one.
 
+## Automatic crypto payouts
+
+Crypto withdrawals can be sent to the user's wallet by NOWPayments' Mass Payouts API instead
+of by an operator. **PayPal and Venmo are never automated** — NOWPayments is a crypto
+gateway and cannot pay either, so those stay a manual step permanently.
+
+| Method | Who sends it | Automated? |
+| --- | --- | --- |
+| `crypto` | NOWPayments payout API | Yes, when switched on |
+| `paypal` | You, in PayPal | Never — the provider cannot |
+| `venmo` | You, in Venmo | Never — the provider cannot |
+
+### What it does to the ledger
+
+A withdrawal is already debited when it is requested, so this changes only *who sends* and
+*when the status moves*. The money path is deliberately narrow:
+
+1. **Claim, then send.** The row moves to `processing` with the exact address, coin, and
+   amount written to it, in a committed transaction, **before** the provider is called. If
+   the process dies at any point afterwards, the claim is on file. The alternative — call
+   the provider, then record — has a window where a crash loses the fact that money moved
+   and the next run sends it again.
+2. **A refused batch releases the claim** back to `pending` for an operator. Nothing was
+   sent, so the request is untouched.
+3. **An unknown outcome is never retried.** A timeout or dropped connection leaves it
+   impossible to tell whether the provider accepted the batch, so the claim is *held* in
+   `SUBMISSION_UNKNOWN` rather than released. Releasing it would let the next run duplicate a
+   transfer; failing it would refund a user whose money may already be moving.
+4. **Only a `FINISHED` callback marks a withdrawal paid**, and only a `REJECTED` one refunds
+   it. Both go through the same `sendWithdrawal` / `reverseWithdrawal` the operator endpoints
+   use, so a `paid` withdrawal still cannot be refunded and a refund is still a balance
+   write plus a ledger row in one transaction.
+5. **Only crypto, filtered in SQL.** The claim query carries `payment_method = 'crypto'`, so
+   a PayPal address cannot reach the provider even if a caller asks for it.
+
+The network fee is estimated and recorded per payout, but it is charged against the NOWPayments
+custody balance rather than deducted from the user's amount, so the user receives the full coin
+equivalent of what they requested.
+
+### Setting it up
+
+1. **On the NOWPayments account**, enable custody and fund the payout balance. Nothing in this
+   app can do this, and a payout against an unfunded balance is refused by the provider.
+2. **Set the credentials** if not already present:
+   `NOWPAYMENTS_EMAIL`, `NOWPAYMENTS_PASSWORD`, and `NOWPAYMENTS_IPN_SECRET`.
+   The IPN secret is what tells the app a payout finished — without it a sent withdrawal sits
+   in `processing` and the user is told their money is in flight when it is not.
+3. **Redeploy.** `db/migrations/009_auto_payouts.sql` adds the payout columns and the unique
+   index on `batch_id`; the build applies it.
+4. **Check readiness** — this sends nothing:
+   ```bash
+   npm run withdrawals -- preflight
+   ```
+   It reports each missing piece separately, because the fix is different for each.
+5. **See what would be sent**, still claiming nothing:
+   ```bash
+   npm run withdrawals -- queue
+   ```
+6. **Send for real** — a named command, not a flag, so it cannot happen by omission:
+   ```bash
+   npm run withdrawals -- send 10
+   ```
+
+`NOWPAYMENTS_AUTO_PAYOUTS` is **off unless set to `true`**. Credentials alone never start
+sending money; the switch is separate so a fresh deployment stays manual until someone has
+funded custody and seen a test payout land.
+
+To run it on a schedule instead, add a cron entry to `vercel.json` alongside the existing
+reconciliation job — `POST /api/maintenance/payouts/run` with `{"dryRun": false}`. Vercel Cron
+issues `GET`, and that path is deliberately POST-only so a link preview cannot move money; use
+the script or a scheduler that can send a POST.
+
+### When something is stuck
+
+| `payout_status` | Meaning | What to do |
+| --- | --- | --- |
+| `CREATING` | Claimed, submission not yet confirmed | Wait, then re-run `queue`; a later run will not re-claim it. |
+| `WAITING` / `PROCESSING` | Sent to the network | Nothing. The callback or reconciliation will finish it. |
+| `SUBMISSION_UNKNOWN` | The provider never answered | **Do not resend.** Check the NOWPayments dashboard for the batch, then `paid` or `refund` by hand. |
+| `FINISHED` / `REJECTED` | Settled | Nothing. The withdrawal is already `paid` or `failed`. |
+
+Anything in `SUBMISSION_UNKNOWN` is listed by `npm run withdrawals -- list` and needs a human
+decision, which is the point: it is the one state where the app cannot safely choose.
+
 ### Resolving a withdrawal
 
 A request is a debit the moment it is stored, so it has to end somewhere. Two operator
@@ -278,6 +363,10 @@ reconciliation (loopback only outside production):
 | `GET /api/maintenance/withdrawals` | Requests still awaiting a decision, oldest first. |
 | `POST /api/maintenance/withdrawals/:id/paid` | Marks it sent. `providerReference` is required. |
 | `POST /api/maintenance/withdrawals/:id/refund` | Closes it as `failed` and returns the money. `reason` is required. |
+
+A crypto withdrawal that [automatic payouts](#automatic-crypto-payouts) has sent is not
+resolved by hand — the provider's callback does it, and the same `paid`/`failed` invariants
+apply either way.
 
 A refund is the balance write plus a `refund` ledger row keyed on `withdrawal:<id>`, in one
 transaction, so a repeat attempt collides on the ledger instead of paying the user twice.
@@ -368,14 +457,38 @@ Two schema rules make most of those checks structural rather than hopeful:
   development and engaged on a deployment with demo mode off (the same database, so this
   happens) redirects back to the catalog with `?notice=demo-unavailable`, and the catalog
   says why. The previous response was a 404 page reading "Demo offer not found."
+- **The survey's questions are rows, not code.** They used to be defined twice — a literal
+  array in `public/demo.js` and two `Set`s in `demoController` — and the two had to be edited
+  together or the page would offer an answer the server rejected. `survey_questions` (migration
+  010) is now the single definition: `GET /api/demo/survey` serves it, and completion is
+  validated against the same rows, so the page can only ever offer what the server will accept.
+  Editing a survey is a database change, not a deploy.
+  - A row with a malformed option list is repaired by *dropping* the bad entries, never by
+    inventing a value. An option with no usable value cannot be selected, and one generated
+    from an index would store an answer nobody chose.
+  - An answer that is not on the question's own option list is refused, which is what stops a
+    page left open in a tab from before an edit recording a response to a question that no
+    longer exists.
+  - Extra keys in a submission are dropped rather than stored, so an unrecognised key cannot
+    land in `conversions.details` as though it were an answer.
+- **A completed survey returns to the offer wall by itself**, after a visible countdown with
+  the link available at any point. Finishing a questionnaire and then having to find your own
+  way back is the part of the flow that loses people; the countdown keeps the automatic return
+  a convenience rather than something to wait out.
+- **The survey is paged, one question at a time.** A wall of question groups scrolls past the
+  point where someone is answering, and on a phone the submit button ends up several screens
+  below the last question. Back and Next share one row, and the first option is focused on
+  each step so arrow keys work immediately.
 - **`tracking_url` is never sent.** With it, anyone could append their own `aff_sub` to the
   advertiser and claim credit for clicks that were never recorded — which is the entire
   reason for the `/offer/engage` hop.
-- **Cards are filterable and searchable.** Type chips (All / Offers / Surveys) narrow the
-  list, and search covers the title, blurb, partner, and keywords — searching the title alone
-  found nothing for a partner name that was visible on screen. The count reads "0 of 12
-  offers" when a filter is hiding things, because "0 offers" on a list of twelve reads as an
-  outage, and the empty state offers a reset.
+- **Cards are filterable and searchable, and surveys are distinguishable.** Type chips (All /
+  Offers / Surveys) narrow the list, and search covers the title, blurb, partner, and keywords
+  — searching the title alone found nothing for a partner name that was visible on screen. The
+  count reads "0 of 12 offers" when a filter is hiding things, because "0 offers" on a list of
+  twelve reads as an outage, and the empty state offers a reset. The type is a badge and a
+  survey states an estimated length, because "how long is this?" is the question people
+  actually ask before committing and an unanswered one reads as an unbounded task.
 - The response is short-cached (`max-age=30, s-maxage=30, stale-while-revalidate=60`) from
   the handler rather than from `vercel.json`, so a self-hosted deploy gets the same behaviour
   and the policy lives next to the response it describes. These rows are public, change
