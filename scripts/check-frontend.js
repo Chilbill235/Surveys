@@ -108,6 +108,68 @@ for (const htmlFile of Object.keys(pages)) {
     }
 }
 
+// ------------------------------------------------- dialog structure
+//
+// Every direct child of a `<dialog>` must be the panel. The panel owns the padding, the
+// background, and the scroll container, so anything outside it renders flush against the
+// dialog edge with none of that.
+//
+// This is not hypothetical: `#withdraw-confirmation` sat outside `.dialog-panel` in the
+// withdrawal dialog, because that dialog made the panel *be* the form and then needed a
+// sibling for the confirmation screen. The receipt therefore looked like it belonged to a
+// different app, while the equivalent deposit screen looked correct -- which is the hardest
+// kind of layout bug to report, because "it looks wrong" gives nothing to search for.
+for (const htmlFile of Object.keys(pages)) {
+    const html = read(htmlFile);
+    const stray = [];
+    for (const match of html.matchAll(/<dialog\b[^>]*>([\s\S]*?)<\/dialog>/g)) {
+        const openingTag = match[0].slice(0, match[0].indexOf('>') + 1);
+        const dialogId = (/\bid="([^"]+)"/.exec(openingTag) || [, 'dialog'])[1];
+        const body = match[1];
+
+        // The body's top level: elements not nested inside another element.
+        //
+        // Void elements are the trap here. `<input>` and `<br>` are written without a
+        // trailing slash and have no closing tag, so counting them as opening tags leaves
+        // the depth permanently above zero -- which makes every later sibling look nested,
+        // and the check silently passes a broken dialog instead of reporting it.
+        const voidElements = new Set([
+            'area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input',
+            'link', 'meta', 'param', 'source', 'track', 'wbr'
+        ]);
+
+        let depth = 0;
+        const topLevel = [];
+        for (const tag of body.matchAll(/<(\/?)([a-z][a-z0-9-]*)\b([^>]*?)(\/?)>/gi)) {
+            const [, closing, name, attributes, selfClosing] = tag;
+            if (selfClosing || voidElements.has(name.toLowerCase())) continue;
+            if (closing) {
+                depth -= 1;
+                continue;
+            }
+            if (depth === 0) topLevel.push({ name, attributes });
+            depth += 1;
+        }
+
+        if (topLevel.length === 0) {
+            stray.push(`${dialogId}: empty`);
+        } else if (topLevel.length > 1) {
+            // More than one top-level element means something is sitting beside the panel and
+            // therefore outside its padding, background, and scroll container.
+            stray.push(`${dialogId}: ${topLevel.length} top-level children (${topLevel.map((t) => `<${t.name}>`).join(' ')})`);
+        } else if (!/\bclass="[^"]*\bdialog-panel\b/.test(topLevel[0].attributes)) {
+            // Exactly one child, but it is not the panel, so it gets none of the panel's
+            // styling. The tag name is reported because it usually is the form.
+            stray.push(`${dialogId}: top-level <${topLevel[0].name}> is not a .dialog-panel`);
+        }
+    }
+    if (stray.length) {
+        fail(`${htmlFile} has dialog content outside the panel (no .dialog-panel padding): ${stray.join(', ')}`);
+    } else {
+        pass(`${htmlFile}: every dialog wraps its content in a panel`);
+    }
+}
+
 // ------------------------------------------------- classes have rules
 const cssClasses = new Set([...css.matchAll(/\.([a-z][a-z0-9_-]*)/g)].map((m) => m[1]));
 

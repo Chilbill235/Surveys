@@ -504,8 +504,22 @@ h1, h2, h3, h4 { line-height: 1.15; text-wrap: balance; font-weight: 400; }
 .button-ghost { color: var(--ink); border-color: var(--line-strong); background: var(--surface); }
 .button-ghost:hover:not(:disabled) { border-color: var(--indigo-700); color: var(--accent); background: var(--indigo-050); }
 
-.button-wide { width: 100%; }
-.button-lg { min-height: 50px; padding: 0 24px; font-size: var(--step-1); }
+/* A full-width button is the one place wrapping reads correctly, because there is nothing
+   beside it to misalign against. The base button is `nowrap` so a short inline button never
+   breaks mid-word -- but the primary actions carry labels the script sets, like "Generate
+   crypto payment address", which is wider than a 320px phone once the dialog padding and
+   the button's own padding are taken off. Those labels were being clipped at the edge. */
+.button-wide {
+    width: 100%;
+    white-space: normal;
+    padding-block: 11px;
+    line-height: 1.25;
+    /* Two lines must not look like a mistake: the row is centred and grows from its middle
+       so the button keeps its vertical rhythm whichever way the label breaks. */
+    text-align: center;
+}
+
+.button-lg { min-height: 50px; padding-inline: 24px; font-size: var(--step-1); }
 
 .icon-button {
     width: 36px;

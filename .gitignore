@@ -1,2 +1,41 @@
-.env
+# Dependencies
 node_modules/
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# TLS certificates for the database connection
+certs/
+*.pem
+*.crt
+
+# One-off scripts from debugging sessions
+test.js
+check-*.js
+run-cleanup.js
+cleanup-test-data.sql
+
+# Build and cache
+dist/
+build/
+.cache/
+.vercel/
+
+# Logs
+*.log
+npm-debug.log*
+logs/
+
+# Coverage
+coverage/
+.nyc_output/
+
+# Editor and OS noise
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini

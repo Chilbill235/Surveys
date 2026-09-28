@@ -252,6 +252,12 @@
 
     <!-- Withdraw -->
     <dialog class="dialog dialog-withdraw" id="withdraw-dialog" aria-labelledby="withdraw-title">
+        <!-- A plain panel wrapper, not a form, so the confirmation screen can be a sibling of
+             the form rather than a child of it. The panel owns the padding, background, and
+             scroll container; when the confirmation lived outside it, the receipt rendered
+             flush against the dialog edge with none of that -- the one screen in this dialog
+             that looked like it belonged to a different app. This mirrors the deposit dialog,
+             where the same arrangement already worked. -->
         <form class="dialog-panel" id="withdraw-form" novalidate>
             <div class="dialog-heading">
                 <div>
@@ -269,8 +275,8 @@
                 <button class="max-button" id="withdraw-max" type="button">Withdraw all</button>
             </div>
 
-            <div class="callout is-warning">
-                <span>Requests are reviewed manually and are <strong>not sent automatically</strong>. Your balance is held as soon as you submit, and funds leave after an operator pays the request.</span>
+            <div class="callout is-warning" id="withdraw-process-notice">
+                <span>Your balance is held as soon as you submit. Crypto payouts are sent automatically when automatic payouts are on; PayPal and Venmo are always paid by an operator.</span>
             </div>
 
             <div class="amount-block">
@@ -318,6 +324,7 @@
         </form>
 
         <div id="withdraw-confirmation" class="confirmation" hidden></div>
+        </div>
     </dialog>
 </body>
 </html>
