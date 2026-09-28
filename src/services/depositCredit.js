@@ -133,17 +133,39 @@ async function creditConfirmedDeposit(client, deposit, description) {
  * Applies a non-crediting provider status to a deposit without touching balances.
  * Optionally backfills `provider_payment_id` if provided.
  *
+ * Returns whether the status actually *changed*, not merely whether a row was written. The
+ * provider repeats notifications, and the reconciliation sweep re-reads the same deposit on
+ * every pass, so a row that already reads `failed` gets this call again and again. Reporting
+ * that as a change would send the user a fresh "your deposit did not go through" every time,
+ * which trains people to ignore the one email that matters here. Idempotence is what makes
+ * the notification safe to fire off the back of this return value.
+ *
+ * The backfill is a separate statement for the same reason: it is not a status change and
+ * must still happen on a repeat, while the status update must not.
+ *
  * Must be called with a client that already has an open transaction.
  */
 async function applyDepositStatus(client, depositId, status, providerPaymentId = null) {
     const result = await client.query(
-        `UPDATE deposits 
-         SET status = $1, 
-             updated_at = NOW(),
-             provider_payment_id = COALESCE(provider_payment_id, $3)
-         WHERE id = $2 AND credited_at IS NULL`,
-        [status, depositId, providerPaymentId]
+        `UPDATE deposits
+         SET status = $1,
+             updated_at = NOW()
+         WHERE id = $2
+           AND credited_at IS NULL
+           AND status IS DISTINCT FROM $1
+         RETURNING id`,
+        [status, depositId]
     );
+
+    if (providerPaymentId) {
+        await client.query(
+            `UPDATE deposits
+             SET provider_payment_id = $1, updated_at = NOW()
+             WHERE id = $2 AND provider_payment_id IS NULL`,
+            [providerPaymentId, depositId]
+        );
+    }
+
     return result.rowCount > 0;
 }
 

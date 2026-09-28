@@ -166,6 +166,14 @@ app.listen(port, () => {
     // "processing" withdrawal for a long time. One minute is the compromise.
     const AUTO_PAYOUT_INTERVAL_MS = 60_000;
 
+    // Settling is on a slower beat than sending. The callback is the fast path and it
+    // normally resolves a payout within seconds; this is the net underneath it, for the
+    // callbacks that never arrive. Polling the provider costs a request per in-flight
+    // payout, so a shorter interval buys nothing once the queue is settled and spends real
+    // quota while it is not. Five minutes is inside the window a user would still call
+    // "where is my money", and slow enough to be free in the steady state.
+    const PAYOUT_RECONCILE_INTERVAL_MS = 5 * 60_000;
+
     async function runAutoPayoutsTick() {
         try {
             const autoPayouts = require('./src/services/autoPayouts');
@@ -185,7 +193,31 @@ app.listen(port, () => {
         }
     }
 
+    // Runs unconditionally, unlike the sending tick: a deployment that has payouts in
+    // flight but has since unset NOWPAYMENTS_AUTO_PAYOUTS still owes those users an
+    // outcome, and refusing to look would leave a withdrawal stuck in `processing` with
+    // its balance already debited. Settling reads and never sends, so it is safe to run
+    // even where sending is not configured.
+    async function runPayoutReconcileTick() {
+        try {
+            const autoPayouts = require('./src/services/autoPayouts');
+            const outcomes = await autoPayouts.reconcilePayouts({ limit: 50 });
+            const settled = outcomes.filter((o) => o.outcome === 'sent' || o.outcome === 'refunded');
+            if (settled.length > 0) {
+                console.log(`Payout reconcile: settled ${settled.length} of ${outcomes.length} in-flight payout(s).`);
+            }
+        } catch (error) {
+            console.error('Payout reconciliation tick failed:', error.message);
+        }
+    }
+
     // First tick after a short delay so startup logs settle.
     setTimeout(runAutoPayoutsTick, 5000);
     setInterval(runAutoPayoutsTick, AUTO_PAYOUT_INTERVAL_MS);
+
+    // Reconciliation starts later than sending: there is nothing in flight five seconds
+    // after a cold start, and this way the first pass does not immediately re-read batches
+    // that the first sending tick is still creating.
+    setTimeout(runPayoutReconcileTick, 30_000);
+    setInterval(runPayoutReconcileTick, PAYOUT_RECONCILE_INTERVAL_MS);
 });

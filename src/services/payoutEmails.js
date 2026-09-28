@@ -42,6 +42,67 @@ function formatAmount(value) {
     return Number.isFinite(amount) ? `$${amount.toFixed(2)}` : null;
 }
 
+/**
+ * Sent the moment a payout batch is accepted and released to the provider.
+ *
+ * This is the message the withdrawal flow was missing at its most alarming point. The balance
+ * is debited the instant the request is stored, and until now the next thing the user heard
+ * was either nothing or the final "sent" confirmation. In between, their balance had dropped
+ * by the full amount and there was no evidence anything was happening -- which reads as "my
+ * money is gone" rather than as "it is being sent", and is exactly when someone opens a
+ * support ticket or submits a second withdrawal.
+ *
+ * It is deliberately honest about the stage. The batch has been created and verified with the
+ * provider, which means the payout is queued on-chain, not that the money has arrived. Saying
+ * "sent" here would be a promise about a blockchain confirmation nobody has seen yet, and the
+ * user would be right to distrust it when the arrival email is late.
+ */
+async function sendWithdrawalStartedEmail({ to, amount, assetCode, network, destination }) {
+    if (!isEmailConfigured()) {
+        console.error('Withdrawal-started email was not sent (email is not configured).');
+        return { sent: false, reason: 'email-not-configured' };
+    }
+
+    const money = formatAmount(amount);
+    const destinationLabel = String(destination || '').slice(0, 60);
+    const assetLabel = String(assetCode || '').toUpperCase() || 'crypto';
+    const networkLabel = String(network || '').trim();
+    const method = networkLabel ? `${assetLabel} (${networkLabel})` : assetLabel;
+
+    const blocks = [
+        { type: 'callout', tone: 'success', text: `${money} is on its way to your wallet.` },
+        { type: 'details', items: [
+            { label: 'Amount', value: money || 'Unknown' },
+            { label: 'Method', value: method },
+            { label: 'Sending to', value: destinationLabel || 'Your wallet' }
+        ] },
+        { type: 'paragraph', text:
+            'We have sent this to the payment provider. It is now waiting for the blockchain to confirm, ' +
+            'which usually takes a few minutes and can take longer when the network is busy.' }
+    ];
+
+    const history = historyUrl();
+
+    return sendEmail({
+        to,
+        subject: `${money} withdrawal is on its way`,
+        text: renderEmailText({
+            intro: `We have accepted your withdrawal of ${money || 'an unknown amount'} and sent it to your wallet.`,
+            blocks,
+            action: history ? { label: 'View history', url: history } : null,
+            footnote: 'We will email you again as soon as the transfer is confirmed on the blockchain. Nothing more is needed from you.'
+        }),
+        html: renderEmail({
+            preheader: `${money} is being sent to your wallet.`,
+            heading: 'Withdrawal on its way',
+            intro: `We have accepted your withdrawal of ${money || 'an unknown amount'} and sent it to your wallet.`,
+            blocks,
+            action: history ? { label: 'View history', url: history } : null,
+            footnote: 'We will email you again as soon as the transfer is confirmed on the blockchain. Nothing more is needed from you.'
+        })
+    });
+}
+
 /** Sent when a payout is confirmed on-chain and the withdrawal is marked paid. */
 async function sendWithdrawalSentEmail({ to, amount, assetCode, network, destination, batchId }) {
     if (!isEmailConfigured()) {
@@ -125,6 +186,7 @@ async function sendWithdrawalRefundedEmail({ to, amount, reason }) {
 }
 
 module.exports = {
+    sendWithdrawalStartedEmail,
     sendWithdrawalSentEmail,
     sendWithdrawalRefundedEmail
 };

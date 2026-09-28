@@ -21,6 +21,14 @@ const { renderEmail, renderEmailText, escapeHtml, safeUrl, brandGifUrl } = requi
 const { buildMessage } = require('../src/services/verificationEmail');
 const { sendWelcomeEmail, sendAccountVerifiedEmail } = require('../src/services/accountEmails');
 const { sendPasswordResetEmail } = require('../src/services/resetEmail');
+const {
+    sendDepositInstructionsEmail,
+    sendDepositConfirmedEmail,
+    sendDepositFailedEmail,
+    formatCoin,
+    methodLabelFor
+} = require('../src/services/depositEmails');
+const { sendWithdrawalStartedEmail } = require('../src/services/payoutEmails');
 
 /** Counts opening and closing tags of one name, so unbalanced markup is caught rather than eyeballed. */
 function tagBalance(html, tag) {
@@ -206,3 +214,207 @@ test('escapeHtml covers the characters that actually break attributes', () => {
     assert.equal(escapeHtml(null), '');
     assert.equal(escapeHtml(undefined), '');
 });
+
+/**
+ * A crypto deposit is not complete when it is created: the user is handed an address and a QR
+ * code and has to go and send an exact figure to it. Until these messages existed, the only
+ * copy of that figure was the response that produced it -- so a user who closed the tab had no
+ * way to finish, and the coin amount is not reconstructible later because the rate has moved
+ * and one address serves every figure quoted against it.
+ *
+ * These pin the three things that make the message usable rather than decorative: the exact
+ * amount survives, the destination tag is present when the chain routes by one, and the coin is
+ * never rounded to a fixed two decimals -- which turns a real 0.00042 instruction into "0.00",
+ * an instruction to send nothing to an address that only accepts a non-zero amount.
+ */
+test('the deposit instructions carry the exact amount, the address, and the tag', async () => {
+    const sent = [];
+    const originalFetch = global.fetch;
+    global.fetch = async (url, init) => {
+        sent.push(JSON.parse(init.body));
+        return new Response('{"messageId":"1"}', { status: 201, headers: { 'Content-Type': 'application/json' } });
+    };
+    process.env.BREVO_API_KEY = 'test-key';
+    try {
+        const result = await sendDepositInstructionsEmail({
+            to: 'a@example.test',
+            amount: 25,
+            balance: 40.5,
+            method: 'XRP (ripple)',
+            depositId: 42,
+            payAddress: 'rExampleDestinationAddress',
+            payAmount: '12.50000000',
+            payinExtraId: 'tag-99',
+            expiresAt: '2026-10-01T12:00:00Z'
+        });
+
+        assert.equal(result.sent, true);
+        assert.equal(sent.length, 1);
+        const [body] = sent;
+
+        // The provider's trailing zeros are noise, but the digits must not move.
+        assert.match(body.textContent, /12\.5 XRP \(ripple\)/);
+        assert.match(body.textContent, /rExampleDestinationAddress/);
+        assert.match(body.textContent, /tag-99/);
+        assert.match(body.textContent, /\$25\.00/);
+        assert.match(body.textContent, /\$40\.50/, 'the account balance is the reference the user checks against');
+        assert.ok(body.textContent.length > 40, 'a message has no usable text alternative');
+        assert.ok(body.htmlContent.includes('<table'), 'a message is not using the branded layout');
+    } finally {
+        global.fetch = originalFetch;
+        delete process.env.BREVO_API_KEY;
+    }
+});
+
+test('a coin amount is never rounded to the two decimals a fiat figure would use', () => {
+    // Rounding here is not a cosmetic problem: 0.00042 becomes 0.00, and 0.00 is an
+    // instruction to send nothing to an address that only accepts a non-zero amount.
+    assert.equal(formatCoin('0.00042000'), '0.00042');
+    assert.equal(formatCoin('0.001'), '0.001');
+    assert.equal(formatCoin('12.50000000'), '12.5');
+    assert.equal(formatCoin(100), '100');
+    assert.equal(formatCoin('not a number'), null);
+});
+
+test('the deposit receipt names the amount, the method, and the new balance', async () => {
+    const sent = [];
+    const originalFetch = global.fetch;
+    global.fetch = async (url, init) => {
+        sent.push(JSON.parse(init.body));
+        return new Response('{"messageId":"1"}', { status: 201, headers: { 'Content-Type': 'application/json' } });
+    };
+    process.env.BREVO_API_KEY = 'test-key';
+    try {
+        const result = await sendDepositConfirmedEmail({
+            to: 'a@example.test',
+            amount: 25,
+            balance: 65.5,
+            method: 'Card',
+            reference: 'cs_test_123'
+        });
+
+        assert.equal(result.sent, true);
+        const [body] = sent;
+        // The balance simply becoming larger is the least legible thing that can happen to an
+        // account: a user watching an unexpected credit has no way to tell a deposit landing
+        // from a mistake, so the receipt has to say what it was for.
+        assert.match(body.textContent, /\$25\.00/);
+        assert.match(body.textContent, /Card/);
+        assert.match(body.textContent, /\$65\.50/, 'the new balance is what the user is trying to account for');
+        assert.match(body.textContent, /cs_test_123/);
+        assert.ok(body.htmlContent.includes('<table'));
+    } finally {
+        global.fetch = originalFetch;
+        delete process.env.BREVO_API_KEY;
+    }
+});
+
+test('a crypto deposit is named by coin and network, and a card deposit by card', () => {
+    // Sending USDT on the wrong chain is the single most common way a crypto deposit is lost,
+    // so the network is not decoration -- it is the part the user gets wrong.
+    assert.equal(methodLabelFor({ provider: 'nowpayments', assetCode: 'usdt', network: 'trc20' }), 'USDT (trc20)');
+    assert.equal(methodLabelFor({ provider: 'nowpayments', assetCode: 'btc', network: 'bitcoin' }), 'BTC (bitcoin)');
+    assert.equal(methodLabelFor({ provider: 'stripe', assetCode: 'USD' }), 'Card');
+    // A network the provider did not report is not invented.
+    assert.equal(methodLabelFor({ provider: 'nowpayments', assetCode: 'btc' }), 'BTC');
+});
+
+test('a deposit email with nowhere to go is a skip, not a failure and not a send', async () => {
+    const originalFetch = global.fetch;
+    let called = false;
+    global.fetch = async () => { called = true; return new Response('{}', { status: 201 }); };
+    process.env.BREVO_API_KEY = 'test-key';
+    try {
+        const noRecipient = await sendDepositInstructionsEmail({ to: '', payAddress: 'a', payAmount: 1 });
+        assert.equal(noRecipient.sent, false);
+        assert.equal(noRecipient.reason, 'no-recipient');
+        assert.equal(called, false, 'an empty address must not reach the provider');
+    } finally {
+        global.fetch = originalFetch;
+        delete process.env.BREVO_API_KEY;
+    }
+});
+
+/**
+ * A deposit that ends badly used to end in silence. Three ways a crypto deposit can stop --
+ * the address expires, the payment is refused, an underpayment is never made whole -- all
+ * left the user watching a balance that never moved, with no way to tell the app apart from
+ * one that was merely slow.
+ *
+ * The line that matters most is the one saying the funds were never credited. Without it a
+ * failed deposit reads as "the platform has my money", and that belief is what turns a routine
+ * expiry into a chargeback.
+ */
+test('a deposit that did not complete says so, and says the money was never credited', async () => {
+    const sent = [];
+    const originalFetch = global.fetch;
+    global.fetch = async (url, init) => {
+        sent.push(JSON.parse(init.body));
+        return new Response('{"messageId":"1"}', { status: 201, headers: { 'Content-Type': 'application/json' } });
+    };
+    process.env.BREVO_API_KEY = 'test-key';
+    try {
+        const result = await sendDepositFailedEmail({
+            to: 'a@example.test',
+            amount: 25,
+            method: 'USDT (trc20)',
+            expired: true
+        });
+
+        assert.equal(result.sent, true);
+        const [body] = sent;
+        // Named for what happened rather than for the state change: "deposit failed" is a
+        // system fact, and the subject is the only part most people read.
+        assert.match(body.subject, /did not go through/i);
+        assert.match(body.textContent, /could not be completed/i);
+        assert.match(body.textContent, /expired/i);
+        // The sentence that prevents a support escalation becoming a chargeback.
+        assert.match(body.textContent, /not credited to your account/i);
+        assert.match(body.textContent, /transaction hash/i, 'the user needs to be told what to bring to support');
+        assert.ok(body.htmlContent.includes('<table'));
+    } finally {
+        global.fetch = originalFetch;
+        delete process.env.BREVO_API_KEY;
+    }
+});
+
+/**
+ * The balance is debited the instant a withdrawal request is stored, and until this message
+ * existed the next thing the user heard was the final confirmation -- if it arrived at all.
+ * In between, their balance had dropped by the full amount with no evidence anything was
+ * happening, which reads as "my money is gone" and is when people file a ticket or, worse,
+ * submit a second withdrawal.
+ */
+test('the withdrawal is announced the moment it is sent, and not claimed as arrived', async () => {
+    const sent = [];
+    const originalFetch = global.fetch;
+    global.fetch = async (url, init) => {
+        sent.push(JSON.parse(init.body));
+        return new Response('{"messageId":"1"}', { status: 201, headers: { 'Content-Type': 'application/json' } });
+    };
+    process.env.BREVO_API_KEY = 'test-key';
+    try {
+        const result = await sendWithdrawalStartedEmail({
+            to: 'a@example.test',
+            amount: 20,
+            assetCode: 'USDT',
+            network: 'tron',
+            destination: 'TXyz9Example'
+        });
+
+        assert.equal(result.sent, true);
+        const [body] = sent;
+        assert.match(body.textContent, /on its way/i);
+        assert.match(body.textContent, /\$20\.00/);
+        assert.match(body.textContent, /USDT \(tron\)/);
+        // Honest about the stage. Saying "sent" here would be a promise about a blockchain
+        // confirmation nobody has seen, and the user would be right to distrust it when the
+        // arrival email is late.
+        assert.match(body.textContent, /waiting for the blockchain to confirm/i);
+        assert.match(body.textContent, /will email you again/i);
+    } finally {
+        global.fetch = originalFetch;
+        delete process.env.BREVO_API_KEY;
+    }
+});
+

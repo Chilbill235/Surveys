@@ -489,23 +489,146 @@ test('a batch carries the callback URL, so a finished payout is noticed', async 
 
     const { seen } = await withPayoutFetch(() => nowPayments.submitPayoutBatch(entries, {
         ipnCallbackUrl: 'https://example.test/api/payments/nowpayments/ipn',
-        logger: { log() {} }
+        logger: { log() {}, warn() {} }
     }));
 
     const create = seen.find((call) => call.url.endsWith('/v1/payout'));
     assert.ok(create);
     assert.equal(create.body.ipn_callback_url, 'https://example.test/api/payments/nowpayments/ipn');
-    assert.deepEqual(create.body.withdrawals[0].payoutId, 'wd-5');
     assert.equal(create.body.withdrawals[0].currency, 'btc');
+    assert.equal(create.body.withdrawals[0].address, 'bc1qexample');
+    assert.equal(create.body.withdrawals[0].amount, 0.001);
 
     // Left to the dashboard setting when the caller has no usable origin, so a batch is never
     // pointed at a host that cannot receive it.
     const without = await withPayoutFetch(() => nowPayments.submitPayoutBatch(entries, {
-        logger: { log() {} }
+        logger: { log() {}, warn() {} }
     }));
     const noCallback = without.seen.find((call) => call.url.endsWith('/v1/payout'));
     assert.equal('ipn_callback_url' in noCallback.body, false);
 });
+
+/**
+ * `POST /v1/payout` has a closed schema: anything beyond the documented fields is refused
+ * with `withdrawals[0].<field> is not allowed`, and one extra field costs the whole batch.
+ * `payoutId` was sent for a long time on the assumption the provider would echo it back, and
+ * the first live send against a funded account was refused outright, leaving every crypto
+ * withdrawal in the queue undelivered.
+ *
+ * The field that *is* documented is `unique_external_id` -- the name NOWPayments' own official
+ * SDK serialises, which the provider echoes back on the create response, on the individual
+ * payout record, and in the payout IPN. It is an identity match rather than an inference from
+ * the destination, which is what makes a single payout inside a multi-withdrawal batch
+ * unambiguous. The address matching underneath is the fallback for a response that omits it.
+ */
+test('a batch sends the documented fields only, and is matched back by its external id', async () => {
+    const entries = [
+        { payoutId: 'wd-5', address: 'bc1qexample', currency: 'btc', amount: 0.001 },
+        { payoutId: 'wd-6', address: 'TXyz9Example', currency: 'usdttrc20', amount: 12.5, extraId: 'tag-1' },
+    ];
+
+    // The provider's order is not assumed, and the addresses are deliberately swapped relative
+    // to the request. An identity match is unaffected by both; anything positional or
+    // address-ordered would get this wrong.
+    const { seen, result } = await withPayoutFetch(() => nowPayments.submitPayoutBatch(entries, {
+        logger: { log() {}, warn() {} }
+    }), {
+        payoutBody: {
+            batch_withdrawal_id: 'batch-1',
+            withdrawals: [
+                { id: 'p-2', unique_external_id: 'wd-6', address: 'TXyz9Example', currency: 'usdttrc20', amount: '12.5', status: 'CREATING' },
+                { id: 'p-1', unique_external_id: 'wd-5', address: 'bc1qexample', currency: 'btc', amount: '0.001', status: 'WAITING' },
+            ]
+        }
+    });
+
+    const create = seen.find((call) => call.url.endsWith('/v1/payout'));
+    assert.equal('payoutId' in create.body.withdrawals[0], false, 'the provider refuses an unknown field');
+    assert.equal(create.body.withdrawals[0].unique_external_id, 'wd-5');
+    assert.equal(create.body.withdrawals[1].unique_external_id, 'wd-6');
+    assert.equal(create.body.withdrawals[1].extra_id, 'tag-1', 'the destination tag uses the documented name');
+
+    // Each entry keeps its own correlation key and picks up its own provider id, even though
+    // the response came back in the opposite order.
+    assert.deepEqual(result.withdrawals, [
+        { payoutId: 'wd-5', providerWithdrawalId: 'p-1', status: 'WAITING' },
+        { payoutId: 'wd-6', providerWithdrawalId: 'p-2', status: 'CREATING' }
+    ]);
+});
+
+test('a response that omits the external id still resolves, on the destination', async () => {
+    const entries = [
+        { payoutId: 'wd-5', address: 'bc1qexample', currency: 'btc', amount: 0.001 },
+        { payoutId: 'wd-6', address: 'TXyz9Example', currency: 'usdttrc20', amount: 12.5 },
+    ];
+
+    // A provider version that drops the field, or a response shape that does not carry it,
+    // must degrade to address matching rather than losing every entry in the batch.
+    const sparse = await withPayoutFetch(() => nowPayments.submitPayoutBatch(entries, {
+        logger: { log() {}, warn() {} }
+    }), {
+        payoutBody: {
+            batch_withdrawal_id: 'batch-1',
+            withdrawals: [
+                { id: 'p-1', address: 'bc1qexample', amount: '0.001', status: 'WAITING' },
+                { id: 'p-2', address: 'TXyz9Example', amount: '12.5', status: 'CREATING' },
+            ]
+        }
+    });
+    assert.deepEqual(sparse.result.withdrawals.map((w) => w.providerWithdrawalId), ['p-1', 'p-2']);
+
+    // Two entries to the same address and currency is ambiguous. Guessing would attach one
+    // row's status to the other, so neither is matched and both are left for reconciliation.
+    const ambiguous = await withPayoutFetch(() => nowPayments.submitPayoutBatch([
+        { payoutId: 'wd-7', address: 'bc1qshared', currency: 'btc', amount: 0.001 },
+        { payoutId: 'wd-8', address: 'bc1qshared', currency: 'btc', amount: 0.001 },
+    ], {
+        logger: { log() {}, warn() {} }
+    }), {
+        payoutBody: {
+            batch_withdrawal_id: 'batch-1',
+            withdrawals: [
+                { id: 'p-1', address: 'bc1qshared', currency: 'btc', amount: '0.001', status: 'FINISHED' },
+                { id: 'p-2', address: 'bc1qshared', currency: 'btc', amount: '0.001', status: 'REJECTED' },
+            ]
+        }
+    });
+    assert.deepEqual(ambiguous.result.withdrawals.map((w) => w.status), [null, null]);
+
+    // An entry the provider says nothing about keeps its own key and no status, which
+    // `autoPayouts` records as the conservative `WAITING`.
+    const partial = await withPayoutFetch(() => nowPayments.submitPayoutBatch(entries, {
+        logger: { log() {}, warn() {} }
+    }), {
+        payoutBody: {
+            batch_withdrawal_id: 'batch-1',
+            withdrawals: [
+                { id: 'p-1', address: 'bc1qexample', currency: 'btc', amount: '0.001', status: 'WAITING' },
+            ]
+        }
+    });
+    assert.deepEqual(partial.result.withdrawals, [
+        { payoutId: 'wd-5', providerWithdrawalId: 'p-1', status: 'WAITING' },
+        { payoutId: 'wd-6', providerWithdrawalId: null, status: null }
+    ]);
+});
+
+/**
+ * `SENDING`, `FAILED` and `CANCELLED` are the states a payout is in for most of its life, or
+ * ends its life in. They were missing from the vocabulary, which is not a cosmetic gap: a
+ * status the app does not recognise is written as the `WAITING` fallback, so a payout
+ * genuinely broadcasting on-chain read as "queued, nothing happening", and a payout the
+ * provider had abandoned was never recognised as finished and so never refunded.
+ */
+test('the payout vocabulary covers the states a real payout passes through and ends in', () => {
+    for (const status of ['NEW', 'CREATING', 'WAITING', 'PROCESSING', 'SENDING', 'FINISHED', 'FAILED', 'CANCELLED', 'REJECTED', 'REJECTED_NOT_CHECKED']) {
+        assert.equal(nowPayments.PAYOUT_STATUSES[status], status, `${status} is missing from the vocabulary`);
+    }
+    // Both spellings, because the provider uses both and downstream code has one value to
+    // reason about.
+    assert.deepEqual([...nowPayments.PAYOUT_CANCELLED_SPELLINGS], ['CANCELLED', 'CANCELED']);
+});
+
 
 
 /**

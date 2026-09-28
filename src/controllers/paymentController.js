@@ -6,6 +6,7 @@ const { resolvePublicBaseUrl, isPubliclyReachable } = require('../services/publi
 const { parseAmountInRange, amountsMatch, formatUsd } = require('../services/money');
 const nowPayments = require('../services/nowPayments');
 const { applyPayoutCallback } = require('../services/autoPayouts');
+const { notifyDepositInstructions, notifyDepositCredited, notifyDepositFailed } = require('../services/depositEmails');
 const ipnLog = require('../services/ipnLog');
 
 // ---------------------------------------------------------------------------
@@ -639,6 +640,28 @@ async function createDeposit(req, res) {
             ]
         );
 
+        // The deposit is only a set of instructions at this point, and those instructions exist
+        // in exactly one place: the response being assembled below. The coin amount cannot be
+        // reconstructed later -- the exchange rate has moved, and one address serves every
+        // figure quoted against it -- so the durable copy goes out now, while the user is
+        // still on the page to act on it. Not awaited, for the same reason the welcome email
+        // is not: the deposit row already exists, and holding the response open to deliver a
+        // courtesy message turns a slow mail provider into a failed deposit request that the
+        // user then retries, creating a second deposit.
+        notifyDepositInstructions({
+            userId: req.user.id,
+            depositId: deposit.id,
+            amount,
+            assetCode: providerAsset,
+            network: payment.network || payCurrency,
+            payAddress: payment.pay_address,
+            payAmount: payment.pay_amount,
+            payinExtraId: payment.payin_extra_id || null,
+            expiresAt: payment.expiration_estimate_date || null
+        }).catch((error) => {
+            console.error(`Deposit ${deposit.id}: instructions email failed:`, error.message);
+        });
+
         return res.status(201).json({
             depositId: deposit.id,
             providerPaymentId: String(payment.payment_id),
@@ -881,18 +904,39 @@ async function nowPaymentsIpn(req, res) {
         }
 
         const targetStatus = targetStatusFor(paymentStatus);
+        let credited = null;
+        let statusChanged = false;
         if (targetStatus === 'confirmed') {
             // creditConfirmedDeposit is the only thing that writes 'confirmed', and
             // it also flips credited_at, so the status and the credit cannot diverge.
-            await creditConfirmedDeposit(client, {
+            credited = await creditConfirmedDeposit(client, {
                 id: deposit.id,
                 ledger_source_id: `nowpayments:${paymentId}`,
             }, 'Confirmed NOWPayments deposit');
         } else {
-            await applyDepositStatus(client, deposit.id, targetStatus);
+            // Whether this delivery is the one that moved the row, as opposed to a repeat of a
+            // status it already had. Decided here rather than after the commit because that is
+            // the only place the row count is known.
+            statusChanged = await applyDepositStatus(client, deposit.id, targetStatus);
         }
 
         await client.query('COMMIT');
+
+        // After the commit and only for the call that actually changed something: a duplicate
+        // delivery reaches the early return above, and a redeposit cannot happen. The balance
+        // is the only evidence a user has that the money arrived, and an unexplained credit is
+        // as alarming as a missing one.
+        if (credited?.credited) {
+            notifyDepositCredited({ depositId: deposit.id }).catch((error) => {
+                console.error(`Deposit ${deposit.id}: receipt email failed:`, error.message);
+            });
+        } else if (statusChanged && targetStatus === 'failed') {
+            // A deposit that expired or was refused is a user who has possibly already sent
+            // money and is watching for it to appear. Silence is the worst available answer.
+            notifyDepositFailed({ depositId: deposit.id }).catch((error) => {
+                console.error(`Deposit ${deposit.id}: failure notice failed:`, error.message);
+            });
+        }
         ipnLog.record({
             outcome: 'accepted',
             detail: targetStatus === 'confirmed' ? 'Deposit credited.' : `Deposit moved to ${targetStatus}.`,
@@ -949,6 +993,8 @@ async function stripeWebhook(req, res) {
     }
 
     let client;
+    let credited = null;
+    let statusChanged = false;
     try {
         client = await pool.connect();
         await client.query('BEGIN');
@@ -996,21 +1042,37 @@ async function stripeWebhook(req, res) {
             return res.status(200).send('Already processed.');
         }
 
+        let failedReason = null;
         if (isExpiry) {
-            await applyDepositStatus(client, deposit.id, 'failed');
+            statusChanged = await applyDepositStatus(client, deposit.id, 'failed');
+            failedReason = 'The card payment was not completed and the checkout session expired.';
         } else if (isFailure) {
             // The reason is captured so the deposit history can explain why the
             // card never completed. Stripe does not always populate this field,
             // so a sensible fallback is used.
-            await applyDepositStatus(client, deposit.id, 'failed');
+            statusChanged = await applyDepositStatus(client, deposit.id, 'failed');
+            failedReason = 'The bank did not complete this card payment.';
         } else {
-            await creditConfirmedDeposit(client, {
+            credited = await creditConfirmedDeposit(client, {
                 id: deposit.id,
                 ledger_source_id: `stripe:${session.id}`,
             }, 'Confirmed Stripe card deposit');
         }
 
         await client.query('COMMIT');
+
+        // Same reasoning as the crypto path, and the same reason it happens here: the webhook
+        // is the only place a card deposit is noticed, so a credit that arrives without a
+        // receipt is a balance the owner cannot account for.
+        if (credited?.credited) {
+            notifyDepositCredited({ depositId: deposit.id }).catch((error) => {
+                console.error(`Deposit ${deposit.id}: receipt email failed:`, error.message);
+            });
+        } else if (statusChanged && failedReason) {
+            notifyDepositFailed({ depositId: deposit.id, reason: failedReason }).catch((error) => {
+                console.error(`Deposit ${deposit.id}: failure notice failed:`, error.message);
+            });
+        }
         return res.status(200).send('OK');
     } catch (error) {
         if (client) await client.query('ROLLBACK').catch(() => {});

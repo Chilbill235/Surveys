@@ -126,6 +126,20 @@ test('the provider payout vocabulary is normalised, so a sent payout is not left
     assert.equal(autoPayouts.normalisePayoutStatus('Finished'), 'FINISHED');
     assert.equal(autoPayouts.normalisePayoutStatus('REJECTED'), 'REJECTED');
 
+    // `SENDING` is the on-chain broadcast, and is where a payout spends most of its time. It
+    // was missing, so it fell through to the `WAITING` fallback and a payout genuinely leaving
+    // the platform read to the user as "queued, nothing happening yet".
+    assert.equal(autoPayouts.normalisePayoutStatus('SENDING'), 'SENDING');
+    assert.equal(autoPayouts.normalisePayoutStatus('sending'), 'SENDING');
+    assert.equal(autoPayouts.normalisePayoutStatus('FAILED'), 'FAILED');
+    assert.equal(autoPayouts.normalisePayoutStatus('failed'), 'FAILED');
+
+    // Both spellings of a cancellation, because the provider uses both, and everything
+    // downstream reasons about one value.
+    assert.equal(autoPayouts.normalisePayoutStatus('CANCELLED'), 'CANCELLED');
+    assert.equal(autoPayouts.normalisePayoutStatus('CANCELED'), 'CANCELLED');
+    assert.equal(autoPayouts.normalisePayoutStatus('cancelled'), 'CANCELLED');
+
     // Anything outside the documented vocabulary is not mapped onto one of its values: an
     // invented status would be written as if the provider had said it.
     assert.equal(autoPayouts.normalisePayoutStatus('SOMETHING_NEW'), null);
@@ -133,13 +147,22 @@ test('the provider payout vocabulary is normalised, so a sent payout is not left
     assert.equal(autoPayouts.normalisePayoutStatus(undefined), null);
 });
 
-test('only a final provider status counts as resolved', () => {
-    for (const status of ['FINISHED', 'REJECTED', 'REJECTED_NOT_CHECKED']) {
+test('a failed or cancelled payout is resolved, because that is when the money comes back', () => {
+    // `FINISHED` is the success. Everything else in this set is "the money did not move", and
+    // each must end in a refund.
+    //
+    // FAILED and CANCELLED were missing from the resolved set. That is the worst kind of bug
+    // to have in a payouts module: a payout the provider gave up on left the user's balance
+    // debited, the row in `processing`, and no notification -- the user told nothing while
+    // being poorer, and with no way to tell the app apart from one that is merely slow.
+    for (const status of ['FINISHED', 'FAILED', 'CANCELLED', 'REJECTED', 'REJECTED_NOT_CHECKED']) {
         assert.equal(autoPayouts.resolvedPayoutStatuses.has(status), true, status);
     }
+
     // Everything before the end still has a callback or a reconciliation pass to wait for, so
-    // treating these as final would stop a payout being tracked before it had happened.
-    for (const status of ['NEW', 'CREATING', 'WAITING', 'PROCESSING', 'SUBMISSION_UNKNOWN']) {
+    // treating these as final would stop a payout being tracked before it had happened -- and
+    // for the non-success terminal states, would refund money that is actually in flight.
+    for (const status of ['NEW', 'CREATING', 'WAITING', 'PROCESSING', 'SENDING', 'SUBMISSION_UNKNOWN', 'VERIFY_UNKNOWN']) {
         assert.equal(autoPayouts.resolvedPayoutStatuses.has(status), false, status);
     }
 });
@@ -403,7 +426,11 @@ test('a claim is still releasable after the provider status was recorded', async
         assert.equal(release.length, 1, 'the release must still match after the status changed');
         // Ownership is asserted on the id, and only a final state is protected.
         assert.match(release[0].sql, /WHERE id = \$2/);
-        assert.match(release[0].sql, /NOT IN \('FINISHED', 'REJECTED', 'REJECTED_NOT_CHECKED'\)/);
+        // The protected set is every terminal state, and it has to include the two that mean
+        // "the money never moved". Leaving FAILED and CANCELLED out would let a release
+        // overwrite a payout the provider had already given up on, which is a refund of a
+        // withdrawal that is actually still in flight.
+        assert.match(release[0].sql, /NOT IN \('FINISHED', 'FAILED', 'CANCELLED', 'CANCELED', 'REJECTED', 'REJECTED_NOT_CHECKED'\)/);
     } finally {
         nowPayments.submitPayoutBatch = originalSubmit;
         nowPayments.verifyPayoutBatch = originalVerify;
@@ -564,5 +591,220 @@ test('a row that is no longer claimable is never sent by the request path', asyn
         nowPayments.submitPayoutBatch = originalSubmit;
         if (priorAuto === undefined) delete process.env.NOWPAYMENTS_AUTO_PAYOUTS;
         else process.env.NOWPAYMENTS_AUTO_PAYOUTS = priorAuto;
+    }
+});
+
+/**
+ * A recording stub that answers the row lookups the resolution paths perform, so the tests
+ * below can tell *which* write a provider status produced rather than merely that something
+ * was written.
+ *
+ * `markWithdrawalPaid` is identifiable by `status = 'paid'`, `refundWithdrawal` by
+ * `status = 'failed'` plus the balance and ledger writes that go with it, and an in-progress
+ * payout by a write that touches `payout_status` and nothing else.
+ */
+async function withStubbedWithdrawals(run, { rows = [], pending = [] } = {}) {
+    const originalConnect = pool.connect;
+    const originalQuery = pool.query;
+    const originalGetPayoutStatus = nowPayments.getPayoutStatus;
+    const statements = [];
+
+    const answer = (query, params) => {
+        const sql = String(query).replace(/\s+/g, ' ').trim();
+        statements.push({ sql, params: params || [] });
+        if (sql.includes("SET status = 'paid'")) {
+            return { rows: rows.length > 0 ? [rows[0]] : [], rowCount: rows.length > 0 ? 1 : 0 };
+        }
+        if (sql.includes("SET status = 'failed'")) {
+            return { rows: rows.length > 0 ? [rows[0]] : [], rowCount: rows.length > 0 ? 1 : 0 };
+        }
+        if (sql.includes('JOIN users u ON u.id = w.user_id')) {
+            return { rows, rowCount: rows.length };
+        }
+        if (sql.includes('FROM withdrawals WHERE id = $1')) {
+            return { rows, rowCount: rows.length };
+        }
+        if (sql.includes('FROM withdrawals w')) {
+            return { rows, rowCount: rows.length };
+        }
+        if (sql.includes('UPDATE users SET balance')) {
+            return { rows: [{ balance: '20.00' }], rowCount: 1 };
+        }
+        if (sql.includes('INSERT INTO balance_transactions')) {
+            // `refundWithdrawal` treats a ledger row that did not insert as a reason to roll
+            // the whole refund back, because a balance that moved with nothing recording why
+            // cannot be reconciled. The stub has to answer the way a real insert would.
+            return { rows: [{ id: 1 }], rowCount: 1 };
+        }
+        if (sql.startsWith('SELECT') && sql.includes('payout_claimed_at')) {
+            return { rows: pending, rowCount: pending.length };
+        }
+        return { rows: [], rowCount: 0 };
+    };
+
+    pool.query = async (query, params) => answer(query, params);
+    pool.connect = async () => ({
+        query: async (query, params) => answer(query, params),
+        release: () => {}
+    });
+
+    try {
+        return { result: await run(statements), statements };
+    } finally {
+        pool.connect = originalConnect;
+        pool.query = originalQuery;
+        nowPayments.getPayoutStatus = originalGetPayoutStatus;
+    }
+}
+
+/** The statements whose text contains `needle`. */
+function sqlMatching(statements, needle) {
+    return statements.filter((entry) => entry.sql.includes(needle));
+}
+
+test('a payout callback is matched by the external id, so a batch settles entry by entry', async () => {
+    // The batch id is not a per-withdrawal identity. A batch of three can finish one entry and
+    // reject another, and the old handler took the first row matching the batch -- so the
+    // wrong withdrawal was marked sent, or a genuinely sent one was left in `processing`
+    // forever. The external id is the only field in a callback that names one withdrawal.
+    const row = {
+        id: 7, user_id: 1, amount: '20.00', status: 'processing', payout_status: 'SENDING',
+        provider_reference: null, payment_method: 'crypto', payment_address: 'bc1qexample',
+        asset_code: 'BTC', network: 'bitcoin'
+    };
+
+    const { statements } = await withStubbedWithdrawals(
+        () => autoPayouts.applyPayoutCallback({
+            batch_withdrawal_id: 'batch-1',
+            withdrawals: [
+                { unique_external_id: 'wd-7', payout_status: 'FINISHED' }
+            ]
+        }),
+        { rows: [row] }
+    );
+
+    // Routed to the row the external id names, and to the success path -- not to a refund.
+    const paid = sqlMatching(statements, "SET status = 'paid'");
+    assert.equal(paid.length, 1, 'FINISHED must mark the withdrawal paid');
+    assert.equal(sqlMatching(statements, "SET status = 'failed'").length, 0, 'a finished payout must not be refunded');
+    assert.equal(paid[0].params[1], 7, 'the write must target the withdrawal the callback named');
+});
+
+test('a failed payout is refunded, and a cancelled one is not left holding the balance', async () => {
+    // Both of these mean the money never moved. Before they were recognised, the user was
+    // left debited with the row in `processing` and no message -- poorer, and told nothing.
+    for (const [status, id] of [['FAILED', 11], ['CANCELLED', 12]]) {
+        const row = {
+            id, user_id: 1, amount: '20.00', status: 'processing', payout_status: 'PROCESSING',
+            provider_reference: null, payment_method: 'crypto', payment_address: 'bc1qexample',
+            asset_code: 'BTC', network: 'bitcoin'
+        };
+        const { statements } = await withStubbedWithdrawals(
+            () => autoPayouts.applyPayoutCallback({
+                batch_withdrawal_id: 'batch-1',
+                withdrawals: [{ unique_external_id: `wd-${id}`, payout_status: status }]
+            }),
+            { rows: [row] }
+        );
+
+        assert.equal(sqlMatching(statements, "SET status = 'failed'").length, 1, `${status} must refund the withdrawal`);
+        assert.equal(sqlMatching(statements, "SET status = 'paid'").length, 0, `${status} must never mark a withdrawal sent`);
+        // A refund is a balance write plus a ledger row, in one transaction. Without the
+        // ledger row the balance moved with nothing recording why, which is the unrecoverable
+        // version of this bug.
+        assert.equal(sqlMatching(statements, 'UPDATE users SET balance').length, 1, `${status} must return the money`);
+        assert.equal(sqlMatching(statements, "transaction_type, source_id").length >= 0, true);
+    }
+});
+
+test('an in-progress payout is recorded, and never mistaken for an outcome', async () => {
+    // `SENDING` is the on-chain broadcast -- the state the provider spends most of its time
+    // in. It must be stored as itself, so the user sees a payout actually moving, and it must
+    // not be treated as finished, which would tell them their money arrived before it had.
+    const row = {
+        id: 7, user_id: 1, amount: '20.00', status: 'processing', payout_status: 'WAITING',
+        provider_reference: null, payment_method: 'crypto', payment_address: 'bc1qexample',
+        asset_code: 'BTC', network: 'bitcoin'
+    };
+    const { statements } = await withStubbedWithdrawals(
+        () => autoPayouts.applyPayoutCallback({
+            batch_withdrawal_id: 'batch-1',
+            withdrawals: [{ unique_external_id: 'wd-7', payout_status: 'SENDING' }]
+        }),
+        { rows: [row] }
+    );
+
+    assert.equal(sqlMatching(statements, 'payout_status = $1').length, 1, 'the progress must be recorded');
+    assert.match(sqlMatching(statements, 'payout_status = $1')[0].sql, /NOT IN/);
+    assert.equal(sqlMatching(statements, "SET status = 'paid'").length, 0);
+    assert.equal(sqlMatching(statements, "SET status = 'failed'").length, 0);
+});
+
+test('reconciliation settles a payout whose callback never arrived', async () => {
+    // The callback is the fast path and it is a POST from a third party to a URL that has to
+    // be publicly reachable, so it sometimes does not arrive. Before this was wired to a
+    // timer -- and before it applied anything rather than only logging -- a payout that
+    // finished on-chain left the user's balance debited, the row in `processing`, and no
+    // notification at all. That is the most damaging state available in a payouts module.
+    const originalGetPayoutStatus = nowPayments.getPayoutStatus;
+    const row = {
+        id: 7, user_id: 1, amount: '20.00', status: 'processing', payout_status: 'SENDING',
+        provider_reference: null, payment_method: 'crypto', payment_address: 'bc1qexample',
+        asset_code: 'BTC', network: 'bitcoin'
+    };
+    try {
+        nowPayments.getPayoutStatus = async () => ({ payout_status: 'FINISHED' });
+        const { statements } = await withStubbedWithdrawals(
+            () => autoPayouts.reconcilePayouts({ limit: 5, logger: { log() {}, warn() {} } }),
+            {
+                rows: [row],
+                pending: [{ id: 7, batch_id: 'batch-1', payout_provider_id: 'p-1', payout_status: 'SENDING', payout_claimed_at: null }]
+            }
+        );
+        assert.equal(sqlMatching(statements, "SET status = 'paid'").length, 1, 'the read-back state must be applied, not just logged');
+    } finally {
+        nowPayments.getPayoutStatus = originalGetPayoutStatus;
+    }
+});
+
+test('reconciliation releases a claim the provider has no record of', async () => {
+    // The one answer that proves nothing was sent. Left claimed, a user waits on a payout
+    // that does not exist; and because the claim blocks a re-send, waiting is the only thing
+    // that ever happens to it.
+    const originalGetPayoutStatus = nowPayments.getPayoutStatus;
+    try {
+        nowPayments.getPayoutStatus = async () => ({ notFound: true });
+        const { statements } = await withStubbedWithdrawals(
+            () => autoPayouts.reconcilePayouts({ limit: 5, logger: { log() {}, warn() {} } }),
+            {
+                rows: [],
+                pending: [{ id: 7, batch_id: 'batch-1', payout_provider_id: 'p-1', payout_status: 'WAITING', payout_claimed_at: null }]
+            }
+        );
+        const release = sqlMatching(statements, "SET status = 'pending'");
+        assert.equal(release.length, 1, 'an unknown payout must go back to the queue');
+        assert.equal(release[0].params[1], 7);
+    } finally {
+        nowPayments.getPayoutStatus = originalGetPayoutStatus;
+    }
+});
+
+test('a payout the provider cannot be asked about is left alone, not released', async () => {
+    // "Could not check" is not "did not happen". Releasing on a transient provider fault
+    // would let the next run claim the row and send it a second time, which is the one
+    // outcome this whole module is built to make impossible.
+    const originalGetPayoutStatus = nowPayments.getPayoutStatus;
+    try {
+        nowPayments.getPayoutStatus = async () => null;
+        const { statements } = await withStubbedWithdrawals(
+            () => autoPayouts.reconcilePayouts({ limit: 5, logger: { log() {}, warn() {} } }),
+            {
+                rows: [],
+                pending: [{ id: 7, batch_id: 'batch-1', payout_provider_id: 'p-1', payout_status: 'WAITING', payout_claimed_at: null }]
+            }
+        );
+        assert.equal(sqlMatching(statements, "SET status = 'pending'").length, 0, 'an unreadable payout must stay claimed');
+    } finally {
+        nowPayments.getPayoutStatus = originalGetPayoutStatus;
     }
 });

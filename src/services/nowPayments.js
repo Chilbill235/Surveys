@@ -69,16 +69,36 @@ const PAYMENT_STATUSES = Object.freeze({
  * `FINISHED` here means the payout was sent; `finished` there means the customer's
  * deposit completed. They are different fields in different payloads, and collapsing
  * them would let a finished withdrawal be read as a funded deposit.
+ *
+ * The list is the provider's full raw vocabulary, not the subset the dashboard shows.
+ * `SENDING`, `FAILED` and `CANCELLED` were missing, and each omission was a way for a
+ * user's money to disappear quietly:
+ *
+ *  - `SENDING` is the on-chain broadcast, the state the provider spends most of its
+ *    time in. Unrecognised, it was stored as the fallback `WAITING`, so a withdrawal
+ *    genuinely broadcasting on-chain read as "queued, nothing happening yet".
+ *  - `FAILED` and `CANCELLED` are terminal *and* mean the money never left. Unrecognised,
+ *    they were not in the resolved set, so a payout the provider had given up on left
+ *    the user's balance debited with no refund and no notification -- the worst possible
+ *    outcome, because the user is told nothing while being poorer.
+ *
+ * Both spellings of the cancellation are accepted because the provider uses both.
  */
 const PAYOUT_STATUSES = Object.freeze({
     NEW: 'NEW',
     CREATING: 'CREATING',
     WAITING: 'WAITING',
     PROCESSING: 'PROCESSING',
+    SENDING: 'SENDING',
     FINISHED: 'FINISHED',
+    FAILED: 'FAILED',
+    CANCELLED: 'CANCELLED',
     REJECTED: 'REJECTED',
     REJECTED_NOT_CHECKED: 'REJECTED_NOT_CHECKED'
 });
+
+/** The two spellings the provider uses for a cancelled payout. */
+const PAYOUT_CANCELLED_SPELLINGS = Object.freeze(['CANCELLED', 'CANCELED']);
 
 const ipnSignaturePattern = /^[0-9a-f]{128}$/i;
 
@@ -914,10 +934,19 @@ function resetPayoutMinimumAvailability() {
  * Submits a batch of crypto payouts through the Mass Payouts API.
  *
  * The endpoint is a batch: one call carries many withdrawals, and the provider returns one
- * `withdrawal` record per entry keyed by the `payoutId` the caller supplied. That caller
- * key is the only way to map the response back to our rows, so it is required per entry and
- * derived from the withdrawal id -- never a random value, because a value that could not be
- * recomputed would make a response impossible to reconcile.
+ * record per entry. It does *not* accept a caller-supplied correlation key. The request body
+ * is exactly `address`, `currency`, `amount`, and optionally `extra_id`; the provider rejects
+ * anything else with `withdrawals[0].<field> is not allowed`, because the schema is closed
+ * rather than permissive. A `payoutId` was sent here for a long time on the assumption that
+ * the provider would echo it back, and the first live send against a funded account proved
+ * otherwise: the whole batch was refused, nothing moved, and every crypto withdrawal in the
+ * queue was released back to `pending` unrefunded-but-undelivered.
+ *
+ * So the only link between a response entry and a withdrawal row is the destination itself,
+ * and `matchPayoutResults` rebuilds it from `address` + `amount` + `currency`. The returned
+ * `payoutId` is still this app's own `wd-<id>` key, because `autoPayouts` recovers the
+ * withdrawal row from it; it is simply an internal correlation value now rather than
+ * something negotiated with the provider.
  *
  * This endpoint is the one place in the app that moves money out without a human, so the
  * shape is deliberately narrow: it takes entries that have already been claimed, and it
@@ -925,7 +954,7 @@ function resetPayoutMinimumAvailability() {
  * see `autoPayouts` -- because a payout that is sent without a claim on file is a payout
  * that can be sent again.
  *
- * `extraId` carries a destination tag or memo for the chains that route by one (XRP).
+ * `extra_id` carries a destination tag or memo for the chains that route by one (XRP).
  * Sending an XRP address with no tag is a transfer that confirms and delivers nothing.
  */
 async function submitPayoutBatch(entries, { logger = console, ipnCallbackUrl = null } = {}) {
@@ -935,24 +964,26 @@ async function submitPayoutBatch(entries, { logger = console, ipnCallbackUrl = n
     const list = Array.isArray(entries) ? entries : [];
     if (list.length === 0) return { batchId: null, withdrawals: [] };
 
-    // `payoutId` is our correlation key back to a withdrawal, and the provider's own docs do not
-    // list it among the accepted per-withdrawal fields. It has never been confirmed against a
-    // funded account, so the first live send is the real test. If the batch is refused with
-    // `withdrawals[0] does not match any of the allowed types`, the field is not accepted under
-    // that name: drop it from the body and match the response on `address` instead, which is
-    // unique per claim because a withdrawal row is claimed once. Nothing else needs to change --
-    // the response mapping below already falls back across `payoutId`/`payout_id`, and
-    // `withdrawalIdFromPayoutId` is only reached for entries we sent, so a response keyed some
-    // other way is not applied rather than applied to the wrong row.
+    // Exactly the fields the provider documents, nothing more. The schema is closed, so an
+    // extra key is a 400 that costs a whole batch of real payouts -- which is how `payoutId`
+    // took every crypto withdrawal in the queue offline. Built from scratch rather than
+    // spread, so a future field on the claim object cannot leak in by accident.
+    //
+    // `unique_external_id` is the correlation key, and it is the one the provider actually
+    // documents: NOWPayments' own official SDK serialises exactly this field name, and the
+    // provider echoes it back on the create response, on the individual payout record, and in
+    // the payout IPN. So a response entry can be tied to a withdrawal row by identity rather
+    // than by inferring it from the destination -- and the same value makes a webhook for a
+    // single payout in a multi-withdrawal batch unambiguous, which the batch id never could.
     const body = {
         withdrawals: list.map((entry) => {
             const record = {
-                payoutId: String(entry.payoutId),
                 address: String(entry.address),
                 currency: String(entry.currency).toLowerCase(),
                 amount: Number(entry.amount)
             };
-            if (entry.extraId) record.extraId = String(entry.extraId);
+            if (entry.extraId) record.extra_id = String(entry.extraId);
+            if (entry.payoutId) record.unique_external_id = String(entry.payoutId);
             return record;
         })
     };
@@ -978,18 +1009,25 @@ async function submitPayoutBatch(entries, { logger = console, ipnCallbackUrl = n
     // Per-entry results, when the provider sends them. Absent for some statuses, in which
     // case the batch id is all we have and reconciliation re-reads the batch.
     const reported = Array.isArray(result?.withdrawals) ? result.withdrawals : [];
-    const byPayoutId = new Map();
-    for (const item of reported) {
-        const key = String(item?.payoutId ?? item?.payout_id ?? '');
-        if (key) byPayoutId.set(key, item);
-    }
+    const matches = matchPayoutResults(list, reported);
 
+    const unmatched = matches.reduce((count, item) => count + (item === null ? 1 : 0), 0);
     logger.log(`Submitted a NOWPayments payout batch${batchId ? ` ${batchId}` : ''} with ${list.length} withdrawal(s).`);
+    if (unmatched > 0) {
+        // Said out loud rather than swallowed. An unmatched entry still gets the batch id and
+        // the conservative `WAITING` status, so it is safe; it just has to wait for
+        // reconciliation to learn its real state, and an operator reading the log at 3am
+        // should not have to work that out from a missing line.
+        logger.warn(
+            `${unmatched} of ${list.length} payout(s) came back unrecognised; they are recorded as awaiting ` +
+            'the provider and will be resolved by reconciliation.'
+        );
+    }
 
     return {
         batchId: batchId === null ? null : String(batchId),
-        withdrawals: list.map((entry) => {
-            const item = byPayoutId.get(String(entry.payoutId));
+        withdrawals: list.map((entry, index) => {
+            const item = matches[index];
             return {
                 payoutId: String(entry.payoutId),
                 providerWithdrawalId: item?.id === undefined || item?.id === null ? null : String(item.id),
@@ -1000,19 +1038,132 @@ async function submitPayoutBatch(entries, { logger = console, ipnCallbackUrl = n
 }
 
 /**
- * Reads the current state of a submitted payout batch.
+ * Pairs each requested entry with the provider's record of it.
+ *
+ * Two mechanisms, in order of strength.
+ *
+ * The primary one is `unique_external_id`, which was sent with the request and is echoed
+ * back. That is an identity match and there is nothing to infer: two entries cannot share
+ * one, because the value is derived from a withdrawal id that is unique.
+ *
+ * The fallback matches on the destination -- `address` plus `amount` plus `currency` -- and
+ * exists only so a provider that drops or renames the external id still resolves. It runs in
+ * tiers from most specific to least, each tier seeing only the entries earlier tiers could
+ * not place, so a response that omits `currency` still matches on address and amount rather
+ * than falling all the way to address alone.
+ *
+ * Every pairing must be one-to-one. A key two entries share, or that two reported items
+ * share, is ambiguous and is left unpaired on purpose: an unmatched entry is recorded as
+ * `WAITING` and resolved later by reconciliation, which is a delay, whereas attributing one
+ * entry's status to another entry's row could mark a withdrawal resolved that never moved --
+ * and a row wrongly stored as rejected is then protected by the idempotency check in
+ * `applyPayoutCallback`, so the real outcome would be ignored when it finally arrives.
+ *
+ * Positional pairing is deliberately absent. The provider does not document the order of the
+ * `withdrawals` array as the order they were sent in, and "assume the order" is exactly the
+ * kind of guess that produces a plausible-looking write to the wrong row.
+ */
+function matchPayoutResults(list, reported) {
+    const matches = new Array(list.length).fill(null);
+    if (reported.length === 0) return matches;
+
+    // Identity first. Paired with a uniqueness requirement, so a provider that somehow echoed
+    // one external id twice resolves to nothing rather than to whichever entry came first.
+    const externalIdOf = (entry) => String(entry?.unique_external_id ?? entry?.uniqueExternalId ?? '').trim();
+    const byExternalId = new Map();
+    for (let j = 0; j < reported.length; j += 1) {
+        const key = externalIdOf(reported[j]);
+        if (!key) continue;
+        byExternalId.set(key, byExternalId.has(key) ? null : j);
+    }
+    if (byExternalId.size > 0) {
+        for (let i = 0; i < list.length; i += 1) {
+            const key = String(list[i]?.payoutId ?? '').trim();
+            if (!key || !byExternalId.has(key)) continue;
+            const j = byExternalId.get(key);
+            if (j === null || j === undefined) continue;
+            matches[i] = reported[j];
+        }
+    }
+    if (matches.every((item) => item !== null)) return matches;
+
+    const describe = (entry) => ({
+        address: String(entry?.address ?? '').trim().toLowerCase(),
+        currency: String(entry?.currency ?? '').trim().toLowerCase(),
+        // The provider reports `amount` as a string and we send it as a number, so both sides
+        // are compared numerically at a fixed precision rather than as text.
+        amount: (() => {
+            const value = Number(entry?.amount);
+            return Number.isFinite(value) ? value.toFixed(12) : null;
+        })()
+    });
+
+    const requested = list.map(describe);
+    const answered = reported.map(describe);
+
+    // Most specific first. A null key means the fields it needs are not usable on that side.
+    const keyTiers = [
+        (part) => (part.address && part.amount !== null ? `${part.address}|${part.amount}|${part.currency}` : null),
+        (part) => (part.address && part.amount !== null ? `${part.address}|${part.amount}` : null),
+        (part) => (part.address || null)
+    ];
+
+    for (const key of keyTiers) {
+        const open = [];
+        for (let i = 0; i < requested.length; i += 1) {
+            if (matches[i] === null) open.push(i);
+        }
+        if (open.length === 0) break;
+
+        // A duplicate key is stored as null, which is what makes the mapping one-to-one: two
+        // entries wanting the same key resolve to nothing on either side rather than one of
+        // them winning arbitrarily.
+        const bucket = (indexes, parts) => {
+            const map = new Map();
+            for (const index of indexes) {
+                const value = key(parts[index]);
+                if (value === null) continue;
+                map.set(value, map.has(value) ? null : index);
+            }
+            return map;
+        };
+
+        const requestedByKey = bucket(open, requested);
+        const answeredByKey = bucket(answered.map((_, index) => index), answered);
+
+        for (const [value, requestIndex] of requestedByKey) {
+            if (requestIndex === null) continue;
+            const answerIndex = answeredByKey.get(value);
+            if (answerIndex === null || answerIndex === undefined) continue;
+            matches[requestIndex] = reported[answerIndex];
+        }
+    }
+
+    return matches;
+}
+
+/**
+ * Reads the current state of a submitted payout.
  *
  * Used by reconciliation, and it is the only way out of an unknown submission outcome: when
  * the submit call fails in a way that leaves the caller unsure whether the provider acted
  * (a timeout, a dropped connection), retrying the send is not safe, but asking what already
  * happened is.
  *
- * Returns null when the provider cannot answer, so a caller can tell "no such batch" and
+ * The id should be the *individual* payout id, not the batch id. The provider's status
+ * endpoint addresses a single payout, and reconciliation needs that granularity anyway: a
+ * batch of three can finish one entry and reject another, and a batch-level answer would
+ * force a choice between telling a user their money moved when it did not, and leaving a
+ * sent payout looking unfinished. A batch id is accepted as a fallback for rows claimed
+ * before the individual id was stored, and for the window between the create call and the
+ * write that records it.
+ *
+ * Returns null when the provider cannot answer, so a caller can tell "no such payout" and
  * "could not check" apart by treating null as unresolved rather than as a failure.
  */
-async function getPayoutBatch(batchId) {
+async function getPayoutStatus(payoutId) {
     if (!payoutsConfigured()) return null;
-    const id = String(batchId || '').trim();
+    const id = String(payoutId || '').trim();
     if (!id) return null;
     try {
         const result = await request('GET', `/v1/payout/${encodeURIComponent(id)}`, {
@@ -1021,11 +1172,16 @@ async function getPayoutBatch(batchId) {
         });
         return result || null;
     } catch (error) {
-        // A batch the provider does not know about is a real answer -- it means the
+        // A payout the provider does not know about is a real answer -- it means the
         // submission never landed -- so it is reported rather than swallowed.
         if (error instanceof NowPaymentsError && error.status === 404) return { notFound: true };
         return null;
     }
+}
+
+/** Reads a whole batch, for the case where only the batch id is known. */
+async function getPayoutBatch(batchId) {
+    return getPayoutStatus(batchId);
 }
 
 // ---------------------------------------------------------------------------
@@ -1247,6 +1403,7 @@ module.exports = {
     PRODUCTION_BASE_URL,
     PAYMENT_STATUSES,
     PAYOUT_STATUSES,
+    PAYOUT_CANCELLED_SPELLINGS,
 
     getBaseUrl,
     getApiKey,
@@ -1281,6 +1438,7 @@ module.exports = {
     submitPayoutBatch,
     verifyPayoutBatch,
     getPayoutBatch,
+    getPayoutStatus,
 
     sortKeysDeep,
     verifyIpnSignature,

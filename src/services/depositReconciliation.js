@@ -9,6 +9,7 @@ const {
 } = require('./depositCredit');
 const { amountsMatch } = require('./money');
 const nowPayments = require('./nowPayments');
+const { notifyDepositCredited, notifyDepositFailed } = require('./depositEmails');
 
 /**
  * Checks if NOWPayments credentials are set up.
@@ -58,6 +59,8 @@ async function applyProviderOutcome(deposit, targetStatus, ledgerSourceId, descr
         let credited = false;
         let amount = null;
 
+        let statusChanged = false;
+
         if (targetStatus === 'confirmed') {
             const result = await creditConfirmedDeposit(client, {
                 id: deposit.id,
@@ -67,7 +70,7 @@ async function applyProviderOutcome(deposit, targetStatus, ledgerSourceId, descr
             credited = result.credited;
             amount = result.amount;
         } else {
-            await applyDepositStatus(client, deposit.id, targetStatus, deposit.provider_payment_id);
+            statusChanged = await applyDepositStatus(client, deposit.id, targetStatus, deposit.provider_payment_id);
         }
 
         await client.query('COMMIT');
@@ -75,12 +78,29 @@ async function applyProviderOutcome(deposit, targetStatus, ledgerSourceId, descr
         if (credited) {
             logger.log(`Deposit ${deposit.id}: credited $${amount} to user ${deposit.user_id}.`);
             summary.credited += 1;
+            // The sweep is a fallback for a callback that never arrived, which makes it the
+            // least expected way for a balance to grow. A receipt here is what stops the user
+            // reporting an unexplained credit. After the commit, and only for the one call that
+            // performed the credit -- an already-credited row is logged as skipped and skipped
+            // here too, so a repeated sweep cannot send the same receipt twice.
+            notifyDepositCredited({ depositId: deposit.id }).catch((error) => {
+                logger.error(`Deposit ${deposit.id}: receipt email failed (${error.message}).`);
+            });
         } else if (targetStatus === 'confirmed') {
             logger.log(`Deposit ${deposit.id}: already credited by another process.`);
             summary.skipped += 1;
         } else {
             logger.log(`Deposit ${deposit.id}: marked ${targetStatus}.`);
             summary.failed += 1;
+            // The mirror of the receipt above, and gated on the status having actually changed.
+            // A sweep re-reads the same expired deposit on every pass until something clears
+            // the row, so an ungated notice here would email the same failure notice over and
+            // over for as long as the row survives.
+            if (statusChanged && targetStatus === 'failed') {
+                notifyDepositFailed({ depositId: deposit.id }).catch((error) => {
+                    logger.error(`Deposit ${deposit.id}: failure notice failed (${error.message}).`);
+                });
+            }
         }
         return true;
     } catch (error) {
