@@ -245,7 +245,34 @@ const expectations = [
     ['phone', '.offer-card', 'padding', { 'phone 430 (large)': '16px', 'laptop 1280': '20px' }],
     // A narrow window on a desktop still gets the stacked layout, but keeps a cursor,
     // so it is not treated as a touch device for the touch-target rules.
-    ['narrow desktop', '.offer-grid', 'grid-template-columns', { 'narrow desktop window 700 (mouse)': 'minmax(0, 1fr)', 'laptop 1280': 'repeat(3, minmax(0, 1fr))' }]
+    ['narrow desktop', '.offer-grid', 'grid-template-columns', { 'narrow desktop window 700 (mouse)': 'minmax(0, 1fr)', 'laptop 1280': 'repeat(3, minmax(0, 1fr))' }],
+
+    // A full-width button is the only place a label is allowed to wrap. The base button is
+    // `nowrap` so a short inline button never breaks mid-word, but the primary actions carry
+    // labels the script sets -- "Generate crypto payment address" is wider than a 320px phone
+    // once the dialog and button padding are taken off, and it was being clipped at the edge.
+    // Asserted at the smallest supported width, which is where it actually broke.
+    ['phone', '.button-wide', 'white-space', { 'phone 320 (small)': 'normal', 'laptop 1280': 'normal' }],
+    ['phone', '.button-wide', 'width', { 'phone 320 (small)': '100%', 'laptop 1280': '100%' }],
+
+    // The survey's Back and Next share one row rather than stacking, because stacking pushes
+    // the primary control below the fold on a short phone.
+    ['phone', '.demo-actions', 'display', { 'phone 390 (modern)': 'flex', 'laptop 1280': 'flex' }],
+
+    // "How it works" collapses to one column on a phone and widens as space allows, with no
+    // breakpoints of its own. `auto-fit` with a 240px floor is the whole mechanism: two
+    // columns need 480px plus the gap, so a 390px phone gets one column and a 1280px desktop
+    // gets three, from a single declaration. Hardcoding a column count here would need a rule
+    // per viewport and would still be wrong at the widths between them.
+    ['phone', '.home-step-list', 'grid-template-columns', {
+        'phone 320 (small)': 'repeat(auto-fit, minmax(240px, 1fr))',
+        'phone 390 (modern)': 'repeat(auto-fit, minmax(240px, 1fr))',
+        'laptop 1280': 'repeat(auto-fit, minmax(240px, 1fr))'
+    }],
+
+    // The offer card's type badge and partner name share one wrapping row, so a long network
+    // name cannot push the badge off the line.
+    ['phone', '.offer-card-top', 'flex-wrap', { 'phone 390 (modern)': 'wrap', 'laptop 1280': 'wrap' }]
 ];
 
 let problems = 0;

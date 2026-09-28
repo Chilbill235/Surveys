@@ -1,6 +1,7 @@
 const express = require('express');
 const authController = require('../controllers/authController');
 const { rateLimitByIp } = require('../services/security');
+const { register: registerMethod } = require('./methodRegistry');
 
 const router = express.Router();
 
@@ -23,5 +24,19 @@ router.post('/register', registerLimit, authController.register);
 router.post('/login', loginLimit, authController.login);
 router.post('/forgot-password', forgotLimit, authController.forgotPassword);
 router.post('/reset-password', resetLimit, authController.resetPassword);
+
+// Verification. The code check is not behind a per-IP limiter of its own: the code is already
+// limited to a handful of guesses by the server-side attempt counter, which is the control
+// that has to be unevaditable. An IP limiter in front of it would only push a patient attacker
+// onto another address, and would punish a household whose members all mistyped a code.
+router.post('/verify-email', authController.verifyEmail);
+router.post('/resend-verification', authController.resendVerification);
+
+registerMethod(/^\/api\/auth\/register\/?$/, ['POST']);
+registerMethod(/^\/api\/auth\/login\/?$/, ['POST']);
+registerMethod(/^\/api\/auth\/forgot-password\/?$/, ['POST']);
+registerMethod(/^\/api\/auth\/reset-password\/?$/, ['POST']);
+registerMethod(/^\/api\/auth\/verify-email\/?$/, ['POST']);
+registerMethod(/^\/api\/auth\/resend-verification\/?$/, ['POST']);
 
 module.exports = router;

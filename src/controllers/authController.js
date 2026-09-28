@@ -4,9 +4,45 @@ const jwt = require('jsonwebtoken');
 const pool = require('../config/db');
 const { consumeRateLimit } = require('../services/security');
 const { sendPasswordResetEmail } = require('../services/resetEmail');
+const {
+    generateCode,
+    hashCode,
+    codeMatches,
+    sendVerificationEmail,
+    CODE_PATTERN,
+    CODE_LIFETIME_MINUTES,
+    MAX_ATTEMPTS
+} = require('../services/verificationEmail');
 const { resolvePublicBaseUrl } = require('../services/publicBaseUrl');
 
 const scryptAsync = promisify(scrypt);
+
+/**
+ * One message for every failed verification, whatever the reason.
+ *
+ * A more specific reply would be a better experience and a worse system: distinguishing
+ * "no account", "already confirmed", "expired" and "wrong code" tells an attacker which
+ * addresses are registered and how far a guess got. The recovery path for a real user is the
+ * resend button, which is one click either way.
+ */
+const VERIFICATION_FAILED_MESSAGE =
+    'That code is not valid. Check the newest email, or request a new code.';
+
+/** New codes per address per window. Enough for a real person, not enough to bury an inbox. */
+const RESEND_LIMIT_PER_ADDRESS = 3;
+const RESEND_LIMIT_PER_IP = 10;
+const RESEND_WINDOW_SECONDS = 15 * 60;
+
+/**
+ * Whether email can be sent at all.
+ *
+ * Checked before an account is created rather than after, because a deployment without this
+ * cannot confirm anyone: registration would "succeed", the user would wait for a code that
+ * never came, and the account they just made would be permanently unusable.
+ */
+function isEmailConfigured() {
+    return Boolean(process.env.RESEND_API_KEY && process.env.EMAIL_FROM);
+}
 
 // ---------------------------------------------------------------------------
 // Policy
@@ -248,6 +284,18 @@ async function consumeResetToken({ token, passwordHash }) {
 // ---------------------------------------------------------------------------
 
 const authController = {
+    /**
+     * Creates an account and sends a confirmation code.
+     *
+     * No session token is returned. The account exists but cannot be used until the address
+     * is confirmed, which is the entire point: handing back a token here is what let a typo,
+     * or an address belonging to someone else, become a usable account holding a balance.
+     *
+     * The response distinguishes "created, now confirm it" from "that address is taken",
+     * because the person registering already knows the address they typed. That is not an
+     * enumeration surface -- registration is not a secret, and the alternative (pretending to
+     * succeed while sending nothing) leaves a real user stuck with no way forward.
+     */
     register: async (req, res) => {
         const email = normaliseEmail(req.body.email);
         const password = req.body.password;
@@ -261,25 +309,86 @@ const authController = {
             return res.status(503).json({ error: 'Account login is not configured.' });
         }
 
+        // Email is the only way to prove an address, so a deployment without it cannot
+        // confirm anyone. Production refuses outright rather than minting accounts that can
+        // never be used -- a user who is told to check an inbox that will never receive
+        // anything has no way forward and no way to tell that from a delivery problem.
+        //
+        // Outside production the code is logged and the address is accepted as already
+        // confirmed, so local development and the smoke suite work without a mail provider.
+        // The branch is gated on NODE_ENV rather than on the missing variables, so a
+        // production deployment with a misconfigured provider is refused rather than
+        // silently skipping verification for real users.
+        const emailReady = isEmailConfigured();
+        if (!emailReady && process.env.NODE_ENV === 'production') {
+            return res.status(503).json({
+                error: 'Email confirmation is not configured, so accounts cannot be created right now.'
+            });
+        }
+        if (!emailReady) {
+            console.warn(
+                'RESEND_API_KEY / EMAIL_FROM are not set: new accounts are being accepted ' +
+                'without email confirmation. This is a development convenience and is refused ' +
+                'in production.'
+            );
+        }
+
+        let client;
         try {
+            client = await pool.connect();
+            await client.query('BEGIN');
+
             const passwordHash = await hashPassword(password);
             const username = `member_${randomUUID().replaceAll('-', '').slice(0, 16)}`;
-            const result = await pool.query(
-                `INSERT INTO users (username, email, password_hash)
-                 VALUES ($1, $2, $3)
+            const result = await client.query(
+                `INSERT INTO users (username, email, password_hash, email_verified_at)
+                 VALUES ($1, $2, $3, $4)
                  RETURNING id, email, balance, demo_balance`,
-                [username, email, passwordHash]
+                // Confirmed at creation only on the development path above; production always
+                // leaves this NULL until a code proves the address.
+                [username, email, passwordHash, emailReady ? null : new Date()]
             );
             const user = result.rows[0];
 
+            if (emailReady) {
+                const code = generateCode();
+                await client.query(
+                    `INSERT INTO email_verification_codes (user_id, code_hash, expires_at)
+                     VALUES ($1, $2, NOW() + ($3 || ' minutes')::interval)`,
+                    [user.id, hashCode(code, user.id), String(CODE_LIFETIME_MINUTES)]
+                );
+                await client.query('COMMIT');
+                client.release();
+                client = null;
+
+                const delivery = await sendVerificationEmail({ to: user.email, code });
+                if (!delivery.sent) {
+                    // The account is real and a code exists, so this is recoverable by
+                    // resending. Logged loudly because it means nobody can be confirmed.
+                    console.error(`Verification email was not delivered (${delivery.reason}).`);
+                }
+
+                return res.status(201).json({
+                    requiresVerification: true,
+                    email: user.email,
+                    expiresInMinutes: CODE_LIFETIME_MINUTES
+                });
+            }
+
+            await client.query('COMMIT');
+            client.release();
+            client = null;
+
             const token = issueToken(user);
             if (!token) {
-                // Unreachable in practice (JWT_SECRET is checked above), but
-                // returning `{ token: null }` would be a silent auth failure.
                 return res.status(503).json({ error: 'Account login is not configured.' });
             }
             return res.status(201).json({ token, user: publicUser(user) });
         } catch (error) {
+            if (client) {
+                await client.query('ROLLBACK').catch(() => {});
+                client.release();
+            }
             if (error.code === '23505') {
                 // The email column is the only uniqueness the client can
                 // influence: `username` is server-generated and collisions are
@@ -304,6 +413,160 @@ const authController = {
         }
     },
 
+    /**
+     * Confirms an address with the code that was emailed, and issues the session.
+     *
+     * The code row is destroyed on a correct guess, so it cannot be replayed, and on the
+     * last wrong guess, so it cannot be searched. Every failure answers with one message: a
+     * more specific reply would tell an attacker whether the address exists, whether a code
+     * was live, and how many digits were right.
+     */
+    verifyEmail: async (req, res) => {
+        const email = normaliseEmail(req.body.email);
+        const code = String(req.body.code || '').trim();
+
+        if (!isValidEmail(email) || !CODE_PATTERN.test(code)) {
+            return res.status(400).json({ error: 'Enter the 6-digit code from your email.' });
+        }
+
+        let client;
+        try {
+            client = await pool.connect();
+            await client.query('BEGIN');
+
+            const found = await client.query(
+                `SELECT u.id, u.email, u.balance, u.demo_balance, u.is_banned,
+                        c.id AS code_id, c.code_hash, c.attempts
+                 FROM users u
+                 LEFT JOIN email_verification_codes c
+                        ON c.user_id = u.id AND c.consumed_at IS NULL AND c.expires_at > NOW()
+                 WHERE LOWER(u.email) = $1
+                 FOR UPDATE OF u`,
+                [email]
+            );
+            const row = found.rows[0];
+
+            if (!row || !row.code_id || row.is_banned) {
+                if (client) await client.query('ROLLBACK').catch(() => {});
+                return res.status(400).json({ error: VERIFICATION_FAILED_MESSAGE });
+            }
+
+            if (!codeMatches(code, row.code_hash, row.id)) {
+                // Spending an attempt on every wrong guess, and destroying the code when they
+                // run out, is what makes a million possibilities unsearchable.
+                await client.query(
+                    'UPDATE email_verification_codes SET attempts = attempts + 1 WHERE id = $1',
+                    [row.code_id]
+                );
+                if (row.attempts + 1 >= MAX_ATTEMPTS) {
+                    await client.query('DELETE FROM email_verification_codes WHERE id = $1', [row.code_id]);
+                }
+                await client.query('COMMIT');
+                return res.status(400).json({ error: VERIFICATION_FAILED_MESSAGE });
+            }
+
+            await client.query('DELETE FROM email_verification_codes WHERE id = $1', [row.code_id]);
+            const updated = await client.query(
+                `UPDATE users SET email_verified_at = NOW() WHERE id = $1
+                 RETURNING id, email, balance, demo_balance`,
+                [row.id]
+            );
+            await client.query('COMMIT');
+            client.release();
+            client = null;
+
+            const user = updated.rows[0];
+            const token = issueToken(user);
+            if (!token) {
+                return res.status(503).json({ error: 'Account login is not configured.' });
+            }
+            return res.json({ token, user: publicUser(user) });
+        } catch (error) {
+            if (client) {
+                await client.query('ROLLBACK').catch(() => {});
+                client.release();
+            }
+            console.error('Email verification Error:', error.message);
+            if (isDatabaseUnreachable(error)) {
+                return res.status(503).json({ error: 'This service is temporarily unavailable.' });
+            }
+            return res.status(500).json({ error: 'Could not confirm your email right now.' });
+        }
+    },
+
+    /**
+     * Sends another code to an address that has not been confirmed.
+     *
+     * Rated per address and per IP, because without a send limit this is a way to bury an
+     * inbox in mail. The response is identical whether the address is unknown, already
+     * confirmed, or absent, so it cannot be used to discover who has an account -- only
+     * whether a message was actually sent differs, and that is not observable from outside.
+     */
+    resendVerification: async (req, res) => {
+        const email = normaliseEmail(req.body.email);
+        if (!isValidEmail(email)) {
+            return res.status(400).json({ error: 'Enter a valid email address.' });
+        }
+        const ip = req.ip || req.socket?.remoteAddress || 'unknown';
+
+        const [perAddress, perIp] = await Promise.all([
+            consumeRateLimit({
+                bucket: `verify-email:${email}`,
+                maxAttempts: RESEND_LIMIT_PER_ADDRESS,
+                windowSeconds: RESEND_WINDOW_SECONDS
+            }),
+            consumeRateLimit({
+                bucket: `verify-email:ip:${ip}`,
+                maxAttempts: RESEND_LIMIT_PER_IP,
+                windowSeconds: RESEND_WINDOW_SECONDS
+            })
+        ]);
+        if (!perAddress.allowed || !perIp.allowed) {
+            return res.status(429).json({
+                error: 'Too many requests for a new code. Try again in a few minutes.',
+                retryAfterSeconds: Math.max(perAddress.retryAfterSeconds, perIp.retryAfterSeconds)
+            });
+        }
+
+        try {
+            const found = await pool.query(
+                'SELECT id, email, email_verified_at FROM users WHERE LOWER(email) = $1',
+                [email]
+            );
+            const user = found.rows[0];
+
+            if (user && !user.email_verified_at) {
+                const code = generateCode();
+                // Any previous live code is dropped, so only the newest one works and a code
+                // still sitting in the user's inbox from an earlier request cannot be used
+                // after they asked for a new one.
+                await pool.query('DELETE FROM email_verification_codes WHERE user_id = $1', [user.id]);
+                await pool.query(
+                    `INSERT INTO email_verification_codes (user_id, code_hash, expires_at)
+                     VALUES ($1, $2, NOW() + ($3 || ' minutes')::interval)`,
+                    [user.id, hashCode(code, user.id), String(CODE_LIFETIME_MINUTES)]
+                );
+                const delivery = await sendVerificationEmail({ to: user.email, code });
+                if (!delivery.sent) {
+                    console.error(`Verification email was not delivered (${delivery.reason}).`);
+                }
+            }
+
+            return res.json({
+                ok: true,
+                expiresInMinutes: CODE_LIFETIME_MINUTES,
+                message: 'If that address needs confirming, a new code is on its way.'
+            });
+        } catch (error) {
+            console.error('Resend verification Error:', error.message);
+            if (isDatabaseUnreachable(error)) {
+                return res.status(503).json({ error: 'This service is temporarily unavailable.' });
+            }
+            return res.status(500).json({ error: 'Could not send a new code right now.' });
+        }
+    },
+
+
     login: async (req, res) => {
         const email = normaliseEmail(req.body.email);
         const password = req.body.password;
@@ -321,7 +584,7 @@ const authController = {
 
         try {
             const result = await pool.query(
-                `SELECT id, email, balance, password_hash, is_banned, demo_balance
+                `SELECT id, email, balance, password_hash, is_banned, demo_balance, email_verified_at
                  FROM users
                  WHERE LOWER(email) = $1`,
                 [email]
@@ -333,6 +596,24 @@ const authController = {
             const matches = await verifyPassword(password, user?.password_hash);
             if (!user || !matches || user.is_banned) {
                 return res.status(401).json({ error: 'Email or password is incorrect.' });
+            }
+
+            // An unconfirmed account is refused here even though the password was correct.
+            // This is the gate that makes verification mean something: without it, the check
+            // only ever delayed sign-in by one extra click and the account was usable
+            // regardless. The address is echoed back because the caller already proved they
+            // own the password, so this reveals nothing they did not already know, and the
+            // client needs it to show which address to confirm.
+            //
+            // `COALESCE` matters: accounts created before this migration have no value in the
+            // column, and treating "NULL" as confirmed would silently exempt every existing
+            // user. Null means unverified, which asks them to confirm rather than assuming.
+            if (!user.email_verified_at) {
+                return res.status(403).json({
+                    error: 'Confirm your email address to finish setting up your account.',
+                    requiresVerification: true,
+                    email: user.email
+                });
             }
 
             const token = issueToken(user);

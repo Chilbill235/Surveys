@@ -5,31 +5,13 @@
  * outbound SMTP connection is not viable. When no provider is configured the link is
  * logged instead of emailed: local development can still complete the flow, and the
  * operator sees a plain warning rather than a silent failure.
- */
-
-/**
- * Resolves the public origin used for reset links.
  *
- * A reset link built from localhost is useless to the recipient, so an unusable value
- * is reported here rather than silently producing a dead link.
+ * The link itself is built by the caller using `resolvePublicBaseUrl` from
+ * `services/publicBaseUrl`. That validation is deliberately not repeated here: an earlier
+ * copy of it lived in this file and was weaker, because it skipped the embedded-credential
+ * and LAN-origin checks. Two copies of the same rule drift, and the weaker one is the one
+ * that gets used.
  */
-function resolveResetBaseUrl() {
-    const rawBaseUrl = (process.env.APP_BASE_URL || '').trim() ||
-        (process.env.NODE_ENV === 'production' ? '' : 'http://localhost:3000');
-    if (!rawBaseUrl) {
-        return { ok: false, error: 'APP_BASE_URL is required so reset links point at the public site.' };
-    }
-
-    try {
-        const parsed = new URL(rawBaseUrl);
-        if (!['http:', 'https:'].includes(parsed.protocol)) {
-            return { ok: false, error: 'APP_BASE_URL must be an absolute http(s) URL.' };
-        }
-        return { ok: true, baseUrl: parsed };
-    } catch {
-        return { ok: false, error: 'APP_BASE_URL must be a valid absolute URL.' };
-    }
-}
 
 async function sendPasswordResetEmail({ to, resetUrl }) {
     const apiKey = process.env.RESEND_API_KEY;
@@ -69,7 +51,14 @@ async function sendPasswordResetEmail({ to, resetUrl }) {
         });
 
         if (!response.ok) {
-            return { sent: false, reason: `email provider returned ${response.status}` };
+            // The provider's body names the actual problem -- an unverified sending domain, a
+            // rate limit, a bad `from` address. Without it the operator is left with only a
+            // status code and has to guess at a configuration fault.
+            const detail = await response.text().catch(() => '');
+            return {
+                sent: false,
+                reason: `email provider returned ${response.status}${detail ? `: ${detail.slice(0, 200)}` : ''}`
+            };
         }
         return { sent: true };
     } catch (error) {
@@ -77,4 +66,4 @@ async function sendPasswordResetEmail({ to, resetUrl }) {
     }
 }
 
-module.exports = { resolveResetBaseUrl, sendPasswordResetEmail };
+module.exports = { sendPasswordResetEmail };

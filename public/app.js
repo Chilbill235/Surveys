@@ -136,6 +136,29 @@ document.addEventListener('DOMContentLoaded', () => {
         setAuthMode('forgot');
     });
 
+    // Email confirmation. The code box submits on Enter, so the flow is one keypress from
+    // pasting the six digits rather than a hunt for the button.
+    document.getElementById('verify-submit').addEventListener('click', submitVerification);
+    document.getElementById('verify-resend').addEventListener('click', resendVerificationCode);
+    document.getElementById('verify-code').addEventListener('keydown', (event) => {
+        if (event.key === 'Enter') {
+            event.preventDefault();
+            submitVerification();
+        }
+    });
+    document.getElementById('verify-code').addEventListener('input', (event) => {
+        // Digits only, even if the code was pasted with a space or a hyphen in it. The field
+        // is `maxlength=6`, so stripping rather than truncating is what makes a pasted
+        // "123 456" work instead of silently becoming "123 45".
+        const cleaned = event.target.value.replace(/\D/g, '').slice(0, 6);
+        if (cleaned !== event.target.value) event.target.value = cleaned;
+    });
+    document.getElementById('verify-back').addEventListener('click', () => {
+        hideVerifyStep();
+        setAuthMode('login');
+        document.getElementById('account-email').focus();
+    });
+
     document.getElementById('offer-search').addEventListener('input', (event) => {
         offerState.search = event.target.value.trim().toLowerCase();
         renderOffers();
@@ -490,6 +513,11 @@ async function requestJson(url, options = {}) {
     if (!response.ok) {
         const error = new Error(payload?.error || payload || 'The request could not be completed.');
         error.status = response.status;
+        // The parsed body rides along on the error so a caller can act on a structured
+        // refusal instead of only being able to print its message. `login` answers 403 with
+        // `requiresVerification`, and that is routing information rather than a dead end: it
+        // means "show the code screen", not "something went wrong".
+        error.payload = payload;
         throw error;
     }
     return payload;
@@ -870,6 +898,142 @@ function setAuthMode(mode) {
         button.classList.toggle('is-active', selected);
         button.setAttribute('aria-selected', String(selected));
     });
+
+    // Leaving the confirmation screen by switching mode, so the credentials are never
+    // sitting behind a code box that has been dismissed.
+    hideVerifyStep();
+}
+
+/**
+ * Shows the confirmation screen and hides the credentials.
+ *
+ * A separate screen because after submitting there is nothing left to correct -- the only
+ * remaining action is typing the code that was emailed. Leaving the fields visible would
+ * invite edits that no longer do anything, which reads as a broken form.
+ */
+function showVerifyStep(email, expiresInMinutes) {
+    const step = document.getElementById('verify-step');
+    const form = document.getElementById('account-form');
+
+    document.getElementById('verify-email').textContent = email;
+    document.getElementById('verify-expiry').textContent = expiresInMinutes
+        ? `It expires in ${expiresInMinutes} minutes.`
+        : '';
+
+    // The email is remembered because confirming needs it and the field is about to be
+    // hidden. Reading it back from the field would be a hidden dependency on a value the
+    // user can no longer see or correct.
+    form.dataset.verifyEmail = email;
+
+    setFormMessage('verify-message', '');
+    document.getElementById('verify-code').value = '';
+    document.getElementById('verify-submit').disabled = false;
+    document.getElementById('verify-resend').disabled = false;
+
+    for (const id of ['account-email', 'account-password', 'account-password-label',
+        'password-hint', 'connect-submit', 'forgot-password-link', 'account-message']) {
+        const element = document.getElementById(id);
+        if (element) element.hidden = true;
+    }
+    document.querySelector('.auth-mode')?.setAttribute('hidden', '');
+
+    step.hidden = false;
+    document.getElementById('verify-code').focus();
+}
+
+function hideVerifyStep() {
+    const step = document.getElementById('verify-step');
+    if (!step || step.hidden) return;
+    step.hidden = true;
+    for (const id of ['account-email', 'account-password', 'account-password-label',
+        'password-hint', 'connect-submit', 'forgot-password-link', 'account-message']) {
+        const element = document.getElementById(id);
+        if (element) element.hidden = false;
+    }
+    const tabs = document.querySelector('.auth-mode');
+    if (tabs) tabs.removeAttribute('hidden');
+    document.getElementById('account-form').dataset.verifyEmail = '';
+}
+
+/**
+ * Confirms the address and signs the account in.
+ *
+ * The session comes from this call, not from registration, so the balance shown afterwards is
+ * read from a server that has already accepted the address.
+ */
+async function submitVerification() {
+    const form = document.getElementById('account-form');
+    const email = form.dataset.verifyEmail || document.getElementById('account-email').value.trim();
+    const code = document.getElementById('verify-code').value.trim();
+    const button = document.getElementById('verify-submit');
+
+    if (!/^\d{6}$/.test(code)) {
+        setFormMessage('verify-message', 'Enter the 6-digit code from your email.', 'error');
+        return;
+    }
+
+    button.disabled = true;
+    button.textContent = 'Confirming...';
+    setFormMessage('verify-message', '');
+
+    try {
+        const data = await requestJson('/api/auth/verify-email', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ email, code })
+        });
+        completeSignIn(data);
+    } catch (error) {
+        setFormMessage('verify-message', error.message, 'error');
+        button.disabled = false;
+        button.textContent = 'Confirm email';
+        // The field is cleared and refocused: a rejected code should not sit there being
+        // retyped character by character, and the next one may have come from a new email.
+        document.getElementById('verify-code').value = '';
+        document.getElementById('verify-code').focus();
+    }
+}
+
+/** Asks for another code. The address is shown, so a wrong entry is corrected here. */
+async function resendVerificationCode() {
+    const form = document.getElementById('account-form');
+    const email = form.dataset.verifyEmail || document.getElementById('account-email').value.trim();
+    const button = document.getElementById('verify-resend');
+
+    button.disabled = true;
+    setFormMessage('verify-message', '');
+
+    try {
+        const data = await requestJson('/api/auth/resend-verification', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ email })
+        });
+        setFormMessage('verify-message', data.message || 'If that address needs confirming, a new code is on its way.', 'success');
+    } catch (error) {
+        setFormMessage('verify-message', error.message, 'error');
+    } finally {
+        button.disabled = false;
+    }
+}
+
+/** Everything that has to happen once a session exists, for either sign-in route. */
+function completeSignIn(data) {
+    sessionStorage.setItem(accountTokenKey, data.token);
+    applyBalance(data.user.balance, data.user.demo_balance);
+    // The bar and the header have to agree the moment a session exists, because the
+    // header controls were disabled for a signed-out visitor and the mirrored ones were
+    // disabled to match. `syncAccountControls` is what lifts both, and it also enables
+    // the live sync's indicator for the first time.
+    syncAccountControls();
+    paintLiveIndicator();
+    syncNow();
+
+    hideVerifyStep();
+    document.getElementById('account-dialog').close();
+    document.getElementById('account-password').value = '';
+    // A deposit created before sign-in would have been blocked, so a fresh catalog
+    // read is enough; no history needs reloading here.
 }
 
 async function connectAccount(event) {
@@ -899,21 +1063,29 @@ async function connectAccount(event) {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ email, password })
         });
-        sessionStorage.setItem(accountTokenKey, data.token);
-        applyBalance(data.user.balance, data.user.demo_balance);
-        // The bar and the header have to agree the moment a session exists, because the
-        // header controls were disabled for a signed-out visitor and the mirrored ones were
-        // disabled to match. `syncAccountControls` is what lifts both, and it also enables
-        // the live sync's indicator for the first time.
-        syncAccountControls();
-        paintLiveIndicator();
-        syncNow();
 
-        document.getElementById('account-dialog').close();
-        document.getElementById('account-password').value = '';
-        // A deposit created before sign-in would have been blocked, so a fresh catalog
-        // read is enough; no history needs reloading here.
+        // Both routes can stop here and ask for a code instead of returning a session.
+        //
+        // Registration always does, because the address has not been proven. Login does it
+        // for an account created before verification existed, or one whose confirmation was
+        // never finished -- arriving at the same screen from either direction means the
+        // recovery is one place, not two.
+        if (data.requiresVerification) {
+            showVerifyStep(data.email || email, data.expiresInMinutes);
+            return;
+        }
+
+        completeSignIn(data);
     } catch (error) {
+        // `login` refuses an unconfirmed account with 403 rather than 200, so for that case
+        // the code screen is reached from the failure path and not the success one. Without
+        // this, someone signing in to an account that predates verification -- or one whose
+        // confirmation was never finished -- would be told to confirm their address and then
+        // given no way to type the code.
+        if (error.payload?.requiresVerification) {
+            showVerifyStep(error.payload.email || email, undefined);
+            return;
+        }
         setFormMessage('account-message', error.message, 'error');
     } finally {
         button.disabled = false;

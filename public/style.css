@@ -7,12 +7,6 @@
      3. Background      8. Dialogs       13. Reset page
      4. Typography      9. Forms         14. Footer
      5. Header         10. Deposit       15. Utilities / motion / media
-
-   The previous stylesheet interleaved its breakpoints with the base rules, so
-   a later desktop rule silently beat an earlier mobile one (a 400px phone got
-   the 28px dialog padding and the 42px demo heading, not the 21px and 32px that
-   the media queries asked for). Every media query now lives in section 15, at
-   the end, so a narrow-screen rule can never be undone further down the file.
    ========================================================================== */
 
 /* 1. Tokens ---------------------------------------------------------------- */
@@ -20,8 +14,6 @@
 :root {
     color-scheme: light;
 
-    /* Brand. --indigo carries the primary actions; the old name "forest" was
-       left over from an earlier green palette and only confused readers. */
     --indigo-900: #131c4a;
     --indigo-800: #1b2660;
     --indigo-700: #2449d8;
@@ -29,12 +21,6 @@
     --indigo-100: #dce6ff;
     --indigo-050: #eef2ff;
 
-    /* Semantic foreground tokens. The brand ramp above is a fixed set of *background*
-       steps: the header gradient, button fills, borders, and focus rings all need the
-       deep values, and flipping those per colour scheme would break the gradient. But the
-       same two values were also being used as heading and link text on a surface, where
-       in dark mode #131c4a on #161a2e is 1.06:1, i.e. invisible, and #2449d8 is 2.72:1.
-       Text therefore uses these two, which do flip, and the ramp keeps its own job. */
     --heading: #131c4a;
     --accent: #2449d8;
 
@@ -44,10 +30,6 @@
     --coral-100: #ffe2d6;
     --sky-500: #56a4d9;
 
-    /* Neutrals. --muted and --faint are both readable text, not decoration: --faint was
-       2.87:1 on --paper, which fails WCAG AA and is why placeholders looked like
-       near-invisible grey. It is now 4.65:1 on paper and 5.12:1 on a card, and --muted
-       is a clear step darker than it so the hierarchy is still visible. */
     --ink: #171a2b;
     --ink-soft: #3d4457;
     --muted: #54586b;
@@ -58,7 +40,6 @@
     --line: #ddd8cb;
     --line-strong: #c6c1b2;
 
-    /* Status */
     --success: #1f6b45;
     --success-bg: #e2f2e6;
     --warning: #8a5d20;
@@ -66,15 +47,12 @@
     --danger: #a52f28;
     --danger-bg: #fbe6e2;
 
-    /* Elevation. Two shadows per level: a tight contact shadow plus a soft
-       ambient one, which reads as a real surface lift rather than a blur. */
     --shadow-xs: 0 1px 2px rgb(19 28 74 / 0.07);
     --shadow-sm: 0 2px 4px rgb(19 28 74 / 0.06), 0 1px 2px rgb(19 28 74 / 0.05);
     --shadow-md: 0 6px 16px rgb(19 28 74 / 0.09), 0 2px 4px rgb(19 28 74 / 0.05);
     --shadow-lg: 0 18px 44px rgb(19 28 74 / 0.14), 0 4px 10px rgb(19 28 74 / 0.06);
     --shadow-xl: 0 32px 80px rgb(13 18 44 / 0.28);
 
-    /* Radii and rhythm */
     --r-sm: 6px;
     --r-md: 10px;
     --r-lg: 16px;
@@ -84,8 +62,6 @@
     --shell: 1180px;
     --gap: 16px;
 
-    /* Fluid type. clamp() removes the need for a font-size per breakpoint,
-       so the mobile cascade bugs in the old file cannot recur. */
     --step--1: clamp(0.78rem, 0.75rem + 0.15vw, 0.84rem);
     --step-0: clamp(0.94rem, 0.91rem + 0.16vw, 1rem);
     --step-1: clamp(1.05rem, 1rem + 0.24vw, 1.18rem);
@@ -119,8 +95,6 @@
         --indigo-050: #1a1f3d;
         --indigo-100: #232a52;
 
-        /* Headings and links become light, because the surfaces they sit on are dark.
-           These are the two values that were unreadable before. */
         --heading: #eef1fb;
         --accent: #8fabff;
 
@@ -143,7 +117,6 @@
 /* 2. Reset / base ---------------------------------------------------------- */
 
 *, *::before, *::after { box-sizing: border-box; }
-
 * { margin: 0; }
 
 html {
@@ -164,11 +137,6 @@ body {
     text-rendering: optimizeLegibility;
 }
 
-/* Fixes a real bug: any element that sets `display` in a class rule was
-   ignoring the `hidden` attribute, because the author stylesheet beat the
-   user-agent `[hidden] { display: none }`. The password label therefore stayed
-   on screen during a password reset. `!important` is correct here because
-   `hidden` is a behavioural switch, not a styling preference. */
 [hidden] { display: none !important; }
 
 img, svg, video { max-width: 100%; display: block; }
@@ -177,8 +145,6 @@ button, input, select, textarea { font: inherit; color: inherit; }
 button { cursor: pointer; }
 button:disabled { cursor: not-allowed; }
 
-/* Inputs inherit the page font by default; these keep number fields and
-   selects from falling back to the platform UI font on some browsers. */
 input[type='number'] { font-variant-numeric: tabular-nums; }
 select { appearance: none; background-image: linear-gradient(45deg, transparent 50%, var(--muted) 50%), linear-gradient(135deg, var(--muted) 50%, transparent 50%); background-position: right 16px center, right 11px center; background-size: 5px 5px, 5px 5px; background-repeat: no-repeat; padding-right: 34px !important; }
 
@@ -188,16 +154,10 @@ select { appearance: none; background-image: linear-gradient(45deg, transparent 
     border-radius: 3px;
 }
 
-/* Text that sits on the header gradient or on a brand fill is always light, and text
-   that sits on a page surface follows --heading. Repointing every `color: var(--indigo-900)`
-   would have made this pale on the lime chips, so the fixed dark value is kept there. */
 ::selection { background: var(--lime-400); color: #101532; }
 
 /* 3. Background ------------------------------------------------------------ */
 
-/* Three stacked layers: a warm base wash, two soft brand-coloured glows, and a
-   fine engineering grid. Fixed attachment gives the glows depth as the page
-   scrolls, so long pages do not read as flat colour. */
 body::before {
     position: fixed;
     z-index: -2;
@@ -211,8 +171,6 @@ body::before {
     pointer-events: none;
 }
 
-/* The grid is drawn on the body rather than on a wrapper so it also sits
-   behind the header and the page footer. */
 body::after {
     position: fixed;
     z-index: -1;
@@ -246,10 +204,7 @@ body::after {
 
 h1, h2, h3, h4 { line-height: 1.15; text-wrap: balance; font-weight: 400; }
 
-.display {
-    font-family: var(--font-display);
-    letter-spacing: -0.015em;
-}
+.display { font-family: var(--font-display); letter-spacing: -0.015em; }
 
 .eyebrow {
     display: flex;
@@ -303,17 +258,12 @@ h1, h2, h3, h4 { line-height: 1.15; text-wrap: balance; font-weight: 400; }
     gap: 20px;
     padding: 10px max(20px, calc((100% - var(--shell)) / 2));
     color: #fff;
-    /* The gradient is built from the three darkest brand steps on purpose. It previously
-       ran out to --indigo-600, and white text at the alphas used for the secondary labels
-       fell to 3.11:1 at that end. Every stop now clears AA, including the dimmed labels. */
     background: linear-gradient(104deg, var(--indigo-900) 0%, var(--indigo-800) 52%, var(--indigo-700) 100%);
     border-bottom: 3px solid var(--lime-400);
     box-shadow: 0 2px 20px rgb(19 28 74 / 0.18);
     isolation: isolate;
 }
 
-/* Frosted band under the header so catalog content scrolling past stays
-   readable instead of colliding with the solid bar. */
 .topbar::before {
     position: absolute;
     z-index: -1;
@@ -324,8 +274,6 @@ h1, h2, h3, h4 { line-height: 1.15; text-wrap: balance; font-weight: 400; }
     backdrop-filter: blur(12px) saturate(140%);
 }
 
-/* Angled texture on the right edge. Pointer-events are off so it can never
-   swallow a click on the account buttons. */
 .topbar::after {
     position: absolute;
     z-index: -1;
@@ -365,11 +313,7 @@ h1, h2, h3, h4 { line-height: 1.15; text-wrap: balance; font-weight: 400; }
     font-weight: 700;
 }
 
-/* The alpha'd whites below are the dimmest text in the app, so they are set as high as
-   they can go while still reading as secondary: 0.85 / 0.82 / 0.78 clear AA on every stop
-   of the header gradient, where 0.70 / 0.68 / 0.60 did not. */
 .brand-light { color: rgb(255 255 255 / 0.82); font-weight: 400; }
-
 
 .account-tools { display: flex; align-items: center; gap: 10px; }
 
@@ -387,11 +331,6 @@ h1, h2, h3, h4 { line-height: 1.15; text-wrap: balance; font-weight: 400; }
 .demo-balance-line { display: flex; align-items: baseline; gap: 5px; color: rgb(255 255 255 / 0.78); font-size: 0.68rem; }
 .demo-balance-line strong { color: var(--lime-400); font-size: 0.75rem; }
 
-/* Sync indicator.
-   Sits under the balances and reports whether the page is still current. Its meaning is
-   carried by the text, not by the dot: colour alone would be invisible to a colour-blind
-   user and meaningless in a high-contrast mode. The dot is decoration on top of a label
-   that already says everything. */
 .live-indicator {
     display: inline-flex;
     align-items: center;
@@ -401,14 +340,7 @@ h1, h2, h3, h4 { line-height: 1.15; text-wrap: balance; font-weight: 400; }
     font-size: 0.68rem;
     line-height: 1.3;
 }
-.live-indicator::before {
-    content: "";
-    width: 6px;
-    height: 6px;
-    border-radius: 50%;
-    background: var(--lime-400);
-    flex: none;
-}
+.live-indicator::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--lime-400); flex: none; }
 .live-indicator.is-waiting::before { background: var(--warning); }
 .live-indicator.is-waiting { color: rgb(255 255 255 / 0.85); }
 .live-indicator.is-stale { color: var(--danger); }
@@ -416,10 +348,6 @@ h1, h2, h3, h4 { line-height: 1.15; text-wrap: balance; font-weight: 400; }
 
 /* 5b. Mobile action bar ---------------------------------------------------- */
 
-/* The primary money actions. On wide screens these live in the header; on a narrow
-   screen they move to a fixed bar along the bottom edge, which is the only part of a
-   phone screen a thumb reaches without the hand shifting grip. Hidden by default and
-   revealed by the narrow-screen query in section 19. */
 .action-bar {
     position: fixed;
     z-index: 60;
@@ -429,9 +357,6 @@ h1, h2, h3, h4 { line-height: 1.15; text-wrap: balance; font-weight: 400; }
     display: none;
     align-items: stretch;
     gap: 6px;
-    /* `padding: top right bottom left`. The right side must take the right inset and the
-       left side the left one; the two were crossed over, so a phone in landscape padded
-       the wrong edges and let the outermost button sit under the rounded corner. */
     padding: 8px max(12px, env(safe-area-inset-right)) calc(8px + env(safe-area-inset-bottom)) max(12px, env(safe-area-inset-left));
     background: color-mix(in srgb, var(--surface) 88%, transparent);
     border-top: 1px solid var(--line);
@@ -504,18 +429,11 @@ h1, h2, h3, h4 { line-height: 1.15; text-wrap: balance; font-weight: 400; }
 .button-ghost { color: var(--ink); border-color: var(--line-strong); background: var(--surface); }
 .button-ghost:hover:not(:disabled) { border-color: var(--indigo-700); color: var(--accent); background: var(--indigo-050); }
 
-/* A full-width button is the one place wrapping reads correctly, because there is nothing
-   beside it to misalign against. The base button is `nowrap` so a short inline button never
-   breaks mid-word -- but the primary actions carry labels the script sets, like "Generate
-   crypto payment address", which is wider than a 320px phone once the dialog padding and
-   the button's own padding are taken off. Those labels were being clipped at the edge. */
 .button-wide {
     width: 100%;
     white-space: normal;
     padding-block: 11px;
     line-height: 1.25;
-    /* Two lines must not look like a mistake: the row is centred and grows from its middle
-       so the button keeps its vertical rhythm whichever way the label breaks. */
     text-align: center;
 }
 
@@ -581,7 +499,6 @@ h1, h2, h3, h4 { line-height: 1.15; text-wrap: balance; font-weight: 400; }
     border-bottom: 4px solid var(--lime-400);
 }
 
-/* Aurora: two oversized blurred discs behind the copy. */
 .home-hero::before {
     position: absolute;
     z-index: -1;
@@ -645,12 +562,8 @@ h1, h2, h3, h4 { line-height: 1.15; text-wrap: balance; font-weight: 400; }
 .home-stat strong { color: var(--heading); font-family: var(--font-display); font-size: var(--step-2); font-variant-numeric: tabular-nums; }
 .home-stat span { color: var(--muted); font-size: var(--step--1); }
 
-/* The hero's two calls to action. They are one row on a desktop and stack on a phone, where
-   two side-by-side buttons leave each one too narrow to read at a comfortable size. */
 .home-hero-actions { display: flex; align-items: center; gap: 18px; flex-wrap: wrap; }
 
-/* "How it works". Three numbered cards on a desktop, a single column below the point where
-   three columns would leave each card narrower than its own text. */
 .home-steps { width: min(var(--shell), calc(100% - 48px)); margin: 0 auto; padding: 0 0 clamp(40px, 6vw, 68px); }
 .home-step-list {
     display: grid;
@@ -761,12 +674,6 @@ h1, h2, h3, h4 { line-height: 1.15; text-wrap: balance; font-weight: 400; }
 .count-mark { width: 7px; height: 7px; flex: 0 0 auto; border-radius: 50%; background: var(--success); box-shadow: 0 0 0 4px color-mix(in srgb, var(--success) 20%, transparent); }
 .catalog-filters { display: flex; gap: 10px; }
 
-/* Type filter chips.
-   A button group rather than a select because the active filter has to stay visible while
-   a long list is scrolled, and because the counts next to each chip are only meaningful
-   beside the label they belong to. `aria-pressed` is the state; the styles below are the
-   visual mirror of it, so a chip that is pressed is always distinguishable without colour
-   alone -- it also changes its background, its border, and its text weight. */
 .filter-chips { display: flex; gap: 4px; padding: 3px; border: 1px solid var(--line-strong); border-radius: var(--r-sm); background-color: var(--surface-2); }
 .filter-chip {
     height: 34px;
@@ -834,16 +741,11 @@ h1, h2, h3, h4 { line-height: 1.15; text-wrap: balance; font-weight: 400; }
 .offer-card:nth-child(3n + 2)::before { background: var(--coral-500); }
 .offer-card:nth-child(3n)::before { background: var(--lime-500); }
 .offer-card:hover { border-color: var(--indigo-700); transform: translateY(-3px); box-shadow: var(--shadow-md); }
-/* Keyboard users land on the card's button; the card itself has to show it, since the
-   button's own outline is a small target inside a large surface. */
 .offer-card:focus-within, .home-offer:focus-within { border-color: var(--indigo-700); outline: 2px solid var(--indigo-700); outline-offset: 2px; }
 
 .offer-card-top { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px; }
 .offer-id { color: var(--faint); font-size: 0.7rem; font-weight: 700; letter-spacing: 0.09em; }
 
-/* The type is a badge rather than a word in a sentence, because "Survey" and "Offer" are
-   the one thing a person scanning the grid is filtering by. The partner name follows it and
-   is allowed to wrap: a long network name must not push the badge off the row. */
 .offer-type {
     flex: 0 0 auto;
     padding: 2px 8px;
@@ -861,10 +763,6 @@ h1, h2, h3, h4 { line-height: 1.15; text-wrap: balance; font-weight: 400; }
 
 .offer-title { min-height: 3em; margin: 18px 0 12px; color: var(--heading); font-family: var(--font-display); font-size: var(--step-2); overflow-wrap: anywhere; }
 
-/* The blurb sits under the title and above the reward, clamped to two lines.
-   Clamping rather than hiding it entirely: the full text is what makes an offer
-   comparable to its neighbour, and the two lines that fit are enough to tell two offers
-   apart without turning every card into a wall of text. */
 .offer-blurb {
     display: -webkit-box;
     -webkit-box-orient: vertical;
@@ -902,9 +800,6 @@ h1, h2, h3, h4 { line-height: 1.15; text-wrap: balance; font-weight: 400; }
 .start-button:hover:not(:disabled)::after { transform: translateX(3px); }
 
 .loading-state, .empty-state { grid-column: 1 / -1; padding: 48px 16px; color: var(--muted); text-align: center; }
-/* The reset action inside an empty catalog. A block-level stack so the button is not
-   centred against the text baseline, which puts it a few pixels low and reads as
-   misaligned on touch. */
 .empty-state { display: flex; flex-direction: column; align-items: center; gap: 14px; }
 .empty-state p { margin: 0; }
 .loading-dots { display: inline-block; overflow: hidden; width: 18px; vertical-align: bottom; animation: dots 1s steps(4, end) infinite; }
@@ -926,12 +821,6 @@ h1, h2, h3, h4 { line-height: 1.15; text-wrap: balance; font-weight: 400; }
 /* 9. Dialogs --------------------------------------------------------------- */
 
 .dialog {
-    /* The UA centres a modal dialog with `inset: 0; margin: auto`. The `* { margin: 0 }`
-       reset above outranks that UA rule, so every dialog was pinned to the left edge and
-       the top of the viewport. The centring is therefore declared here rather than
-       inherited: `inset: 0` pins all four edges, `margin: auto` distributes the leftover
-       space evenly on both axes, and `max-height` is what keeps a tall form on screen.
-       The phone breakpoint replaces this with a bottom sheet, which sets its own inset. */
     inset: 0;
     margin: auto;
     width: min(460px, calc(100% - 32px));
@@ -960,6 +849,21 @@ h1, h2, h3, h4 { line-height: 1.15; text-wrap: balance; font-weight: 400; }
 .auth-mode-button { min-height: 38px; border: 0; border-radius: var(--r-sm); color: var(--muted); background: transparent; font-size: var(--step--1); font-weight: 700; transition: color 0.16s var(--ease), background-color 0.16s var(--ease); }
 .auth-mode-button.is-active { color: var(--heading); background: var(--surface); box-shadow: var(--shadow-xs); }
 
+.verify-step { display: grid; gap: 12px; }
+.verify-title { margin: 0; color: var(--heading); font-family: var(--font-display); font-size: var(--step-1); }
+.verify-copy { margin: 0; color: var(--muted); font-size: var(--step--1); line-height: 1.55; }
+.verify-copy strong { color: var(--heading); overflow-wrap: anywhere; }
+.verify-code {
+    min-height: 58px;
+    font-family: var(--font-mono, ui-monospace, 'SFMono-Regular', Consolas, monospace);
+    font-size: var(--step-3);
+    font-weight: 700;
+    letter-spacing: 0.4em;
+    text-indent: 0.4em;
+    text-align: center;
+}
+.verify-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 8px 18px; }
+
 /* 10. Forms ---------------------------------------------------------------- */
 
 .form-label { display: block; margin: 16px 0 7px; color: var(--heading); font-size: var(--step--1); font-weight: 700; }
@@ -979,15 +883,18 @@ h1, h2, h3, h4 { line-height: 1.15; text-wrap: balance; font-weight: 400; }
 .form-control::placeholder { color: var(--faint); }
 textarea.form-control { min-height: 96px; resize: vertical; }
 
-/* The currency markers are positioned by centring, not by a hardcoded `top`.
-   They used to be pinned with `top: 12px` while the unit suffix was centred, which put
-   the "$" and the "USD" on different baselines -- and the deposit field needed its own
-   `top: 17px` override because its input is twice the height, so every future height
-   change silently broke the alignment again. One mechanism, both sides. `line-height: 1`
-   makes the centred box the same height as the glyphs, so the marker lines up with the
-   input's own text rather than with its padding box. */
+/* The currency markers are absolutely positioned over the input, and the input's own
+   padding is what keeps its text clear of them.
+
+   The `$` marker is a direct `span` child of `.amount-field`; the `.amount-suffix` is
+   the *other* direct `span` child, on the right. The rule below used to be a single
+   `.amount-field > span { left: 14px }` block, which set `left` on the suffix too.
+   An absolutely positioned element with both `left` and `right` set stretches between
+   them, and the suffix's text landed at the far left of the stretched box -- on top of
+   the `$`. The `:not()` is what keeps the base rule from applying to the suffix, so
+   the suffix keeps only its own `right`. */
 .amount-field { position: relative; display: flex; align-items: center; }
-.amount-field > span {
+.amount-field > span:not(.amount-suffix) {
     position: absolute;
     z-index: 1;
     top: 50%;
@@ -998,7 +905,11 @@ textarea.form-control { min-height: 96px; resize: vertical; }
     line-height: 1;
     pointer-events: none;
 }
-.amount-field .form-control { padding-left: 32px; font-weight: 700; font-variant-numeric: tabular-nums; }
+/* The padding on the input is the width of the marker plus a visible gap. It has to
+   track the marker's font-size, which the deposit field below makes much larger. */
+.amount-field .form-control { padding-left: 36px; font-weight: 700; font-variant-numeric: tabular-nums; }
+/* Right padding only applies when there is a suffix to clear. */
+.amount-field:has(.amount-suffix) .form-control { padding-right: 54px; }
 
 /* The native stepper is drawn inside the input's right edge, which is exactly where the
    absolute "USD" suffix sits -- the two overlapped, and the spinner arrows sat on top of
@@ -1041,8 +952,6 @@ textarea.form-control { min-height: 96px; resize: vertical; }
 }
 .history-row > div { min-width: 0; display: grid; gap: 4px; }
 
-/* The provider's payout stage sits under the withdrawal's own subtitle, in the muted colour
-   because it is supporting detail rather than the claim the badge makes. */
 .payout-progress { color: var(--muted); font-size: var(--step--1); line-height: 1.45; }
 .history-row strong { color: var(--ink); font-size: var(--step-0); text-transform: capitalize; overflow-wrap: anywhere; }
 .history-row div > span { color: var(--muted); font-size: var(--step--1); overflow-wrap: anywhere; }
@@ -1050,8 +959,6 @@ textarea.form-control { min-height: 96px; resize: vertical; }
 .payment-status { flex: 0 0 auto; padding: 4px 9px; border-radius: var(--r-pill); color: var(--warning); background: var(--warning-bg); font-size: 0.7rem; font-weight: 700; text-transform: capitalize; white-space: nowrap; }
 .status-paid, .status-confirmed { color: var(--success); background: var(--success-bg); }
 .status-failed, .status-expired, .status-cancelled { color: var(--danger); background: var(--danger-bg); }
-/* A refunded withdrawal was still rejected, so it keeps the failure colour; it gets its own
-   selector only so the badge is never left unstyled if the class list is read on its own. */
 .status-refunded { color: var(--danger); background: var(--danger-bg); }
 .status-processing, .status-confirming, .status-pending { color: var(--warning); background: var(--warning-bg); }
 
@@ -1095,10 +1002,24 @@ textarea.form-control { min-height: 96px; resize: vertical; }
 .provider-notice.is-offline .provider-indicator { background: var(--danger); box-shadow: 0 0 0 4px color-mix(in srgb, var(--danger) 22%, transparent); }
 
 .deposit-form { margin-top: 18px; padding: 18px; background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--r-md); }
-.deposit-amount-field .form-control { min-height: 60px; padding-left: 38px; font-size: var(--step-3); }
-/* Only the type size differs for the large amount field. The position is inherited from
-   the centring rule above, so the two fields cannot drift apart. */
-.deposit-amount-field > span { left: 16px; color: var(--accent); font-size: var(--step-2); }
+
+/* The deposit field is the same markup as the withdraw field, with two differences:
+   a much larger `$` marker and a larger value. The container is targeted as well as
+   the input so the padding cannot lose to the base `.amount-field .form-control` rule
+   in section 10, which it did while both selectors had the same specificity and only
+   the base rule's `36px` applied. The `:not(.amount-suffix)` is the same fix as the
+   base rule above -- without it, the container rule would set `left` on the suffix
+   too, and stretch it. */
+.amount-field.deposit-amount-field .form-control {
+    min-height: 60px;
+    padding-left: 56px;
+    font-size: var(--step-3);
+}
+.amount-field.deposit-amount-field > span:not(.amount-suffix) {
+    left: 16px;
+    color: var(--accent);
+    font-size: var(--step-2);
+}
 
 .amount-presets { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin-top: 10px; }
 .amount-presets button { min-height: 40px; border: 1px solid var(--line-strong); border-radius: var(--r-sm); color: var(--heading); background: var(--surface); font-weight: 700; transition: border-color 0.16s var(--ease), background-color 0.16s var(--ease), color 0.16s var(--ease); }
@@ -1126,8 +1047,6 @@ textarea.form-control { min-height: 96px; resize: vertical; }
 .deposit-method-option:hover:not(:disabled) { border-color: var(--indigo-700); background: var(--indigo-050); }
 .deposit-method-option.is-active { border: 2px solid var(--indigo-700); padding: 9px 12px; background: var(--indigo-100); box-shadow: var(--shadow-sm); }
 .deposit-method-option:disabled { color: var(--faint); background: var(--surface-2); cursor: not-allowed; }
-/* The unavailable reason is the whole point of the disabled card, so it stays at the normal
-   secondary-text contrast rather than the faint label colour used for the card title. */
 .deposit-method-option:disabled span { color: var(--muted); }
 
 #deposit-currency { min-height: 46px; font-weight: 700; }
@@ -1150,8 +1069,6 @@ textarea.form-control { min-height: 96px; resize: vertical; }
 
 #withdraw-dialog { width: min(540px, calc(100% - 32px)); max-width: 540px; }
 
-/* A fieldset is used purely for grouping, so its default chrome is removed.
-   The legend keeps the visible label. */
 .fieldset-reset { border: 0; padding: 0; margin: 0; min-width: 0; }
 .legend-label { margin-top: 18px; }
 
@@ -1178,23 +1095,24 @@ textarea.form-control { min-height: 96px; resize: vertical; }
 
 /* 14. Money dialogs: amount blocks, receipts, confirmations ---------------- */
 
-/* Money going in and money coming out are different enough to be told apart at a glance,
-   so the accent bar on top of the panel is the only thing that differs. */
 .dialog-deposit { border-top-color: var(--indigo-700); }
 .dialog-withdraw { border-top-color: var(--coral-500); }
 
-/* The amount is the one control on both screens that matters, so it gets a labelled
-   block with the unit and an optional shortcut beside the label rather than a bare
-   input floating under a label. */
 .amount-block { margin: 0 0 18px; }
 .amount-block-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .amount-block-head .form-label { margin-top: 0; margin-bottom: 0; }
 .amount-block > .form-label { margin-top: 0; margin-bottom: 7px; }
 
+/* The unit suffix is absolutely positioned at the right edge of the field. `left: auto`
+   is explicit because the base `.amount-field > span:not(.amount-suffix)` rule no longer
+   sets a `left` on it, and being explicit here means a future change to that selector
+   cannot resurrect the stretch bug by adding one back. */
 .amount-field .amount-suffix {
     position: absolute;
+    z-index: 1;
     top: 50%;
     right: 14px;
+    left: auto;
     transform: translateY(-50%);
     color: var(--muted);
     font-size: var(--step--1);
@@ -1203,7 +1121,6 @@ textarea.form-control { min-height: 96px; resize: vertical; }
     letter-spacing: 0.04em;
     pointer-events: none;
 }
-.amount-field:has(.amount-suffix) .form-control { padding-right: 54px; }
 
 .max-button {
     min-height: 30px;
@@ -1221,32 +1138,14 @@ textarea.form-control { min-height: 96px; resize: vertical; }
 .max-button:hover:not(:disabled) { border-color: var(--indigo-700); background: var(--indigo-050); }
 .max-button:disabled { color: var(--faint); cursor: not-allowed; }
 
-.field-group {
-    margin-top: 18px;
-    padding-top: 18px;
-    border-top: 1px solid var(--line);
-}
+.field-group { margin-top: 18px; padding-top: 18px; border-top: 1px solid var(--line); }
 .field-group > .form-label:first-child { margin-top: 0; }
-
-/* The `hidden` attribute is what actually hides these, so this only has to stop the
-   layout rules above from re-showing an element that was hidden in script. Without it
-   `.callout { display: flex }` outranks the UA `[hidden] { display: none }` rule and the
-   warning renders as an empty coloured bar. */
-[hidden] { display: none !important; }
 
 .fine-print { margin: 10px 0 0; color: var(--muted); font-size: var(--step--1); line-height: 1.5; text-align: center; }
 
-/* Once a provider answers, the status box stops competing with the form for attention
-   and height. The reassurance it used to carry is not lost -- it moves to the fine print
-   under the submit button. */
 .provider-notice.is-compact { padding: 10px 14px; }
 .provider-notice.is-compact .provider-indicator { margin-top: 3px; }
 
-/* A preset outside the selected coin's range is disabled rather than left to fail on
-   submit, so the button state itself states the limit. The text is --muted, not --faint:
-   --faint on this panel is 4.21:1 in dark mode, which is too low to read the limit that
-   the disabled state is communicating in the first place. The sunken background carries
-   the "unavailable" signal instead. */
 .amount-presets button:disabled { color: var(--muted); background: var(--surface-2); border-color: var(--line); cursor: not-allowed; }
 .amount-presets button:disabled:hover { border-color: var(--line); color: var(--muted); }
 
@@ -1265,8 +1164,6 @@ textarea.form-control { min-height: 96px; resize: vertical; }
 .balance-card strong { display: block; margin-top: 3px; color: var(--heading); font-family: var(--font-display); font-size: var(--step-3); line-height: 1.15; font-variant-numeric: tabular-nums; }
 .balance-card .max-button { margin-bottom: 0; }
 
-/* Deposit instructions and the withdrawal receipt share one visual language: a lead
-   line that states the two values that cannot be guessed, then the details. */
 .deposit-receipt { margin-top: 18px; padding: 18px; background: var(--indigo-050); border: 1px solid color-mix(in srgb, var(--indigo-700) 30%, transparent); border-radius: var(--r-md); animation: dialog-in 0.22s var(--ease); }
 .deposit-receipt h3 { margin: 0 0 6px; color: var(--heading); font-family: var(--font-display); font-size: var(--step-2); }
 .receipt-lead { margin: 0 0 16px; color: var(--ink); font-size: var(--step-0); font-weight: 600; line-height: 1.5; }
@@ -1278,9 +1175,6 @@ textarea.form-control { min-height: 96px; resize: vertical; }
 .receipt-meta { margin: 0 0 8px; color: var(--muted); font-size: var(--step--1); }
 .receipt-meta.is-strong { color: var(--heading); font-weight: 700; }
 .receipt-note { margin: 14px 0 0; color: var(--muted); font-size: var(--step--1); line-height: 1.55; }
-/* The live status line takes over the note while a deposit is outstanding. The colour states
-   which of the three things is happening, and the text already says it, so the colour is
-   reinforcement rather than the only signal. */
 .receipt-note.is-credited { color: var(--success); font-weight: 600; }
 .receipt-note.is-failed { color: var(--danger); font-weight: 600; }
 
@@ -1288,10 +1182,6 @@ textarea.form-control { min-height: 96px; resize: vertical; }
 .receipt-countdown.is-expired { color: var(--danger); background: var(--danger-bg); border-color: color-mix(in srgb, var(--danger) 34%, transparent); border-left-color: var(--danger); }
 
 .confirmation { padding: 28px; text-align: center; }
-/* Centred with flex rather than a magic line-height. The old rule positioned the tick
-   with `line-height: 48px` against a 52px circle with a 2px border, which is only exact
-   while all three numbers stay in step; changing the size, the border width, or the
-   font-size silently pushed the glyph off centre. */
 .confirmation-mark { display: grid; place-items: center; width: 52px; height: 52px; margin: 0 auto 16px; border-radius: 50%; background: var(--success-bg); border: 2px solid var(--success); }
 .confirmation-mark::after { content: '\2713'; color: var(--success); font-size: 26px; font-weight: 700; line-height: 1; }
 .confirmation h3 { margin: 0 0 8px; color: var(--heading); font-family: var(--font-display); font-size: var(--step-3); }
@@ -1304,9 +1194,6 @@ textarea.form-control { min-height: 96px; resize: vertical; }
 
 .receipt-list { display: grid; gap: 8px; color: var(--muted); font-size: var(--step-0); }
 
-/* The credit screen, and the standalone receipt, share one set of facts. A two-column
-   grid rather than a `<dl>`'s default flow so the terms and values line up as two columns
-   instead of wrapping unpredictably around long wallet addresses. */
 .receipt-facts {
     display: grid;
     grid-template-columns: minmax(0, auto) minmax(0, 1fr);
@@ -1343,8 +1230,6 @@ textarea.form-control { min-height: 96px; resize: vertical; }
 .credited-balance { margin: 16px 0 0; color: var(--muted); font-size: var(--step--1); text-align: center; }
 .credited-balance strong { display: block; margin-top: 3px; color: var(--heading); font-family: var(--font-display); font-size: var(--step-2); font-variant-numeric: tabular-nums; }
 .dialog-receipt .dialog-panel { padding: 30px 28px 28px; }
-/* The modal centres its heading, amount, and balance -- these are the celebratory
-   elements -- while the facts list below stays left-aligned because it is a table. */
 .deposit-success { text-align: center; }
 .deposit-success .receipt-facts { text-align: left; }
 
@@ -1394,10 +1279,6 @@ textarea.form-control { min-height: 96px; resize: vertical; }
 .demo-fields { display: grid; gap: 20px; }
 .demo-field { display: grid; gap: 8px; margin: 0; }
 
-/* Paged survey.
-   One question at a time. The prompt is the largest thing on the panel, because on a phone
-   it is the only thing above the fold that matters, and the step counter sits above it as a
-   small label so the shape of what is left is always visible. */
 .survey-step { gap: 14px; }
 .survey-legend { display: grid; gap: 6px; padding: 0; }
 .survey-step-count { color: var(--accent); font-size: var(--step--1); font-weight: 700; letter-spacing: 0.02em; }
@@ -1410,8 +1291,6 @@ textarea.form-control { min-height: 96px; resize: vertical; }
 .demo-actions .button { flex: 0 0 auto; }
 .demo-actions #demo-submit { flex: 1 1 auto; }
 
-/* The return panel appears under the result once a task is finished. It is deliberately
-   quiet: the result is the news, and this is the way out. */
 .demo-return { display: grid; gap: 10px; margin-top: 18px; padding-top: 18px; border-top: 1px solid var(--line); }
 .demo-return-countdown { margin: 0; color: var(--muted); font-size: var(--step--1); }
 .demo-return .button { justify-self: start; }
@@ -1478,7 +1357,6 @@ textarea.form-control { min-height: 96px; resize: vertical; }
 .reset-card { width: min(460px, 100%); padding: clamp(24px, 4vw, 32px); background: var(--surface); border: 1px solid var(--line); border-top: 4px solid var(--indigo-700); border-radius: var(--r-lg); box-shadow: var(--shadow-lg); }
 .reset-card h1 { margin: 6px 0 10px; color: var(--heading); font-family: var(--font-display); font-size: var(--step-3); }
 .reset-card p { margin: 0 0 14px; color: var(--muted); font-size: var(--step-0); }
-/* Prose links inside cards are otherwise unstyled and render as default blue. */
 .reset-card a, .form-note a { color: var(--accent); font-weight: 700; text-underline-offset: 3px; }
 
 /* 16. Footer --------------------------------------------------------------- */
@@ -1504,9 +1382,6 @@ textarea.form-control { min-height: 96px; resize: vertical; }
 
 /* 17. Skeletons ------------------------------------------------------------ */
 
-/* Placeholder cards shaped like real ones, so the grid does not reflow when
-   data lands. The shimmer is a transform, not a background-position change,
-   so it stays on the compositor. */
 .skeleton-card { pointer-events: none; }
 .skeleton-card::before { background: var(--line) !important; }
 .skeleton-line { height: 11px; border-radius: var(--r-pill); background: linear-gradient(100deg, var(--line) 30%, color-mix(in srgb, var(--line) 45%, var(--surface)) 50%, var(--line) 70%); background-size: 220% 100%; animation: shimmer 1.4s linear infinite; }
@@ -1517,7 +1392,6 @@ textarea.form-control { min-height: 96px; resize: vertical; }
 .skeleton-footer { margin-top: auto; }
 .skeleton-block { height: 44px; border-radius: var(--r-sm); background: linear-gradient(100deg, var(--line) 30%, color-mix(in srgb, var(--line) 45%, var(--surface)) 50%, var(--line) 70%); background-size: 220% 100%; animation: shimmer 1.4s linear infinite; }
 
-/* Small circular badge shown ahead of a crypto ticker inside a choice. */
 .asset-symbol { display: grid; place-items: center; width: 26px; height: 26px; flex: 0 0 auto; border-radius: var(--r-sm); background: var(--indigo-700); color: #fff; font-size: 0.6rem; font-weight: 700; letter-spacing: 0.01em; }
 
 /* 18. Motion --------------------------------------------------------------- */
@@ -1539,28 +1413,6 @@ textarea.form-control { min-height: 96px; resize: vertical; }
 }
 
 /* 19. Responsive ----------------------------------------------------------- */
-/* Every breakpoint lives here, widest first, so no narrow-screen rule can be
-   overridden by a later desktop rule. Type scales with clamp() above, so only
-   genuine layout changes are needed.
-   ---------------------------------------------------------------------------
-   The two device layouts
-   ---------------------------------------------------------------------------
-   Wide (pointer: fine, 4 columns)   a dense catalog: four offers across, the
-                                     toolbar stuck under the header, hover reveals
-                                     affordances that a mouse can use.
-
-   Narrow (720px and below)           a single-column, thumb-first layout: the
-                                     header collapses to one row, the primary
-                                     actions move into a fixed bar along the bottom
-                                     edge, and every dialog becomes a bottom sheet
-                                     that rises from the bottom of the screen rather
-                                     than a centred box the user has to aim at.
-
-   These are structural differences, not a fluid resize of one layout. A centred
-   modal on a phone wastes the top and bottom of the screen, puts controls under
-   the thumb, and is dismissed by tapping a target several millimetres from the
-   edge; a bottom sheet uses the full width, keeps its actions at the bottom where
-   they are reachable, and reads as a sheet the user can push away. */
 
 @media (min-width: 1400px) {
     :root { --shell: 1320px; }
@@ -1569,7 +1421,6 @@ textarea.form-control { min-height: 96px; resize: vertical; }
 }
 
 @media (min-width: 721px) {
-    /* Pointer-driven affordances that only make sense with a real cursor. */
     .offer-card:hover .start-button { box-shadow: 0 0 0 3px color-mix(in srgb, var(--indigo-700) 18%, transparent); }
     .catalog-toolbar { position: sticky; z-index: 20; top: calc(var(--header-h) + 12px); }
     .offer-card:focus-within, .home-offer:focus-within { border-color: var(--indigo-700); }
@@ -1592,45 +1443,25 @@ textarea.form-control { min-height: 96px; resize: vertical; }
     .sort-field select { min-width: 140px; }
 }
 
-/* ---- narrow layout: the mobile UI ---- */
-
 @media (max-width: 720px) {
-    /* The survey's Back and Next sit side by side and share the row, because stacking them
-       pushes the primary control below the fold on a short phone. */
     .demo-actions { gap: 8px; }
     .demo-actions .button { min-height: 48px; }
     .survey-prompt { font-size: var(--step-0); }
     .survey-options .choice { min-height: 48px; }
     .demo-return .button { width: 100%; }
 
-    /* One row of header: brand on the left, balance on the right. The three action
-       buttons move to the fixed bar, so the header stops costing three rows. */
     .topbar { flex-direction: row; align-items: center; gap: 12px; padding: 10px 16px; }
     .header-action { display: none; }
     .account-tools { display: block; min-width: 0; }
-    .balance-block {
-        display: grid;
-        min-width: 0;
-        gap: 0;
-        padding: 0;
-        border: 0;
-        text-align: right;
-    }
+    .balance-block { display: grid; min-width: 0; gap: 0; padding: 0; border: 0; text-align: right; }
     .balance-label { font-size: 0.66rem; }
     .balance-block strong { font-size: var(--step-0); line-height: 1.25; }
     .demo-balance-line { justify-content: flex-end; font-size: 0.62rem; }
 
-    /* The bar is fixed, so the last of the page has to be padded clear of it. Scoped
-       to the page that has the bar, otherwise the home, demo, and reset pages all gain
-       68px of dead space at the bottom for a control they do not have. The safe-area
-       inset keeps it above the iPhone home indicator. */
     .action-bar { display: flex; }
     .has-action-bar { padding-bottom: calc(68px + env(safe-area-inset-bottom)); }
     .site-footer { padding-bottom: 20px; }
 
-    /* The angled header texture covers the right of the bar, which is exactly where
-       the balance sits once the header collapses to one row. Dropped on narrow
-       screens so the balance keeps its contrast. */
     .topbar::after { display: none; }
 
     .offer-grid, .home-offer-grid { grid-template-columns: minmax(0, 1fr); }
@@ -1638,14 +1469,9 @@ textarea.form-control { min-height: 96px; resize: vertical; }
     .catalog-toolbar { position: static; flex-direction: column; align-items: stretch; }
     .catalog-filters { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, auto); }
     .search-field input { width: 100%; }
-    /* The chips take their own full-width row so the search box keeps the space it needs
-       for its placeholder, and each chip stretches to an even share so the three targets
-       stay thumb-sized rather than shrinking to fit their labels. */
     .filter-chips { grid-column: 1 / -1; }
     .filter-chips .filter-chip { flex: 1 1 0; padding: 0 8px; }
 
-    /* Offers become rows rather than cards: the reward and the call to action sit on
-       one line, so three offers are visible in the space one card used to take. */
     .offer-card {
         min-height: 0;
         display: grid;
@@ -1668,10 +1494,6 @@ textarea.form-control { min-height: 96px; resize: vertical; }
     .home-text-link { padding: 0; }
     .home-offer { min-height: 0; }
 
-    /* Bottom sheet. `inset: 0` and `margin: auto` are what the base rule uses to centre a
-       modal; pinning only the bottom edge (`auto 0 0 0`) with `margin: 0` turns the same
-       element into a sheet. Mixing a single zeroed margin with the UA's `inset: 0` would
-       instead leave it stretched to the viewport height. */
     .dialog {
         inset: auto 0 0 0;
         margin: 0;
@@ -1686,11 +1508,6 @@ textarea.form-control { min-height: 96px; resize: vertical; }
     }
     .dialog::backdrop { background: rgb(10 14 34 / 0.6); }
 
-    /* A sheet pinned to the bottom edge has to say it can be dismissed. The modal it
-       replaced announced that with a close button in a corner; a sheet is dismissible
-       by swiping or tapping the backdrop, which is not discoverable from the shape
-       alone. The handle is drawn rather than added to the markup, because it is a
-       visual affordance, not a control, and a button there would be a dead target. */
     .dialog-panel { padding: 14px 18px calc(20px + env(safe-area-inset-bottom)); }
     .dialog-panel::before {
         content: '';
@@ -1704,16 +1521,9 @@ textarea.form-control { min-height: 96px; resize: vertical; }
     .dialog-heading { padding-bottom: 14px; margin-bottom: 16px; }
     #deposit-dialog .dialog-heading h2 { font-size: var(--step-3); }
 
-    /* The skeleton is laid out for the desktop card. Left on the mobile grid it would
-       auto-place its parts outside the named areas, and the push-to-bottom trick that
-       keeps the last block against the card edge does not exist in grid, so the
-       placeholder ends up a differently-sized box than the card that replaces it. */
     .skeleton-card { display: flex; flex-direction: column; gap: 10px; }
     .skeleton-footer { margin-top: 6px; }
 
-    /* A QR beside the address is the desktop arrangement. On a phone the two columns
-       leave the address too narrow to read, and the QR large enough to scan is the point
-       of showing it -- so the QR goes full width above the text instead. */
     .receipt-stage { grid-template-columns: minmax(0, 1fr); justify-items: center; }
     .receipt-qr svg { width: 190px; height: 190px; }
     .receipt-details { width: 100%; }
@@ -1746,16 +1556,12 @@ textarea.form-control { min-height: 96px; resize: vertical; }
     .action-bar { gap: 4px; padding-left: 8px; padding-right: 8px; }
     .action-bar-item { min-height: 50px; font-size: 0.66rem; }
 
-    /* The balance and the "withdraw all" button sit side by side above 400px, which
-       leaves the total a narrow column that wraps an 8-digit balance onto two lines and
-       drops it out of line with the label. Stacked, the number gets the full width. */
     .balance-card { flex-direction: column; align-items: stretch; gap: 12px; }
     .balance-card .max-button { width: 100%; min-height: 40px; }
     .receipt-qr svg { width: 168px; height: 168px; }
     .confirmation-steps li { padding-left: 30px; }
 }
 
-/* Coarse pointers get larger hit areas than a mouse needs. */
 @media (pointer: coarse) {
     .button, .icon-button, .amount-presets button, .choice, .deposit-method-option, .auth-mode-button, .start-button { min-height: 48px; }
     .catalog-filters .form-control, .search-field input, .sort-field select { height: 48px; }

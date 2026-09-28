@@ -156,6 +156,28 @@
             <p id="account-message" class="form-message" role="status"></p>
             <button class="button button-accent button-wide" id="connect-submit" type="submit">Sign in</button>
             <button class="link-button" id="forgot-password-link" type="button">Forgot password?</button>
+
+            <!-- The confirmation step, shown in place of the credentials once an address needs
+                 proving. It is a separate screen rather than another field on the form,
+                 because after submitting there is nothing left to edit: the only thing left
+                 to do is type the code that was emailed. -->
+            <div id="verify-step" class="verify-step" hidden>
+                <p class="verify-title">Confirm your email</p>
+                <p class="verify-copy">
+                    We sent a 6-digit code to <strong id="verify-email">your address</strong>.
+                    <span id="verify-expiry"></span>
+                </p>
+                <label class="visually-hidden" for="verify-code">6-digit confirmation code</label>
+                <input class="form-control verify-code" id="verify-code" type="text"
+                       inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}"
+                       maxlength="6" placeholder="000000" spellcheck="false">
+                <p id="verify-message" class="form-message" role="status"></p>
+                <button class="button button-accent button-wide" id="verify-submit" type="button">Confirm email</button>
+                <div class="verify-actions">
+                    <button class="link-button" id="verify-resend" type="button">Send a new code</button>
+                    <button class="link-button" id="verify-back" type="button">Use a different email</button>
+                </div>
+            </div>
         </form>
     </dialog>
 
