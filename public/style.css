@@ -1673,7 +1673,18 @@ select.form-control:disabled { cursor: not-allowed; background-image: none; padd
 .survey-prompt { color: var(--heading); font-size: var(--step-1); font-weight: 700; line-height: 1.3; }
 
 .survey-options { margin-top: 4px; }
-.survey-options .choice { min-height: 52px; }
+    .survey-options .choice { min-height: 52px; }
+
+    /* A partner task is a checklist rather than a paged questionnaire, so its steps share the
+     * survey's look without inheriting its layout: no paging, no hidden steps, and the
+     * progress bar counts ticks rather than questions. The classes are suffixed to keep the
+     * two flows distinct in the stylesheet even though they render in the same shell. */
+    .task-step { gap: 14px; }
+    .task-legend { display: grid; gap: 6px; padding: 0; }
+    .task-step-count { color: var(--accent); font-size: var(--step--1); font-weight: 700; letter-spacing: 0.02em; }
+    .task-prompt { color: var(--heading); font-size: var(--step-1); font-weight: 700; line-height: 1.3; }
+    .task-link { display: inline-block; margin-top: 6px; font-size: var(--step--1); color: var(--accent); }
+    .task-link:hover { text-decoration: underline; }
 
 .demo-actions { display: flex; align-items: center; gap: 10px; }
 .demo-actions .button { flex: 0 0 auto; }

@@ -29,6 +29,7 @@ function resolveCompletionUrl(offer) {
 const pool = require('../config/db');
 const { isDemoModeEnabled } = require('../services/demoMode');
 const { loadSurveyQuestions, answersAreValid, sanitiseAnswers } = require('../services/surveyService');
+const { loadOfferTaskSteps, taskStepsAreValid } = require('../services/offerTaskSteps');
 
 const clickIdPattern = /^[\da-f]{8}-(?:[\da-f]{4}-){3}[\da-f]{12}$/i;
 
@@ -46,11 +47,34 @@ const demoController = {
             return res.status(404).json({ error: 'Demo rewards are not available in this deployment.' });
         }
         try {
-            const questions = await loadSurveyQuestions();
-            return res.json({ questions });
+            // The click carries the offer id, which is what decides whether this is a survey
+            // or a task. Returning both shapes lets the page ask for one without a second
+            // round trip, and the server is what decides which one to render.
+            const clickId = String(req.query.clickId || '').trim();
+            const click = clickIdPattern.test(clickId)
+                ? await pool.query(
+                    `SELECT clicks.offer_id, offers.offer_type
+                     FROM clicks
+                     JOIN offers ON offers.id = clicks.offer_id
+                     WHERE clicks.click_id = $1 AND clicks.user_id = $2`,
+                    [clickId, req.user.id]
+                )
+                : { rows: [] };
+
+            const offerType = click.rows[0]?.offer_type || 'survey';
+            const questions = offerType === 'survey' ? await loadSurveyQuestions() : null;
+            const steps = offerType !== 'survey'
+                ? await loadOfferTaskSteps(click.rows[0]?.offer_id)
+                : null;
+
+            return res.json({
+                offerType,
+                questions,
+                steps
+            });
         } catch (error) {
-            console.error('Could not load survey questions:', error.message);
-            return res.status(500).json({ error: 'Could not load the survey.' });
+            console.error('Could not load demo questions:', error.message);
+            return res.status(500).json({ error: 'Could not load the demo task.' });
         }
     },
 
@@ -90,19 +114,32 @@ const demoController = {
             // Loaded once here and used for both the check and the stored payload, so what is
             // validated and what is recorded cannot be two different definitions.
             const questions = offer.offer_type === 'survey' ? await loadSurveyQuestions() : null;
+            const steps = offer.offer_type !== 'survey' ? await loadOfferTaskSteps(offer.id) : null;
             if (offer.offer_type === 'survey') {
                 if (!await answersAreValid(answers, questions)) {
                     await client.query('ROLLBACK');
                     return res.status(400).json({ error: 'Answer every question before submitting.' });
                 }
-            } else if (answers?.completed !== true) {
-                await client.query('ROLLBACK');
-                return res.status(400).json({ error: 'Complete the demo task before submitting.' });
+            } else {
+                if (!taskStepsAreValid(answers, steps)) {
+                    await client.query('ROLLBACK');
+                    return res.status(400).json({ error: 'Tick every step before submitting.' });
+                }
             }
 
             // Only the questions that were actually asked are kept. An unrecognised key is
             // dropped rather than written into `details` as if it were an answer.
             const recorded = questions ? sanitiseAnswers(answers, questions) : { completed: true };
+            if (steps) {
+                // The step positions that were ticked, so the completion record says which
+                // steps were done rather than just that the task was done.
+                recorded.completed = true;
+                recorded.steps = steps.map((step) => ({
+                    position: step.position,
+                    actionLabel: step.actionLabel,
+                    ticked: answers[step.position] === true
+                }));
+            }
 
             const priorConversion = await client.query(
                 'SELECT status FROM conversions WHERE click_id = $1',

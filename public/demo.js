@@ -40,12 +40,15 @@ const demoType = params.get('type') === 'survey' ? 'survey' : 'offer';
  */
 const RETURN_TO = '/offers';
 
-/** Seconds shown before the automatic return. Long enough to read the result, not a stall. */
-const RETURN_DELAY_SECONDS = 8;
+/** Seconds shown before the automatic return. Short: a participant who finished wants to
+ * keep going, and a countdown that waits is friction. The link is always available, so the
+ * automatic return is a convenience rather than something that has to be waited out. */
+const RETURN_DELAY_SECONDS = 2;
 
 let questions = [];
-let currentStep = 0;
-let returnTimer = null;
+    let steps = [];
+    let currentStep = 0;
+    let returnTimer = null;
 
 document.addEventListener('DOMContentLoaded', () => {
     document.getElementById('demo-form').addEventListener('submit', onSubmit);
@@ -62,51 +65,77 @@ async function start() {
         return failTask('Sign in from the offers page to complete this task.');
     }
 
-    if (demoType !== 'survey') {
-        renderConfirmationTask();
-        return;
-    }
-    await loadSurvey();
+    // The page used to branch on the `type` query parameter, which the engage handler sets from
+    // the offer row. It is a hint, and a stale one -- an offer that changes type after a click
+    // is recorded leaves the page rendering the old shape. The survey endpoint now answers with
+    // `offerType`, which is what the server actually thinks this click is for, so the page
+    // asks and the server decides.
+    await loadTask();
 }
 
 /**
- * Fetches the questions, then renders the first step.
+ * Fetches the task the server thinks this click is for, then renders it.
  *
  * A failed load is a refusal rather than a fallback to a built-in copy of the survey. The
  * built-in questions are exactly the thing that was removed so the page and the server could
  * not disagree; reintroducing them as a fallback would restore the drift on the one path
  * where nobody would notice it.
  */
-async function loadSurvey() {
+async function loadTask() {
     const fields = document.getElementById('demo-fields');
-    setMessage('Loading the survey...');
+    setMessage('Loading the task...');
 
     let data;
     try {
-        const response = await fetch('/api/demo/survey', {
+        const response = await fetch(`/api/demo/survey?clickId=${encodeURIComponent(demoClickId)}`, {
             headers: { Authorization: `Bearer ${sessionStorage.getItem(demoTokenKey)}` }
         });
         const body = await response.json();
-        if (!response.ok) throw new Error(body.error || 'Could not load the survey.');
+        if (!response.ok) throw new Error(body.error || 'Could not load the task.');
         data = body;
     } catch (error) {
         return failTask(error.message);
     }
 
-    questions = Array.isArray(data?.questions) ? data.questions : [];
-    if (questions.length === 0) {
-        return failTask('This survey has no questions configured yet.');
+    const isSurvey = data.offerType === 'survey';
+    if (isSurvey) {
+        questions = Array.isArray(data?.questions) ? data.questions : [];
+        if (questions.length === 0) {
+            return failTask('This survey has no questions configured yet.');
+        }
+        // The server does not send a step index, and using the array position in two places is
+        // how they drift. Assign it here once, from the order the server returned, so the
+        // rendering, the step counter, and the progress bar all agree about which question is
+        // which. Without this every fieldset's data-step was "undefined", showStep(0) matched
+        // nothing, and the survey appeared to have no questions at all.
+        questions = questions.map((question, index) => ({ ...question, index }));
+
+        document.getElementById('demo-title').textContent = 'Quick survey';
+        document.getElementById('demo-copy').textContent =
+            `${questions.length} ${questions.length === 1 ? 'question' : 'questions'}. It takes about a minute.`;
+        document.getElementById('demo-submit').textContent = 'Submit answers';
+        document.getElementById('demo-progress').hidden = false;
+        setMessage('');
+
+        for (const question of questions) fields.append(createQuestionGroup(question));
+        showStep(0);
+        return;
     }
 
-    document.getElementById('demo-title').textContent = 'Quick survey';
+    steps = Array.isArray(data?.steps) ? data.steps : [];
+    if (steps.length === 0) {
+        return failTask('This task has no steps configured yet.');
+    }
+
+    document.getElementById('demo-title').textContent = 'Partner task';
     document.getElementById('demo-copy').textContent =
-        `${questions.length} ${questions.length === 1 ? 'question' : 'questions'}. It takes about a minute.`;
-    document.getElementById('demo-submit').textContent = 'Submit answers';
+        `${steps.length} ${steps.length === 1 ? 'step' : 'steps'}. Tick each one as you do it.`;
+    document.getElementById('demo-submit').textContent = 'Complete task';
     document.getElementById('demo-progress').hidden = false;
     setMessage('');
 
-    for (const question of questions) fields.append(createQuestionGroup(question));
-    showStep(0);
+    for (const step of steps) fields.append(createTaskStep(step));
+    updateTaskProgress();
 }
 
 /** Builds one labelled radio group, wrapped in a fieldset for grouping semantics. */
@@ -143,7 +172,11 @@ function createQuestionGroup(question) {
         input.type = 'radio';
         input.name = question.key;
         input.value = option.value;
-        input.required = true;
+        // `required` is set per question, not per radio. A question the survey marks optional
+        // must not be required: a participant who skips it is still submitting a valid
+        // answer set, and marking it required would refuse them for a question nobody asked
+        // them to answer.
+        input.required = question.required === false ? false : true;
 
         const text = document.createElement('span');
         text.textContent = option.label;
@@ -164,27 +197,91 @@ function renderConfirmationTask() {
     fields.append(createConfirmationTask());
 }
 
-function createConfirmationTask() {
+/**
+ * One step of a partner task: a checkbox the participant ticks to say they did the thing.
+ *
+ * A demo offer used to be one checkbox saying "I have completed the demo partner task", which
+ * is not an offer, it is a shrug. A real offer has steps -- visit a site, sign up, confirm an
+ * email, make a purchase -- and the participant needs to know what is left. Each step is its
+ * own labelled checkbox, shown in order, so the page is a checklist rather than a single
+ * assertion. The server records which were ticked, so the completion is a set of steps rather
+ * than a boolean, and an operator can see what was actually done.
+ *
+ * The step's own URL, when it has one, is a real link the participant clicks. It is opened in
+ * the same tab: the page stays in the tab, the participant does the thing, comes back, and
+ * ticks the box. Opening it in a new tab would leave this page unreachable behind a tab the
+ * participant may not return to.
+ */
+function createTaskStep(step) {
     const fieldset = document.createElement('fieldset');
-    fieldset.className = 'demo-field';
+    fieldset.className = 'demo-field task-step';
+    fieldset.dataset.position = String(step.position);
 
     const legend = document.createElement('legend');
-    legend.textContent = 'Confirm the task';
+    legend.className = 'task-legend';
+    legend.append(
+        Object.assign(document.createElement('span'), {
+            className: 'task-step-count',
+            textContent: `Step ${step.position} of ${steps.length}`
+        }),
+        Object.assign(document.createElement('span'), {
+            className: 'task-prompt',
+            textContent: step.prompt
+        })
+    );
 
     const label = document.createElement('label');
     label.className = 'demo-check';
 
     const input = document.createElement('input');
     input.type = 'checkbox';
-    input.name = 'completed';
+    input.name = String(step.position);
+    input.value = 'on';
     input.required = true;
+    input.addEventListener('change', updateTaskProgress);
 
     const text = document.createElement('span');
-    text.textContent = 'I have completed the demo partner task and want to claim the test-only reward.';
+    text.textContent = step.actionLabel;
 
     label.append(input, text);
-    fieldset.append(legend, label);
+
+    if (step.url) {
+        const link = document.createElement('a');
+        link.className = 'task-link';
+        link.href = step.url;
+        link.target = '_blank';
+        link.rel = 'noopener noreferrer';
+        link.textContent = 'Open the partner site';
+        fieldset.append(legend, label, link);
+    } else {
+        fieldset.append(legend, label);
+    }
+
     return fieldset;
+}
+
+/**
+ * Shows how many steps are ticked.
+ *
+ * Counted over every step, not the visible one, so the bar reflects the whole task and does
+ * not jump back when the participant scrolls. A task is not paged like a survey -- the
+ * participant needs to see what is left -- so this is a single checklist with a count.
+ */
+function updateTaskProgress() {
+    const wrapper = document.getElementById('demo-progress');
+    if (steps.length === 0 || wrapper.hidden) return;
+
+    const ticked = steps.filter((step) => {
+        const input = document.querySelector(
+            `#demo-fields input[name="${CSS.escape(step.position)}"]`
+        );
+        return Boolean(input && input.checked);
+    }).length;
+
+    const percent = steps.length === 0 ? 0 : Math.round((ticked / steps.length) * 100);
+    document.getElementById('demo-progress-bar').style.width = `${percent}%`;
+    document.getElementById('demo-progress-label').textContent =
+        `${ticked} of ${steps.length} steps done`;
 }
 
 function setMessage(text, variant) {
@@ -205,12 +302,23 @@ function failTask(message) {
  *
  * The submit button becomes "Next" until the last question, so there is a single forward
  * control and no separate "next" that could disagree with it about which is which.
+ *
+ * A `required` radio inside a fieldset that is not visible is reported by the browser as an
+ * invalid, unfocusable control -- six warnings for a six-question survey, one per hidden
+ * step, every time the page loads. Toggling `required` off the steps that are not shown and
+ * back on when they become visible is what makes the validity check describe the page as it
+ * is rather than as it will be: only the question in front of the participant is required
+ * to be answered before it can advance.
  */
 function showStep(index) {
     currentStep = Math.min(Math.max(index, 0), questions.length - 1);
 
     document.querySelectorAll('#demo-fields .survey-step').forEach((step) => {
-        step.hidden = Number(step.dataset.step) !== currentStep;
+        const visible = Number(step.dataset.step) === currentStep;
+        step.hidden = !visible;
+        step.querySelectorAll('input').forEach((input) => {
+            input.required = visible;
+        });
     });
 
     const submit = document.getElementById('demo-submit');
@@ -248,7 +356,7 @@ function onAnswerChanged(event) {
  */
 function updateProgress() {
     const wrapper = document.getElementById('demo-progress');
-    if (demoType !== 'survey' || wrapper.hidden) return;
+    if (questions.length === 0 || wrapper.hidden) return;
 
     const answered = questions.filter((question) => {
         const input = document.querySelector(
@@ -273,7 +381,9 @@ function updateProgress() {
  */
 function onSubmit(event) {
     event.preventDefault();
-    if (demoType === 'survey' && currentStep < questions.length - 1) {
+    // A task is not paged -- the participant needs to see what is left -- so it submits
+    // directly. Only the survey advances.
+    if (questions.length > 0 && currentStep < questions.length - 1) {
         if (!document.getElementById('demo-form').reportValidity()) return;
         showStep(currentStep + 1);
         return;
@@ -286,12 +396,18 @@ async function submitTask() {
     const button = document.getElementById('demo-submit');
     const values = Object.fromEntries(new FormData(form).entries());
 
-    const answers = demoType === 'survey'
+    // The shape of the answers depends on what the server said this click is for, which is
+    // what `questions` and `steps` hold after `loadTask`. A survey answers by question key;
+    // a task ticks by step position. The server validates against the same definitions, so a
+    // stale page cannot submit a shape the server no longer accepts.
+    const answers = questions.length > 0
         ? Object.fromEntries(questions.map((question) => [question.key, values[question.key]]))
-        : { completed: values.completed === 'on' };
+        : Object.fromEntries(
+            steps.map((step) => [String(step.position), values[String(step.position)] === 'on'])
+        );
 
     button.disabled = true;
-    button.textContent = demoType === 'survey' ? 'Submitting...' : 'Saving...';
+    button.textContent = 'Saving...';
     setMessage('');
 
     try {
@@ -311,7 +427,7 @@ async function submitTask() {
     } catch (error) {
         setMessage(error.message, 'error');
         button.disabled = false;
-        button.textContent = demoType === 'survey' ? 'Submit answers' : 'Complete demo task';
+        button.textContent = questions.length > 0 ? 'Submit answers' : 'Complete task';
     }
 }
 
@@ -332,7 +448,10 @@ function showResult(data) {
     result.hidden = false;
 
     document.getElementById('demo-progress').hidden = true;
-    document.getElementById('survey-back').hidden = true;
+    // `survey-back` only exists on the survey page. Guarding the lookup rather than assuming
+    // the element is present keeps the same code working for a task, which has no back button.
+    const back = document.getElementById('survey-back');
+    if (back) back.hidden = true;
     setMessage(data.cashValue
         ? 'Saved. This reward was paid to your real balance.'
         : 'Saved. This is simulated test credit only and has no cash value.',
@@ -341,12 +460,12 @@ function showResult(data) {
 }
 
 /**
- * Counts down to the return target, and sends the participant there.
+ * Sends the participant back to the offers page (or the offer's own completion URL).
  *
- * This is the difference between a survey that feels finished and one that feels abandoned.
- * The countdown is visible and the link works at any point, so the automatic return is a
- * convenience rather than something that has to be waited out -- a participant who wants to
- * look at another offer can leave in the first second.
+ * The countdown is short because a participant who finished wants to keep going, and waiting
+ * is friction. The link is always available, so the automatic return is a convenience rather
+ * than something that has to be waited out -- a participant who wants to look at another offer
+ * can leave in the first second.
  */
 function startReturnCountdown(target) {
     const destination = typeof target === 'string' && target.startsWith('/')

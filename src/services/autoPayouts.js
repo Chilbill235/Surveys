@@ -202,11 +202,14 @@ async function submitClaimedPayouts(claimed) {
         response = await nowPayments.submitPayoutBatch(claimed, { ipnCallbackUrl: payoutIpnCallbackUrl() });
     } catch (error) {
         const unknown = isUndetermined(error);
-        await releaseOrHoldClaims(claimed, unknown ? 'SUBMISSION_UNKNOWN' : 'SUBMIT_FAILED', error.message);
+        const explanation = providerExplanation(error);
+        const detail = explanation ? `${error.message}: ${explanation}` : error.message;
+        await releaseOrHoldClaims(claimed, unknown ? 'SUBMISSION_UNKNOWN' : 'SUBMIT_FAILED', detail);
         const outcomes = claimed.map((entry) =>
             summarizeOutcome(entry, {
                 verdict: unknown ? 'held' : 'released',
-                detail: error.message
+                detail,
+                providerMessage: explanation
             })
         );
         logPayoutRun('submitClaimedPayouts', claimed, outcomes);
@@ -215,7 +218,8 @@ async function submitClaimedPayouts(claimed) {
             released: unknown ? 0 : claimed.length,
             batchId: null,
             uncertain: unknown ? claimed.length : 0,
-            error: error.message,
+            error: detail,
+            providerMessage: explanation,
             outcomes
         };
     }
@@ -253,11 +257,14 @@ async function submitClaimedPayouts(claimed) {
         // batch was released, and releasing those rows is the one action that can pay a
         // withdrawal twice. They stay claimed for reconciliation instead.
         const unknown = isUndetermined(error);
-        await releaseOrHoldClaims(claimed, unknown ? 'VERIFY_UNKNOWN' : 'VERIFY_FAILED', error.message);
+        const explanation = providerExplanation(error);
+        const detail = explanation ? `${error.message}: ${explanation}` : error.message;
+        await releaseOrHoldClaims(claimed, unknown ? 'VERIFY_UNKNOWN' : 'VERIFY_FAILED', detail);
         const outcomes = claimed.map((entry) =>
             summarizeOutcome(entry, {
                 verdict: unknown ? 'held' : 'released',
-                detail: error.message
+                detail,
+                providerMessage: explanation
             })
         );
         logPayoutRun('submitClaimedPayouts', claimed, outcomes);
@@ -267,7 +274,8 @@ async function submitClaimedPayouts(claimed) {
             batchId,
             verified: false,
             uncertain: unknown ? claimed.length : 0,
-            error: error.message,
+            error: detail,
+            providerMessage: explanation,
             outcomes
         };
     }
@@ -315,6 +323,27 @@ function payoutIpnCallbackUrl() {
 function isUndetermined(error) {
     if (!(error instanceof nowPayments.NowPaymentsError)) return true;
     return !(error.status >= 400 && error.status < 500);
+}
+
+/**
+ * The provider's own explanation of a refusal, when it gave one.
+ *
+ * A `NowPaymentsError` carries the provider response and a `providerMessage` getter, but the
+ * failure paths below used to log only `error.message`, which is the generic "NOWPayments
+ * /v1/payout returned 400." That threw away the one sentence naming what would work -- the
+ * entire reason the caller falls through to its own message. The detail is lifted out here so
+ * every failure path, the outcome array, and the response body all carry the same words.
+ */
+function providerExplanation(error) {
+    if (!error) return null;
+    if (error.providerMessage && typeof error.providerMessage === 'string') {
+        const trimmed = error.providerMessage.trim();
+        if (trimmed) return trimmed;
+    }
+    if (error.cause && typeof error.cause === 'object' && error.cause.providerMessage) {
+        return error.cause.providerMessage;
+    }
+    return null;
 }
 
 /**

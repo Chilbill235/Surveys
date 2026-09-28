@@ -561,6 +561,10 @@ async function handlePayoutRun(req, res) {
         // Per-withdrawal verdict, so the operator can see which rows were sent, released,
         // or held -- and why.
         outcomes: outcome.outcomes || [],
+        // The provider's own words, when it refused. A bare "NOWPayments /v1/payout returned
+        // 400." says the batch was refused and nothing else; the useful part is the sentence
+        // naming what would work, which is exactly what an operator needs to fix the row.
+        ...(outcome.providerMessage ? { providerMessage: outcome.providerMessage } : {}),
         ...(outcome.error ? { error: outcome.error } : {})
     });
 }
