@@ -70,6 +70,10 @@ const APP_DEFAULT_LIMITS = Object.freeze({
     fees: {},
     minimumsSource: 'app-default',
     feesSource: 'app-default',
+    // Not merely "no provider figures": the provider refused to answer, so the app's $1.00 floor
+    // is known to be this app's own rule and not something the provider has agreed to. The
+    // withdrawal form says so, rather than presenting an unconfirmed number as a limit.
+    minimumsConfirmed: false,
 });
 
 /**
@@ -172,17 +176,32 @@ function resetPayoutLimitsCache() {
 async function fetchPayoutLimits() {
     const coins = distinctProviderCoins();
 
+    // The provider's refusal is per account, not per coin, so it is worth spending one request
+    // to find out before spending fourteen. `getPayoutMinimum` already skips calls made inside
+    // the cool-off, but the fan-out is concurrent: every worker starts before the first refusal
+    // has come back, so the guard cannot help until the burst is already in the air. Probing
+    // first turns "a dozen guaranteed refusals per refresh" into one.
+    //
+    // A null probe on its own is not enough to stop. It also means the provider answered with
+    // no usable figure, and skipping the rest of the catalogue for that would leave every coin
+    // on the app default because one coin had an odd window. Only an actual refusal stops it.
+    let probed = null;
+    if (coins.length > 0) probed = await nowPayments.getPayoutMinimum(coins[0]);
+    const minimumsRefused = probed === null && nowPayments.isPayoutMinimumRefused();
+
     // One read per coin per metric, bounded so a large catalogue cannot trip the
     // rate limiter. A single failed read is logged and that coin falls back to
     // the app default; it does not blank the rest of the catalogue.
-    const minimumEntries = await mapWithConcurrency(coins, PAYOUT_LIMITS_CONCURRENCY, async (coin) => {
-        try {
-            return [coin, await nowPayments.getPayoutMinimum(coin)];
-        } catch (error) {
-            console.warn(`Could not read the ${coin} payout minimum: ${error.message}`);
-            return [coin, null];
-        }
-    });
+    const minimumEntries = minimumsRefused
+        ? []
+        : await mapWithConcurrency(coins, PAYOUT_LIMITS_CONCURRENCY, async (coin) => {
+            try {
+                return [coin, await nowPayments.getPayoutMinimum(coin)];
+            } catch (error) {
+                console.warn(`Could not read the ${coin} payout minimum: ${error.message}`);
+                return [coin, null];
+            }
+        });
 
     const feeEntries = await mapWithConcurrency(coins, PAYOUT_LIMITS_CONCURRENCY, async (coin) => {
         try {
@@ -208,6 +227,11 @@ async function fetchPayoutLimits() {
         fees,
         minimumsSource: Object.keys(minimums).length > 0 ? 'provider' : 'app-default',
         feesSource: Object.keys(fees).length > 0 ? 'provider' : 'app-default',
+        // Reported so the withdrawal form can say that a $1.00 crypto request is this app's own
+        // floor and not one the provider has agreed to. Without it the form states a minimum it
+        // has not been able to confirm, and the first thing a user learns is a refusal at
+        // submission time, after they have committed to the request.
+        minimumsConfirmed: !minimumsRefused
     };
 }
 
@@ -313,6 +337,12 @@ async function withdrawalOptions(req, res) {
             limitsSource: {
                 minimums: limits.minimumsSource,
                 fees: limits.feesSource,
+                // Whether the per-network floors were actually read from the provider this
+                // refresh. `minimumsSource` alone cannot carry this: an account the provider
+                // refuses leaves `minimums` empty, which is the same shape as "the provider
+                // answered and reported nothing", and only the first of those means the
+                // displayed floor is unverified.
+                minimumsConfirmed: limits.minimumsConfirmed !== false,
             },
         });
     } catch (error) {
@@ -580,3 +610,7 @@ const payoutController = {
 
 module.exports = payoutController;
 module.exports.resetPayoutLimitsCache = resetPayoutLimitsCache;
+// Exposed for the tests, which need to drive one refresh and inspect what it cost. The
+// controller's own request handlers go through the cache, so there is no other way to observe
+// the fan-out without standing up the whole route and a fake provider.
+module.exports.fetchPayoutLimits = fetchPayoutLimits;

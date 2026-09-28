@@ -4,6 +4,7 @@ const {
     creditConfirmedDeposit,
     applyDepositStatus,
     targetStatusFor,
+    knownProviderStatuses,
     isPaymentFullyPaid
 } = require('./depositCredit');
 const { amountsMatch } = require('./money');
@@ -38,10 +39,20 @@ async function fetchProviderPayment(paymentId) {
 }
 
 /**
- * Applies a provider status outcome inside a database transaction.
- * Passes provider_payment_id through so depositCredit can auto-heal NULL fields.
+ * Applies a provider status outcome inside its own transaction.
+ *
+ * The client is acquired here rather than passed in. Every call site needs a client for
+ * exactly one thing -- running this function -- so handing ownership around produced a
+ * contract that was invisible from the call site: the caller connected a client and the
+ * callee released it, and a future edit that added a `.release()` in the caller, or
+ * reused the client after this returned, would have double-released.
+ *
+ * Returns `true` when the transaction committed, `false` when it was rolled back. A
+ * failure is logged and counted as a skip rather than rethrown, because one unusable
+ * deposit should not abort a sweep over many.
  */
-async function applyProviderOutcome(client, deposit, targetStatus, ledgerSourceId, description, summary, logger) {
+async function applyProviderOutcome(deposit, targetStatus, ledgerSourceId, description, summary, logger) {
+    const client = await pool.connect();
     try {
         await client.query('BEGIN');
         let credited = false;
@@ -102,23 +113,51 @@ async function reconcileNowPaymentsDeposit(deposit, summary, logger) {
     }
 
     const paymentStatus = String(providerPayment.payment_status || '').toLowerCase();
-    
-    // Fallback amount normalization (price_amount -> pay_amount -> outcome_amount)
-    const rawAmount = providerPayment.price_amount ?? providerPayment.pay_amount ?? providerPayment.outcome_amount;
-    const providerAmount = parseFloat(rawAmount);
 
-    // Normalize currencies
-    const providerCurrency = String(providerPayment.price_currency || providerPayment.pay_currency || '').trim().toUpperCase();
+    // A status the app has never heard of is a real answer from the provider -- likely
+    // one this build predates -- and it must not reach the database. The IPN handler
+    // already refuses unknown statuses; reconciliation has to make the same check or an
+    // unrecognised string falls through `targetStatusFor` and either produces `null`
+    // (which violates the status check constraint) or, worse, is written verbatim.
+    if (!knownProviderStatuses.has(paymentStatus)) {
+        logger.error(`Deposit ${deposit.id}: provider reported an unrecognised status "${paymentStatus}" - skipping.`);
+        summary.skipped += 1;
+        return;
+    }
+
+    // `price_amount` and `price_currency` are the fiat-denominated fields. `pay_amount`,
+    // `pay_currency`, and `outcome_amount` are the coin side, and comparing one of those
+    // to a USD figure is how a deposit ends up either credited for the wrong amount or
+    // skipped as a mismatch when it was fine. There is no safe fallback across that
+    // boundary: if the fiat fields are absent, the response cannot be used to match a
+    // USD-priced deposit, and the correct action is to say so.
+    const providerAmount = Number(providerPayment.price_amount);
+    const providerCurrency = String(providerPayment.price_currency || '').trim().toUpperCase();
     const dbCurrency = String(deposit.currency_code || deposit.asset_code || 'USD').trim().toUpperCase();
 
-    // Verify compatibility
-    const currencyMatches = (providerCurrency === dbCurrency) || (providerCurrency === 'USD');
-    const amountMatches = !isNaN(providerAmount) && amountsMatch(providerAmount, deposit.amount);
-
-    if (!amountMatches || !currencyMatches) {
+    if (!Number.isFinite(providerAmount)) {
         logger.error(
-            `Deposit ${deposit.id}: provider amount/currency mismatch. ` +
-            `DB: [${deposit.amount} ${dbCurrency}] vs Provider: [${providerAmount} ${providerCurrency}]`
+            `Deposit ${deposit.id}: provider response has no usable price_amount ` +
+            `(got ${JSON.stringify(providerPayment.price_amount)}) - skipping.`
+        );
+        summary.skipped += 1;
+        return;
+    }
+
+    // Compared directly, not against a USD fallback. A deposit row is always priced in
+    // USD, so a provider response that says anything else is a mismatch, not a licence
+    // to proceed.
+    if (providerCurrency !== dbCurrency) {
+        logger.error(
+            `Deposit ${deposit.id}: provider currency ${providerCurrency} does not match stored ${dbCurrency} - skipping.`
+        );
+        summary.skipped += 1;
+        return;
+    }
+
+    if (!amountsMatch(providerAmount, deposit.amount)) {
+        logger.error(
+            `Deposit ${deposit.id}: provider amount ${providerAmount} does not match stored ${deposit.amount} - skipping.`
         );
         summary.skipped += 1;
         return;
@@ -140,14 +179,12 @@ async function reconcileNowPaymentsDeposit(deposit, summary, logger) {
         return;
     }
 
-    const client = await pool.connect();
     await applyProviderOutcome(
-        client, 
-        deposit, 
+        deposit,
         targetStatus,
         `nowpayments:${deposit.provider_payment_id}`,
-        'Confirmed NOWPayments deposit (reconciled)', 
-        summary, 
+        'Confirmed NOWPayments deposit (reconciled)',
+        summary,
         logger
     );
 }
@@ -179,7 +216,7 @@ async function reconcileStripeDeposit(deposit, stripe, summary, logger) {
 
     const expectedCents = Math.round(parseFloat(deposit.amount) * 100);
     const sessionCurrency = String(session.currency || '').toLowerCase();
-    
+
     if (sessionCurrency !== 'usd' || Number(session.amount_total) !== expectedCents) {
         logger.error(`Deposit ${deposit.id}: Stripe amount or currency does not match stored deposit.`);
         summary.skipped += 1;
@@ -187,14 +224,12 @@ async function reconcileStripeDeposit(deposit, stripe, summary, logger) {
     }
 
     if (session.status === 'expired') {
-        const client = await pool.connect();
         await applyProviderOutcome(
-            client, 
-            deposit, 
-            'failed', 
+            deposit,
+            'failed',
             `stripe:${deposit.provider_payment_id}`,
-            'Expired Stripe checkout session', 
-            summary, 
+            'Expired Stripe checkout session',
+            summary,
             logger
         );
         return;
@@ -206,30 +241,39 @@ async function reconcileStripeDeposit(deposit, stripe, summary, logger) {
         return;
     }
 
-    const client = await pool.connect();
     await applyProviderOutcome(
-        client, 
-        deposit, 
-        'confirmed', 
+        deposit,
+        'confirmed',
         `stripe:${deposit.provider_payment_id}`,
-        'Confirmed Stripe card deposit (reconciled)', 
-        summary, 
+        'Confirmed Stripe card deposit (reconciled)',
+        summary,
         logger
     );
 }
 
 /**
  * Fails deposits created over an hour ago that were never attached to a provider payment ID.
+ *
+ * Bounded by `limit` so a first run against a large backlog cannot hold the connection
+ * for minutes. The orphan sweep runs on every general reconciliation; without a limit
+ * the query would scan every orphan every time, which is the kind of thing that is fine
+ * in development and a problem the first time it runs in production.
  */
-async function failOrphanedDeposits({ logger = console } = {}) {
+async function failOrphanedDeposits({ logger = console, limit = 200 } = {}) {
     const result = await pool.query(
         `UPDATE deposits
          SET status = 'failed', updated_at = NOW()
-         WHERE provider_payment_id IS NULL
-           AND credited_at IS NULL
-           AND status IN ('pending', 'confirming')
-           AND created_at < NOW() - INTERVAL '1 hour'
-         RETURNING id`
+         WHERE id IN (
+             SELECT id FROM deposits
+             WHERE provider_payment_id IS NULL
+               AND credited_at IS NULL
+               AND status IN ('pending', 'confirming')
+               AND created_at < NOW() - INTERVAL '1 hour'
+             ORDER BY created_at ASC
+             LIMIT $1
+         )
+         RETURNING id`,
+        [limit]
     );
     if (result.rows.length > 0) {
         logger.log(`Closed ${result.rows.length} deposit(s) that were never attached to a provider payment.`);
@@ -263,18 +307,21 @@ async function reconcilePendingDeposits({
     }
 
     const params = [providers];
-    
-    // Reconcile deposits matching the active providers and status, or targeted by depositId
+
+    // Reconcile deposits matching the active providers and status, or targeted by depositId.
+    // The generic sweep requires a provider_payment_id because a row without one cannot be
+    // looked up; a targeted lookup does not, because the caller already knows which row
+    // they mean and the reconciler's message about a missing id is more useful than a
+    // silent skip.
     let filter = `provider = ANY($1) AND credited_at IS NULL AND status IN ('pending', 'confirming')`;
 
     if (depositId !== null) {
         params.push(depositId);
         filter += ` AND id = $${params.length}`;
     } else {
-        // Only require provider_payment_id when doing general batch sweeps (orphans handled separately)
         filter += ` AND provider_payment_id IS NOT NULL`;
     }
-    
+
     params.push(limit);
 
     const pending = await pool.query(
@@ -289,6 +336,10 @@ async function reconcilePendingDeposits({
     summary.checked = pending.rows.length;
     const stripe = stripeConfigured() ? (stripeClient || getStripeClient()) : null;
 
+    // Sequential, not parallel. The NOWPayments client already serialises its own calls
+    // per endpoint at the documented 3 RPS, so fanning out would just queue them inside
+    // the client while making the logs harder to follow. Stripe's API is faster but the
+    // batch is small in practice.
     for (const deposit of pending.rows) {
         if (deposit.provider === 'stripe') {
             await reconcileStripeDeposit(deposit, stripe, summary, logger);
@@ -297,7 +348,7 @@ async function reconcilePendingDeposits({
         }
     }
 
-    // Run orphan cleanup only on general background sweeps, not single-deposit lookups
+    // Run orphan cleanup only on general background sweeps, not single-deposit lookups.
     if (depositId === null) {
         try {
             await failOrphanedDeposits({ logger });
@@ -310,8 +361,8 @@ async function reconcilePendingDeposits({
     return summary;
 }
 
-module.exports = { 
-    reconcilePendingDeposits, 
-    fetchProviderPayment, 
-    failOrphanedDeposits 
+module.exports = {
+    reconcilePendingDeposits,
+    fetchProviderPayment,
+    failOrphanedDeposits
 };

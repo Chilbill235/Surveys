@@ -56,22 +56,55 @@ if (corsOrigins.length > 0) {
 }
 
 /* -------------------------------------------------------------------------- */
-/*                            WEBHOOK RAW PARSERS                             */
+/*                            WEBHOOK ROUTES                                  */
 /* -------------------------------------------------------------------------- */
 
-// Raw body parser for Stripe Webhook Signature verification
-app.post(
-    '/api/payments/stripe/webhook',
-    express.raw({ type: 'application/json' }),
-    paymentController.stripeWebhook
-);
+/**
+ * Rejects any non-POST request to a webhook endpoint.
+ *
+ * The provider only posts, so a GET here is a misconfigured scheduler or a probe.
+ * `Allow: POST` is set per RFC 7231 so a scanner sees the correct method rather
+ * than a bare 404 that leaves the endpoint looking unregistered.
+ *
+ * The method registry that powers the `/api` 405 handler is populated by the
+ * route modules, and these two paths are registered directly on `app` rather
+ * than through a router, so the registry does not know about them. Without this
+ * guard, `GET /api/payments/nowpayments/ipn` falls through every route, reaches
+ * the `/api` 405 handler, finds no entry, and continues to the `/api` 404 --
+ * reporting "route not found" when the real answer is "POST only". That is the
+ * exact behaviour the maintenance router's IPN guard was added to prevent.
+ */
+function webhookPostOnly(label) {
+    return (req, res, next) => {
+        if (req.method === 'POST') return next();
+        res.set('Allow', 'POST');
+        return res.status(405).json({
+            error: `${label} only accepts POST requests.`,
+            allowed: ['POST'],
+        });
+    };
+}
 
-// Raw body parser for NOWPayments IPN verification
-app.post(
-    '/api/payments/nowpayments/ipn',
-    express.raw({ type: '*/*', limit: '32kb' }),
-    paymentController.nowPaymentsIpn
-);
+// Raw body parsers are required for signature verification -- the handlers read
+// the unparsed bytes, and `express.json()` cannot reconstruct them once parsed.
+// Both must therefore be registered before the global JSON body middleware.
+//
+// `.all()` before `.post()` so a GET is rejected before the raw parser runs:
+// buffering the body of a request that is about to be discarded is wasted work,
+// and the `limit` on the NOWPayments parser makes it a small denial-of-service
+// surface on a path an unauthenticated caller can reach.
+
+// Stripe verifies the signature over the exact bytes Stripe sent.
+app.route('/api/payments/stripe/webhook')
+    .all(webhookPostOnly('The Stripe webhook'))
+    .post(express.raw({ type: 'application/json' }), paymentController.stripeWebhook);
+
+// NOWPayments signs the *parsed and re-serialised* payload, so the parser has to
+// accept whatever content type the provider chooses; `type: '*/*'` keeps the raw
+// bytes available whatever the header says.
+app.route('/api/payments/nowpayments/ipn')
+    .all(webhookPostOnly('The NOWPayments IPN'))
+    .post(express.raw({ type: '*/*', limit: '32kb' }), paymentController.nowPaymentsIpn);
 
 /* -------------------------------------------------------------------------- */
 /*                          GLOBAL BODY MIDDLEWARE                            */
@@ -103,11 +136,15 @@ app.get('/', (req, res) => {
     res.sendFile(path.join(publicDirectory, 'home.html'));
 });
 
-app.get('/offers', (req, res) => {
+// The trailing-slash form is accepted for each of these because a URL a user
+// types by hand often ends in one, and Express's exact-match routing would
+// otherwise send it to the catch-all 404. `express.static` below does not save
+// it: the directory form looks for `offers/index.html`, which does not exist.
+app.get(['/offers', '/offers/'], (req, res) => {
     res.sendFile(path.join(publicDirectory, 'index.html'));
 });
 
-app.get('/reset-password', (req, res) => {
+app.get(['/reset-password', '/reset-password/'], (req, res) => {
     res.sendFile(path.join(publicDirectory, 'reset-password.html'));
 });
 
@@ -115,7 +152,7 @@ app.get('/deposit/:id', (req, res) => {
     res.sendFile(path.join(publicDirectory, 'deposit-receipt.html'));
 });
 
-app.get('/demo', (req, res) => {
+app.get(['/demo', '/demo/'], (req, res) => {
     // Demo mode, not NODE_ENV. The demo page and the demo offers in the catalog are one
     // feature: if the catalog shows a demo offer, this page has to be reachable, and if it
     // is not, the catalog has nothing to point at. Keying them off different variables is
@@ -125,6 +162,11 @@ app.get('/demo', (req, res) => {
     }
     return res.sendFile(path.join(publicDirectory, 'demo.html'));
 });
+
+// `/index.html` is a valid file in the public directory and static would serve
+// it directly, bypassing the route above. Redirected so the catalog has one
+// canonical URL and any tracking that lands on the file form goes through it.
+app.get('/index.html', (req, res) => res.redirect(301, '/offers'));
 
 app.use(
     express.static(publicDirectory, {

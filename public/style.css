@@ -1268,6 +1268,16 @@ textarea.form-control { min-height: 96px; resize: vertical; }
 .callout.is-warning { color: var(--warning); background: var(--warning-bg); border-color: color-mix(in srgb, var(--warning) 30%, transparent); }
 .callout.is-warning::before { content: '\26A0'; }
 
+/* A callout that qualifies the field above it rather than standing alone in the flow. Sits
+ * directly under its hint with a smaller top margin, because the full 14px reads as a
+ * separate section and pulls the eye away from the amount it is about. */
+.callout.is-compact {
+    margin-top: 8px;
+    padding: 10px 13px;
+    font-size: var(--step--1);
+    line-height: 1.5;
+}
+
 /* 14. Money dialogs: amount blocks, receipts, confirmations ---------------- */
 
 .dialog-deposit { border-top-color: var(--indigo-700); }

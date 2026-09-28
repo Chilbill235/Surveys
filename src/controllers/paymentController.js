@@ -235,13 +235,15 @@ async function fetchCryptoDepositOptions() {
     // fixed-rate, and absent again if the response shape is not one we recognise.
     const limits = await nowPayments.getCurrencyLimits();
 
+    const fixedRate = nowPayments.fixedRateEnabled();
+
     // One read per currency, bounded so a large catalogue cannot trip the
     // provider's rate limiter. A single failed read does not blank the picker:
     // that coin falls back to the app floor and every other coin is unaffected.
     const quotes = await mapWithConcurrency(currencies, CRYPTO_OPTIONS_CONCURRENCY, (currency) =>
         nowPayments
             .getMinimumAmount('usd', currency, {
-                isFixedRate: nowPayments.fixedRateEnabled(),
+                isFixedRate: fixedRate,
                 isFeePaidByUser: nowPayments.feePaidByUserEnabled(),
             })
             .catch((error) => {
@@ -259,25 +261,28 @@ async function fetchCryptoDepositOptions() {
         const window = limits[currency];
         const quoted = quotes[index];
 
-        // Two provider sources for the same floor, and they are not equally
-        // trustworthy. `/v1/currencies?fixed_rate=true` states a window in fiat for
-        // the currency itself, so every coin is quoted in the same units.
-        // `/v1/min-amount` is per *pair* and its bare `min_amount` is denominated in
-        // the coin, not the fiat, which is how Bitcoin Cash ended up advertising an
-        // $18.81 minimum and rejecting ordinary deposits below it. Where the two
-        // disagree by more than a plausible margin the window wins, because it is
-        // the one whose units are known.
+        // Two provider sources, and only one of them states its units in USD.
+        //
+        //   * `/v1/currencies?fixed_rate=true` reports a window in fiat for the
+        //     currency itself, so every coin is quoted in the same units. This is
+        //     the trustworthy one.
+        //   * `/v1/min-amount` is per *pair*, and the bare `min_amount` it returns
+        //     is denominated in the coin, not the fiat, *unless* the account is on
+        //     fixed-rate. Reading a coin amount as dollars is exactly how Bitcoin
+        //     Cash ended up advertising an $18.79 floor: 0.05 BCH was read as $0.05
+        //     and then scaled or misreported by the provider's own response.
+        //
+        // So the fiat window wins when present, the quoted value is only trusted
+        // on a fixed-rate account, and otherwise the app floor is used and the
+        // real refusal is left to `createPayment`, whose error message is passed
+        // back to the user verbatim.
         let effectiveMin;
         if (window?.min !== null && window?.min !== undefined) {
-            if (quoted !== null && quoted > window.min * 4) {
-                console.warn(
-                    `NOWPayments quoted a ${currency} minimum of $${quoted.toFixed(2)} but its own ` +
-                    `fixed-rate window starts at $${window.min.toFixed(2)}; using the window.`
-                );
-            }
             effectiveMin = window.min;
+        } else if (fixedRate && quoted !== null) {
+            effectiveMin = quoted;
         } else {
-            effectiveMin = quoted ?? MIN_DEPOSIT_USD;
+            effectiveMin = MIN_DEPOSIT_USD;
         }
 
         // A provider minimum below the app's own floor would let a user submit an
@@ -320,14 +325,12 @@ async function fetchCryptoDepositOptions() {
         cryptoCurrencies: currencies,
         // The app's own limits, which are what the amount box enforces.
         //
-        // These are deliberately separate from the provider figures below. The provider's
-        // per-coin minimum is a volatile, pair-specific fact -- Bitcoin Cash genuinely
-        // refuses anything under about $18.79 today, and that number moves with fees and
-        // volume. It is reported to the browser so the user can be told before submitting,
-        // but it is not allowed to become the input's `min`. Pinning the box to it meant a
+        // These are deliberately separate from the provider figures below. The
+        // provider's per-coin minimum is a volatile, pair-specific fact, and it is
+        // not allowed to become the input's `min`. Pinning the box to it meant a
         // $1 deposit -- which this app explicitly advertises as its minimum -- was
-        // unsubmittable for a whole class of coins, with the reason surfacing only as a
-        // clamped amount the user never typed.
+        // unsubmittable for a whole class of coins, with the reason surfacing only
+        // as a clamped amount the user never typed.
         appMinimumUsd: MIN_DEPOSIT_USD,
         appMaximumUsd: MAX_DEPOSIT_USD,
         // The picker-level minimum is the smallest per-currency floor, so a user is
@@ -338,9 +341,13 @@ async function fetchCryptoDepositOptions() {
         // reason: a low-capped coin must not shrink the box for every other coin.
         // The frontend narrows this to the selected coin via `maximums`.
         maximumUsd: largest > 0 ? largest : MAX_DEPOSIT_USD,
-        // The provider's per-coin windows. Informational: these are shown as guidance and
-        // enforced at payment creation, where a refusal is still caught before any money
-        // moves.
+        // The provider's per-coin windows. These are *guidance* shown to the user
+        // before they submit, not a hard block. The app's own $1 floor is what the
+        // amount box enforces, and if a chosen coin's real minimum is higher than
+        // the amount submitted, NOWPayments refuses the payment and its own message
+        // is passed back to the user unchanged. That is a worse-shaped refusal than
+        // a pre-check, but it is the only way to let a $1 deposit succeed for every
+        // coin whose real minimum is $1 or less.
         minimums,
         maximums,
     };
@@ -461,14 +468,17 @@ async function createDeposit(req, res) {
         return res.status(503).json({ error: 'Crypto deposits are unavailable because NOWPAYMENTS_API_BASE_URL is not the production API.' });
     }
 
-    // The provider is the authority on which coins this account accepts, and on the
-    // real minimum for each. Both are a courtesy check performed before the insert,
-    // so a deposit the provider would refuse never becomes a row the user has to be
-    // told about afterwards. If the pre-flight cannot be completed the request
-    // proceeds on the app's own list and floor rather than being refused: the
-    // provider is still the authority at payment creation, so falling back costs a
-    // clear error there, while failing closed would turn a transient provider
-    // outage into a total deposit outage for every user.
+    // The provider is the authority on which coins this account accepts. That list
+    // is a courtesy check performed before the insert, so a deposit the provider
+    // would refuse never becomes a row the user has to be told about afterwards.
+    //
+    // The provider's per-currency *minimum* is deliberately not enforced here. It
+    // is a volatile, pair-specific figure, and blocking on it meant the app's own
+    // advertised $1 floor was unsubmittable for a class of coins. The deposit is
+    // accepted at whatever the app floor allows, and if the amount is below the
+    // provider's real minimum the `createPayment` call below refuses -- that
+    // refusal is answered with the provider's own message, which names the exact
+    // number that will work, rather than a generic failure.
     let cryptoOptions = null;
     if (method === 'crypto') {
         try {
@@ -482,22 +492,10 @@ async function createDeposit(req, res) {
             return res.status(400).json({ error: 'Choose a supported cryptocurrency.' });
         }
 
-        // The provider's floor is enforced here rather than in the form, because it is a
-        // volatile, pair-specific figure: the browser's amount box deliberately accepts
-        // anything from the app's own $1.00 so the advertised minimum is actually usable.
-        // This is the last point at which a doomed payment can be refused, and it is
-        // refused before the deposit row exists, so nothing is left in the history.
-        const required = cryptoOptions?.minimums?.[payCurrency] ?? MIN_DEPOSIT_USD;
-        if (amount < required) {
-            return res.status(400).json({
-                error: `NOWPayments accepts ${payCurrency.toUpperCase()} deposits from ` +
-                    `$${required.toFixed(2)}. Enter that amount or more to continue.`,
-            });
-        }
-
-        // Checked against the provider's real ceiling as well as the app's own, so
-        // an amount the provider would refuse is caught before the user commits to
-        // it. The message names the coin, because the ceiling is per-currency.
+        // The provider's real ceiling is enforced here, because unlike the floor it
+        // is a hard limit the provider will always refuse above, and it is cheap to
+        // check: `maximums[coin]` comes from the same read as `minimums`, and the
+        // app's own $5,000 ceiling is a further cap that is always safe.
         const ceiling = cryptoOptions?.maximums?.[payCurrency] ?? MAX_DEPOSIT_USD;
         if (amount > ceiling) {
             return res.status(400).json({
@@ -613,20 +611,30 @@ async function createDeposit(req, res) {
             });
         }
 
-        // The provider explains refusals in the body ("Minimum amount is ...",
-        // unknown currency). The caller logs the provider's own words so an operator
-        // can act, but the client response stays generic.
-        const providerDetail = error instanceof nowPayments.NowPaymentsError && error.providerMessage
-            ? `${error.message} Provider said: ${error.providerMessage}`
-            : error.message;
+        // The provider explains refusals in the body ("Minimum amount is 0.05 BCH,
+        // you have 0.002", "unknown currency"). Those words are more useful than a
+        // generic 502 and they are the only thing that tells the user what number
+        // will work -- so a provider refusal is passed through as a 400 with the
+        // provider's own message, and only an unrecognised failure stays a 502.
+        if (error instanceof nowPayments.NowPaymentsError && error.providerMessage) {
+            const providerDetail = `${error.message} Provider said: ${error.providerMessage}`;
+            if (rateLimited) {
+                console.error('NOWPayments create-payment rate limit reached:', providerDetail);
+                return res.status(429).json({
+                    error: 'Too many deposit attempts in a short time. Please wait a moment and try again.',
+                });
+            }
+            console.error('NOWPayments refused the deposit:', providerDetail);
+            return res.status(400).json({ error: error.providerMessage });
+        }
 
         if (rateLimited) {
-            console.error('NOWPayments create-payment rate limit reached:', providerDetail);
+            console.error('NOWPayments create-payment rate limit reached:', error.message);
             return res.status(429).json({
                 error: 'Too many deposit attempts in a short time. Please wait a moment and try again.',
             });
         }
-        console.error('Deposit creation failed:', providerDetail);
+        console.error('Deposit creation failed:', error.message);
         return res.status(502).json({ error: 'Could not create a deposit with the selected provider.' });
     }
 }

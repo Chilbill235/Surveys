@@ -321,6 +321,10 @@
                     <span class="amount-suffix" aria-hidden="true">USD</span>
                 </div>
                 <p class="field-hint" id="withdraw-amount-hint">Minimum $1.00. Maximum $10,000.00.</p>
+                <!-- Shown only when the provider refused to report its per-network payout
+                     floors, so the $1.00 above is known to be our own rule rather than a
+                     limit the provider has agreed to. -->
+                <p class="callout is-warning is-compact" id="withdraw-minimum-unconfirmed" hidden></p>
             </div>
 
             <fieldset class="fieldset-reset">

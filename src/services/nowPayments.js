@@ -20,14 +20,16 @@
  *     GET  /v1/payment/{payment_id}                   payment status / confirmation
  *   Payouts
  *     POST /v1/payout                                create a payout batch
- *     POST /v1/payout/verify                         2FA confirmation, without which the
+ *     POST /v1/payout/{id}/verify                    2FA confirmation, without which the
  *                                                     batch is created but never sent
  *     POST /v1/payout/validate-address                authoritative address validation
  *     GET  /v1/payout/fee                             network fee estimate
  *     GET  /v1/payout-withdrawal/min-amount/{coin}    minimum payout for a coin
+ *     GET  /v1/payout/{batch_id}                      payout batch state
  */
 
 const { createHmac, timingSafeEqual } = require('node:crypto');
+const { ProxyAgent } = require('undici');
 
 const PRODUCTION_BASE_URL = 'https://api.nowpayments.io';
 
@@ -111,6 +113,57 @@ function isTrustedBaseUrl() {
 }
 
 // ---------------------------------------------------------------------------
+// Outbound proxy
+// ---------------------------------------------------------------------------
+
+/**
+ * A memoised dispatcher that routes outbound requests through FIXIE_URL.
+ *
+ * NOWPayments restricts the payout endpoints to a list of whitelisted IPs, and a
+ * serverless host like Vercel cannot be whitelisted because its outbound address
+ * changes on every cold start. Fixie provides two stable IPs, and the app routes the
+ * whitelisted calls through it.
+ *
+ * Only the payout endpoints use this. The payment endpoints (`createPayment`,
+ * `getMinimumAmount`, `getSupportedCurrencies`, `getCurrencyLimits`) are not IP
+ * restricted, and the free Fixie tier allows 500 requests per month -- routing the
+ * per-coin currency lookups through it would exhaust the budget in a single cache
+ * refresh.
+ *
+ * Returned as `null` when the URL is unset, which makes the caller use the direct
+ * connection. That is the correct behaviour for local development, where the
+ * whitelist is not enforced and Fixie may not be configured.
+ *
+ * Constructed once and cached: `ProxyAgent` opens a connection pool, and building a
+ * new one per request would throw the pool away between calls and leak sockets.
+ */
+let cachedProxyDispatcher = null;
+let cachedProxyUrl = null;
+
+function payoutProxyDispatcher() {
+    const url = String(process.env.FIXIE_URL || '').trim();
+    if (!url) return null;
+
+    // Rebuild only if the URL changed. In practice it does not change within one
+    // process, but this guards against a test that swaps it.
+    if (cachedProxyDispatcher && cachedProxyUrl === url) return cachedProxyDispatcher;
+
+    try {
+        cachedProxyDispatcher = new ProxyAgent(url);
+        cachedProxyUrl = url;
+        return cachedProxyDispatcher;
+    } catch (error) {
+        // A malformed URL is a configuration mistake, not a runtime failure. Logged
+        // once, and the caller falls back to a direct connection so an app that was
+        // working before the proxy was added does not stop working because of it.
+        console.error(`FIXIE_URL is not a usable proxy URL (${error.message}); routing directly.`);
+        cachedProxyDispatcher = null;
+        cachedProxyUrl = null;
+        return null;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Rate limiting
 // ---------------------------------------------------------------------------
 
@@ -145,7 +198,6 @@ function rateLimited(method, path, run) {
     return task;
 }
 
-
 // ---------------------------------------------------------------------------
 // Transport
 // ---------------------------------------------------------------------------
@@ -172,6 +224,11 @@ class NowPaymentsError extends Error {
     get isRateLimited() {
         return this.status === 429;
     }
+
+    /** True when the provider refused because the caller's IP is not whitelisted. */
+    get isIpRefused() {
+        return this.status === 403;
+    }
 }
 
 /**
@@ -179,8 +236,19 @@ class NowPaymentsError extends Error {
  *
  * `x-api-key` is the documented auth header for everything except the JWT-only listing
  * endpoints. The key is never returned to a browser and never logged.
+ *
+ * `viaProxy` routes the request through FIXIE_URL when it is set. Only the payout
+ * endpoints pass it, because they are the ones on NOWPayments' IP whitelist. When
+ * `FIXIE_URL` is unset the option has no effect and the request goes out directly, which
+ * is what local development wants.
  */
-async function request(method, path, { body = null, query = null, timeoutMs = 12000, authToken = null } = {}) {
+async function request(method, path, {
+    body = null,
+    query = null,
+    timeoutMs = 12000,
+    authToken = null,
+    viaProxy = false,
+} = {}) {
     if (!isConfigured()) {
         throw new NowPaymentsError('NOWPayments is not configured: NOWPAYMENTS_API_KEY is missing.');
     }
@@ -202,6 +270,11 @@ async function request(method, path, { body = null, query = null, timeoutMs = 12
     if (authToken) headers.Authorization = `Bearer ${authToken}`;
     if (body !== null) headers['Content-Type'] = 'application/json';
 
+    // The dispatcher is only resolved when the caller asked for it. `ProxyAgent`
+    // opens a connection pool on construction, so a request that does not need the
+    // proxy should not pay for one.
+    const dispatcher = viaProxy ? payoutProxyDispatcher() : null;
+
     let response;
     try {
         // Keyed on `path`, not `url`, so the documented per-endpoint limit applies.
@@ -209,7 +282,11 @@ async function request(method, path, { body = null, query = null, timeoutMs = 12
             method,
             headers,
             body: body === null ? undefined : JSON.stringify(body),
-            signal: AbortSignal.timeout(timeoutMs)
+            signal: AbortSignal.timeout(timeoutMs),
+            // Undici's `fetch` accepts `dispatcher` for a custom connection pool. It is
+            // left undefined when the proxy is unset, which makes fetch use its
+            // process-wide default.
+            ...(dispatcher ? { dispatcher } : {}),
         }));
     } catch (error) {
         if (error instanceof NowPaymentsError) throw error;
@@ -248,6 +325,11 @@ function resetAuthTokenCache() {
 /**
  * Returns a JWT for the payout endpoints, which require `Authorization: Bearer` on top of
  * the API key. Email and password are case-sensitive.
+ *
+ * Goes through the proxy when it is configured, because the auth endpoint is on the same
+ * whitelist as the payout calls: NOWPayments resolves the token against the account that
+ * owns the key, and a request from an unlisted IP is refused before the credentials are
+ * even checked.
  */
 async function getAuthToken() {
     if (authTokenCache.token && Date.now() < authTokenCache.expiresAt) {
@@ -262,7 +344,8 @@ async function getAuthToken() {
             email: process.env.NOWPAYMENTS_EMAIL,
             password: process.env.NOWPAYMENTS_PASSWORD
         },
-        timeoutMs: 10000
+        timeoutMs: 10000,
+        viaProxy: true,
     });
     if (!result || typeof result.token !== 'string' || !result.token) {
         throw new NowPaymentsError('NOWPayments did not return an authorization token.');
@@ -285,6 +368,9 @@ async function getAuthToken() {
  * the create-payment call then failed with a generic 502. `GET /v1/merchant/coins` is the
  * endpoint the provider documents for exactly this question. The global list remains as
  * a fallback so a sandbox that does not implement it still works.
+ *
+ * Not proxied: this endpoint is not IP-restricted, and the currency list is refreshed on
+ * every cache expiry, which would consume the free Fixie budget on its own.
  */
 async function getSupportedCurrencies({ logger = console } = {}) {
     // The two endpoints disagree on the field name: the merchant list answers with
@@ -467,6 +553,8 @@ function feePaidByUserEnabled() {
  * The response is checked for the three fields the deposit cannot work without. A payment
  * that comes back without an address or a `pay_amount` cannot be shown to a customer, and
  * storing the deposit as if it had instructions would leave them waiting on nothing.
+ *
+ * Not proxied: this endpoint is not IP-restricted.
  */
 async function createPayment({
     priceAmount,
@@ -505,6 +593,8 @@ async function createPayment({
  * This is `GET /v1/payment/{payment_id}` and it is the authoritative answer to "did this
  * payment arrive?", so it backs the reconciler: it is the path that resolves a deposit
  * whose callback never landed.
+ *
+ * Not proxied: this endpoint is not IP-restricted.
  */
 async function getPaymentStatus(paymentId) {
     if (!paymentId) throw new NowPaymentsError('A payment id is required to read payment status.');
@@ -513,6 +603,13 @@ async function getPaymentStatus(paymentId) {
 
 // ---------------------------------------------------------------------------
 // Payout endpoints
+//
+// Every call in this section passes `viaProxy: true`. NOWPayments restricts these
+// endpoints to a whitelist of IP addresses, and a serverless host cannot be whitelisted
+// because its outbound address changes on every cold start. Fixie provides two stable
+// IPs, both whitelisted in the NOWPayments dashboard, and `payoutProxyDispatcher` reads
+// `FIXIE_URL` to route these calls through it. When `FIXIE_URL` is unset the option is
+// inert and the calls go direct, which is what local development wants.
 // ---------------------------------------------------------------------------
 
 /**
@@ -537,7 +634,7 @@ async function validatePayoutAddress(address, currency, { extraId = null, logger
     if (extraId) body.extra_id = String(extraId);
 
     try {
-        const result = await request('POST', '/v1/payout/validate-address', { body, timeoutMs: 10000 });
+        const result = await request('POST', '/v1/payout/validate-address', { body, timeoutMs: 10000, viaProxy: true });
         // The endpoint reports validity in a few shapes across API versions; any explicit
         // `false` is authoritative, and an absent flag is treated as "cannot tell" rather
         // than as permission, so a shape change fails closed towards the local check.
@@ -562,7 +659,8 @@ async function getPayoutFee(currency, amount) {
     try {
         const result = await request('GET', '/v1/payout/fee', {
             query: { currency: String(currency).toLowerCase(), amount: Number(amount) },
-            timeoutMs: 8000
+            timeoutMs: 8000,
+            viaProxy: true,
         });
         const fee = Number(result?.withdrawal_fee ?? result?.fee);
         return Number.isFinite(fee) ? fee : null;
@@ -574,17 +672,16 @@ async function getPayoutFee(currency, amount) {
 /**
  * Minimum NOWPayments will payout for a coin, in that coin, or null when unknown.
  *
- * This endpoint is access-restricted on the provider side. An account that has not enabled it
- * gets 403 "Access denied | Invalid IP", and the provider cannot even name the address it
+ * This endpoint is access-restricted on the provider side. An account that has not enabled
+ * it gets 403 "Access denied | Invalid IP", and the provider cannot even name the address it
  * thinks is calling -- its own response ends in the literal text "undefined". That is a
  * configuration fact about the NOWPayments account, not a fault here, and the caller already
  * falls back to the app's own floor, so an unavailable minimum never blocks a withdrawal.
  *
- * That fallback is also why the refusal is not worth logging loudly, or retrying hard. It was
- * previously reported once per coin per refresh: fourteen identical warnings, and fourteen
- * HTTP requests that cannot succeed, every time the limits cache expired. The state below
- * makes it one log line and no requests at all until the cool-off expires, and any later
- * refusal is silent because it has already been reported.
+ * With `FIXIE_URL` set the call is routed through the whitelisted proxy and the 403 should
+ * not occur. The cool-off is still kept, because the whitelist is verified per account and
+ * a misconfiguration (or an expired Fixie plan) can bring the 403 back. In that case the
+ * refusal is one log line and no further requests until the cool-off expires.
  */
 let payoutMinimumUnavailableUntil = 0;
 let payoutMinimumRefusalReported = false;
@@ -607,6 +704,19 @@ const payoutMinimumInFlight = new Map();
 /** How long to stop asking after a refusal, and how to undo it when configuration changes. */
 const PAYOUT_MINIMUM_RETRY_MS = 15 * 60 * 1000;
 
+/**
+ * Whether the provider has refused the payout-minimum endpoint for this account.
+ *
+ * Distinct from `getPayoutMinimum` returning null. Null means "no usable figure", which has
+ * three causes that need different responses: the cool-off is active, the provider answered
+ * with something unusable, or the provider refused the account outright. A caller fanning out
+ * over every coin needs to tell those apart -- only the third one means the remaining coins
+ * are not worth asking about.
+ */
+function isPayoutMinimumRefused() {
+    return Date.now() < payoutMinimumUnavailableUntil;
+}
+
 async function getPayoutMinimum(currency) {
     const coin = String(currency).toLowerCase();
     if (Date.now() < payoutMinimumUnavailableUntil) return null;
@@ -618,7 +728,8 @@ async function getPayoutMinimum(currency) {
     const inFlight = (async () => {
         try {
             const result = await request('GET', `/v1/payout-withdrawal/min-amount/${encodeURIComponent(coin)}`, {
-                timeoutMs: 8000
+                timeoutMs: 8000,
+                viaProxy: true,
             });
             const minimum = Number(result?.min_amount ?? result?.amount);
             if (Number.isFinite(minimum) && minimum > 0) {
@@ -644,15 +755,18 @@ async function getPayoutMinimum(currency) {
                 if (!payoutMinimumRefusalReported) {
                     payoutMinimumRefusalReported = true;
                     payoutMinimumRefusalSeen = true;
+                    const viaProxy = Boolean(process.env.FIXIE_URL);
                     console.warn(
                         `NOWPayments refused the payout-minimum endpoint (${error.providerMessage ?? error.message}). ` +
-                        'It is restricted per account, so the app minimum is used for every coin and no further ' +
-                        `requests will be made for ${Math.round(PAYOUT_MINIMUM_RETRY_MS / 60000)} minutes. ` +
-                        'This is a capability notice, not a failure: withdrawals are unaffected. ' +
-                        'To enable provider payout minimums, either whitelist this server\'s IPv4 and IPv6 in the ' +
-                        'NOWPayments dashboard, or -- if the outbound address rotates, as it does on serverless ' +
-                        'hosting -- request that IP whitelisting be disabled at ' +
-                        'https://account.nowpayments.io/whitelist-settings'
+                        (viaProxy
+                            ? 'This request was routed through FIXIE_URL, so the whitelisted proxy IPs are not ' +
+                              'the ones on the NOWPayments account. Confirm that BOTH Fixie outbound IPs are ' +
+                              'whitelisted at https://account.nowpayments.io/whitelist-settings. '
+                            : 'FIXIE_URL is not set, so the request went out from this host\'s own address, ' +
+                              'which a serverless platform will not keep stable. Set FIXIE_URL to route these ' +
+                              'calls through the whitelisted proxy. ') +
+                        `No further requests will be made for ${Math.round(PAYOUT_MINIMUM_RETRY_MS / 60000)} ` +
+                        'minutes. This is a capability notice, not a failure: withdrawals are unaffected.'
                     );
                 }
             }
@@ -735,7 +849,7 @@ async function submitPayoutBatch(entries, { logger = console, ipnCallbackUrl = n
     // thing that resolves a payout in real time.
     if (ipnCallbackUrl) body.ipn_callback_url = String(ipnCallbackUrl);
 
-    const result = await request('POST', '/v1/payout', { body, timeoutMs: 30000 });
+    const result = await request('POST', '/v1/payout', { body, timeoutMs: 30000, viaProxy: true });
 
     // The provider reports the batch under either spelling depending on version; both are
     // read because the batch id is the only durable link back to our rows.
@@ -781,7 +895,10 @@ async function getPayoutBatch(batchId) {
     const id = String(batchId || '').trim();
     if (!id) return null;
     try {
-        const result = await request('GET', `/v1/payout/${encodeURIComponent(id)}`, { timeoutMs: 10000 });
+        const result = await request('GET', `/v1/payout/${encodeURIComponent(id)}`, {
+            timeoutMs: 10000,
+            viaProxy: true,
+        });
         return result || null;
     } catch (error) {
         // A batch the provider does not know about is a real answer -- it means the
@@ -790,7 +907,6 @@ async function getPayoutBatch(batchId) {
         return null;
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // Payout 2FA
@@ -928,7 +1044,8 @@ async function verifyPayoutBatch(batchId, { verificationCode, logger = console }
         await request('POST', `/v1/payout/${encoded}/verify`, {
             authToken: await getAuthToken(),
             body: { verification_code: code },
-            timeoutMs: 20000
+            timeoutMs: 20000,
+            viaProxy: true,
         });
     } catch (error) {
         const missingEndpoint = error instanceof NowPaymentsError
@@ -942,14 +1059,14 @@ async function verifyPayoutBatch(batchId, { verificationCode, logger = console }
         await request('POST', '/v1/payout/verify', {
             authToken: await getAuthToken(),
             body: { batch_withdrawal_id: batch, verification_code: code },
-            timeoutMs: 20000
+            timeoutMs: 20000,
+            viaProxy: true,
         });
     }
 
     logger.log(`Verified NOWPayments payout batch ${batch}; it is now released for sending.`);
     return { batchId: batch, verified: true };
 }
-
 
 // ---------------------------------------------------------------------------
 // IPN
@@ -1038,6 +1155,7 @@ module.exports = {
     validatePayoutAddress,
     getPayoutFee,
     getPayoutMinimum,
+    isPayoutMinimumRefused,
     resetPayoutMinimumAvailability,
     submitPayoutBatch,
     verifyPayoutBatch,

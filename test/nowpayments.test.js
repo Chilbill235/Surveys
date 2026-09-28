@@ -607,3 +607,167 @@ test('a refused payout minimum is reported once, and then not retried per coin',
         }
     }
 });
+
+test('a refusal is reported as a refusal, which is not the same as no figure', async () => {
+    const saved = { ...process.env };
+    const originalFetch = global.fetch;
+    process.env.NOWPAYMENTS_API_KEY = 'test-key';
+
+    try {
+        // `getPayoutMinimum` returns null for three quite different situations, and a caller
+        // fanning out over every coin has to tell them apart. Only a refusal means the other
+        // coins are not worth asking about; an answer with no usable figure does not.
+        assert.equal(nowPayments.isPayoutMinimumRefused(), false, 'a fresh process starts unrefused');
+
+        global.fetch = async () => new Response('Access denied', { status: 403 });
+        const originalWarn = console.warn;
+        console.warn = () => {};
+        try {
+            assert.equal(await nowPayments.getPayoutMinimum('btc'), null);
+        } finally {
+            console.warn = originalWarn;
+        }
+        assert.equal(nowPayments.isPayoutMinimumRefused(), true, 'a 403 did not register as a refusal');
+
+        // A usable answer is not a refusal.
+        global.fetch = async () => new Response(JSON.stringify({ min_amount: 3 }), {
+            status: 200, headers: { 'Content-Type': 'application/json' }
+        });
+        nowPayments.resetPayoutMinimumAvailability();
+        assert.equal(await nowPayments.getPayoutMinimum('btc'), 3);
+        assert.equal(nowPayments.isPayoutMinimumRefused(), false);
+
+        // An answer that carries no usable figure is also not a refusal. This is the case that
+        // matters: treating it as one would blank the whole catalogue's minimums because a
+        // single coin had an odd window, which is a much worse outcome than falling back to
+        // the app default for that one coin.
+        nowPayments.resetPayoutMinimumAvailability();
+        global.fetch = async () => new Response(JSON.stringify({ something_else: 1 }), {
+            status: 200, headers: { 'Content-Type': 'application/json' }
+        });
+        assert.equal(await nowPayments.getPayoutMinimum('btc'), null);
+        assert.equal(
+            nowPayments.isPayoutMinimumRefused(),
+            false,
+            'a response with no usable minimum was reported as an account refusal'
+        );
+    } finally {
+        global.fetch = originalFetch;
+        nowPayments.resetPayoutMinimumAvailability();
+        for (const [key, value] of Object.entries(saved)) {
+            if (value === undefined) delete process.env[key];
+            else process.env[key] = value;
+        }
+    }
+});
+
+test('a refused payout minimum stops the whole catalogue being asked, not just one coin', async () => {
+    const saved = { ...process.env };
+    const originalFetch = global.fetch;
+    process.env.NOWPAYMENTS_API_KEY = 'test-key';
+    process.env.NOWPAYMENTS_EMAIL = 'ops@example.test';
+    process.env.NOWPAYMENTS_PASSWORD = 'test-password';
+
+    try {
+        // The refusal is per account, so the fan-out over ~14 coins should cost one request, not
+        // fourteen. Before the probe, every worker started before the first 403 had come back,
+        // so the cool-off guard could not prevent the rest of the burst.
+        const payoutController = require('../src/controllers/payoutController');
+        payoutController.resetPayoutLimitsCache();
+        nowPayments.resetPayoutMinimumAvailability();
+
+        let minimumCalls = 0;
+        global.fetch = async (url) => {
+            if (String(url).includes('/payout-withdrawal/min-amount/')) {
+                minimumCalls += 1;
+                return new Response('Access denied', { status: 403 });
+            }
+            // Fees are a different endpoint and are not part of this behaviour.
+            return new Response(JSON.stringify({ fee: 0.5 }), {
+                status: 200, headers: { 'Content-Type': 'application/json' }
+            });
+        };
+
+        const originalWarn = console.warn;
+        const originalError = console.error;
+        const originalLog = console.log;
+        console.warn = () => {};
+        console.error = () => {};
+        // The recovery notice is sticky across `resetPayoutMinimumAvailability` by design, so
+        // an earlier test's refusal makes this one announce a recovery. Correct behaviour, but
+        // it is noise in the test output rather than a finding.
+        console.log = () => {};
+        let limits;
+        try {
+            limits = await payoutController.fetchPayoutLimits();
+        } finally {
+            console.warn = originalWarn;
+            console.error = originalError;
+            console.log = originalLog;
+        }
+
+        assert.equal(minimumCalls, 1, `the refused endpoint was called ${minimumCalls} times, expected 1`);
+        assert.deepEqual(limits.minimums, {}, 'a refused account still reported provider minimums');
+        assert.equal(limits.minimumsSource, 'app-default');
+        // The consequence that reaches the user: the $1.00 floor is unconfirmed.
+        assert.equal(limits.minimumsConfirmed, false, 'a refusal was reported as a confirmed minimum');
+    } finally {
+        global.fetch = originalFetch;
+        nowPayments.resetPayoutMinimumAvailability();
+        require('../src/controllers/payoutController').resetPayoutLimitsCache();
+        for (const [key, value] of Object.entries(saved)) {
+            if (value === undefined) delete process.env[key];
+            else process.env[key] = value;
+        }
+    }
+});
+
+test('a working endpoint still reads every coin, and confirms the floors', async () => {
+    const saved = { ...process.env };
+    const originalFetch = global.fetch;
+    process.env.NOWPAYMENTS_API_KEY = 'test-key';
+
+    try {
+        // The probe must not cost the catalogue anything when the endpoint works: the guard is
+        // on the refusal, not on having made a request.
+        const payoutController = require('../src/controllers/payoutController');
+        payoutController.resetPayoutLimitsCache();
+        nowPayments.resetPayoutMinimumAvailability();
+
+        const seen = new Set();
+        global.fetch = async (url) => {
+            if (String(url).includes('/payout-withdrawal/min-amount/')) {
+                seen.add(String(url).split('/').pop());
+                return new Response(JSON.stringify({ min_amount: 2 }), {
+                    status: 200, headers: { 'Content-Type': 'application/json' }
+                });
+            }
+            return new Response(JSON.stringify({ fee: 0.5 }), {
+                status: 200, headers: { 'Content-Type': 'application/json' }
+            });
+        };
+
+        const originalLog = console.log;
+        console.log = () => {};
+        let limits;
+        try {
+            limits = await payoutController.fetchPayoutLimits();
+        } finally {
+            console.log = originalLog;
+        }
+        const expected = require('../src/services/payoutOptions').distinctProviderCoins();
+
+        assert.equal(seen.size, expected.length, `read ${seen.size} coins, catalogue has ${expected.length}`);
+        assert.equal(limits.minimumsSource, 'provider');
+        assert.equal(limits.minimumsConfirmed, true, 'a successful read was not reported as confirmed');
+        assert.equal(Object.keys(limits.minimums).length, expected.length);
+    } finally {
+        global.fetch = originalFetch;
+        nowPayments.resetPayoutMinimumAvailability();
+        require('../src/controllers/payoutController').resetPayoutLimitsCache();
+        for (const [key, value] of Object.entries(saved)) {
+            if (value === undefined) delete process.env[key];
+            else process.env[key] = value;
+        }
+    }
+});

@@ -66,6 +66,14 @@ async function markWithdrawalPaid(client, withdrawalId, providerReference) {
  * not a database operation, and quietly crediting the balance for a payment that really
  * was made would invent money out of nothing.
  *
+ * A withdrawal with a `provider_reference` is refused too. That reference is the record
+ * that a payout was submitted to the provider, and a submitted payout can still complete
+ * on-chain after this transaction commits. Refunding it would credit the balance *and*
+ * leave the crypto transfer in flight -- the user gets paid twice, and nothing in the
+ * database would disagree with itself. If the operator has verified the batch was
+ * rejected or never sent, they can clear the reference first with an explicit database
+ * write; that is a deliberate, visible action rather than a side effect of a refund.
+ *
  * Must be called with a client that already has an open transaction.
  */
 async function refundWithdrawal(client, withdrawalId, reason) {
@@ -83,6 +91,11 @@ async function refundWithdrawal(client, withdrawalId, reason) {
     }
     if (terminalStatuses.has(withdrawal.status)) {
         return { changed: false, reason: 'already-resolved', withdrawal };
+    }
+    // The reference is the only evidence the payout was submitted. Its absence is what
+    // makes the refund safe: a withdrawal with no reference never left the platform.
+    if (withdrawal.provider_reference) {
+        return { changed: false, reason: 'submitted-payout', withdrawal };
     }
 
     const failureReason = String(reason || '').trim().slice(0, 500) || 'Withdrawal rejected on review';
@@ -106,14 +119,23 @@ async function refundWithdrawal(client, withdrawalId, reason) {
         throw new Error(`Withdrawal ${withdrawalId} was closed but user ${withdrawal.user_id} could not be refunded.`);
     }
 
+    // The unique key on (transaction_type, source_id) is what makes a second refund a
+    // failure rather than a silent second credit. A conflict here means a refund ledger
+    // row already exists for this withdrawal, which the row status did not reveal -- a
+    // refund that was applied and then reversed by hand, for example. The transaction is
+    // rolled back by the caller, so the balance write above is undone with it.
     const ledgerInsert = await client.query(
         `INSERT INTO balance_transactions (user_id, amount, transaction_type, source_id, description)
          VALUES ($1, $2, 'refund', $3, $4)
+         ON CONFLICT (transaction_type, source_id) DO NOTHING
          RETURNING id`,
         [withdrawal.user_id, withdrawal.amount, refundSourceId(withdrawalId), failureReason]
     );
     if (ledgerInsert.rowCount !== 1) {
-        throw new Error(`Withdrawal ${withdrawalId} conflicts with an existing refund ledger entry.`);
+        throw new Error(
+            `Withdrawal ${withdrawalId} already has a refund ledger entry; ` +
+            'the balance write was rolled back and nothing changed.'
+        );
     }
 
     return {
@@ -138,7 +160,7 @@ function refundSourceId(withdrawalId) {
 /**
  * Why a withdrawal could not be claimed, for the caller's message.
  *
- * The row is read rather than inferred because the three cases look identical from the
+ * The row is read rather than inferred because the four cases look identical from the
  * UPDATE alone, and "already paid" must not be reported as "not found".
  */
 async function describeUnclaimable(client, withdrawalId) {
@@ -185,11 +207,16 @@ function reverseWithdrawal(withdrawalId, reason) {
  * Ordered oldest first on purpose: a request that has been waiting longest is the one a
  * user is most likely to have chased, and an operator working top-down by recency keeps
  * deferring the same requests.
+ *
+ * `provider_reference` is included so the operator can see, before refunding, whether the
+ * payout was already submitted. A withdrawal in `processing` with a reference must not be
+ * refunded without an explicit reversal of that reference first; showing the value here
+ * makes that decision visible rather than something the refund endpoint refuses silently.
  */
 async function listUnresolvedWithdrawals({ limit = 50 } = {}) {
     const result = await pool.query(
         `SELECT w.id, w.user_id, u.email, w.amount, w.payment_method, w.payment_address,
-                w.asset_code, w.network, w.status, w.created_at
+                w.asset_code, w.network, w.provider_reference, w.status, w.created_at
          FROM withdrawals w
          JOIN users u ON u.id = w.user_id
          WHERE w.status = ANY($1)

@@ -1167,6 +1167,21 @@ function updateWithdrawAmountHint() {
             : `Maximum ${formatBalance(providerMaximum)}`);
     }
     setHint('withdraw-amount-hint', `${parts.join('. ')}.`);
+
+    // When the provider refused to report its per-network floors, that $1.00 is this app's own
+    // rule and not something the provider has agreed to accept. A crypto request under the
+    // provider's real floor would then be refused after the user committed to it, so the
+    // unconfirmed state is stated next to the number rather than left to be discovered.
+    const notice = document.getElementById('withdraw-minimum-unconfirmed');
+    if (!notice) return;
+    const confirmed = options.limitsSource?.minimumsConfirmed;
+    const relevant = withdrawState.method === 'crypto' && confirmed === false;
+    notice.hidden = !relevant;
+    if (relevant) {
+        notice.textContent = 'This is our own minimum. Crypto payouts are normally limited to a ' +
+            'higher amount by the payment provider, and we cannot read that limit right now, so ' +
+            'a small crypto request may be refused.';
+    }
 }
 
 /* --------------------------------------------------------------- deposits */
