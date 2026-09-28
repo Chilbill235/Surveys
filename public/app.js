@@ -2391,7 +2391,6 @@ function validateWithdrawalDestination() {
         }
     }
 
-    updateWithdrawFields();
     return true;
 }
 

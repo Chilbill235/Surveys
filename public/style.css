@@ -1961,6 +1961,8 @@ select.form-control:disabled { cursor: not-allowed; background-image: none; padd
 
 @media (max-width: 400px) {
     .topbar { padding: 10px 12px; }
+    .deposit-form { padding: 14px; }
+    .history-row { flex-direction: column; align-items: flex-start; gap: 8px; }
     .brand { font-size: var(--step-0); }
     .brand-mark { width: 32px; height: 32px; font-size: 19px; }
     .page-shell, .home-offers, .home-stats, .site-footer, .demo-shell { width: calc(100% - 24px); }
@@ -2377,10 +2379,8 @@ select.form-control:disabled { cursor: not-allowed; background-image: none; padd
 }
 /* ==========================================================================
    Touch targets
-   --------------------------------------------------------------------------
+--------------------------------------------------------------------------
    Last in the file on purpose.
-
-   A `pointer: coarse` block that sits in the middle of a stylesheet only wins against the rules
    written *before* it. This one used to sit above the "Home page upgrade" section, so the
    touch sizes it set for `.home-nav-link` were silently overridden by the base rule that
    declared the same property further down -- equal specificity, later rule wins. The result was
