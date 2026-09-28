@@ -19,6 +19,9 @@
  *     POST /v1/payment                                create a payment
  *     GET  /v1/payment/{payment_id}                   payment status / confirmation
  *   Payouts
+ *     POST /v1/payout                                create a payout batch
+ *     POST /v1/payout/verify                         2FA confirmation, without which the
+ *                                                     batch is created but never sent
  *     POST /v1/payout/validate-address                authoritative address validation
  *     GET  /v1/payout/fee                             network fee estimate
  *     GET  /v1/payout-withdrawal/min-amount/{coin}    minimum payout for a coin
@@ -614,7 +617,7 @@ async function getPayoutMinimum(currency) {
  * `extraId` carries a destination tag or memo for the chains that route by one (XRP).
  * Sending an XRP address with no tag is a transfer that confirms and delivers nothing.
  */
-async function submitPayoutBatch(entries, { logger = console } = {}) {
+async function submitPayoutBatch(entries, { logger = console, ipnCallbackUrl = null } = {}) {
     if (!payoutsConfigured()) {
         throw new NowPaymentsError('NOWPayments payouts are not configured: NOWPAYMENTS_EMAIL and NOWPAYMENTS_PASSWORD are required.');
     }
@@ -633,6 +636,13 @@ async function submitPayoutBatch(entries, { logger = console } = {}) {
             return record;
         })
     };
+
+    // Sent per batch rather than left to the dashboard setting, because the two can disagree
+    // and only one of them is visible from here. A batch created with a callback pointing at a
+    // host that cannot reach the app leaves every payout in `processing` with no way to learn
+    // it finished; `reconcilePayouts` covers that by polling, but the callback is the only
+    // thing that resolves a payout in real time.
+    if (ipnCallbackUrl) body.ipn_callback_url = String(ipnCallbackUrl);
 
     const result = await request('POST', '/v1/payout', { body, timeoutMs: 30000 });
 
@@ -688,6 +698,137 @@ async function getPayoutBatch(batchId) {
         if (error instanceof NowPaymentsError && error.status === 404) return { notFound: true };
         return null;
     }
+}
+
+
+// ---------------------------------------------------------------------------
+// Payout 2FA
+// ---------------------------------------------------------------------------
+
+/**
+ * The Base32 alphabet, and decoding a shared secret into the raw bytes a TOTP is computed from.
+ *
+ * Base32 is what authenticator apps show and store, and it is not Node's default encoding.
+ * The alphabet is stripped of padding and case-folded so a secret copied out of a dashboard
+ * with a trailing `=` or in lowercase still works -- those are the two ways a correct secret
+ * gets pasted wrong, and failing on them would look like a 2FA rejection from the provider.
+ */
+const BASE32_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+
+function base32ToBuffer(secret) {
+    const cleaned = String(secret || '').toUpperCase().replace(/=+$/, '').replace(/\s+/g, '');
+    if (!cleaned) return null;
+
+    let bits = 0;
+    let value = 0;
+    const bytes = [];
+    for (const character of cleaned) {
+        const index = BASE32_ALPHABET.indexOf(character);
+        if (index === -1) return null;
+        value = (value << 5) | index;
+        bits += 5;
+        if (bits >= 8) {
+            bits -= 8;
+            bytes.push((value >>> bits) & 0xff);
+        }
+    }
+    return bytes.length > 0 ? Buffer.from(bytes) : null;
+}
+
+/**
+ * Generates the current 6-digit TOTP for a shared secret, per RFC 6238.
+ *
+ * Implemented here rather than with a library because it is a fixed, twenty-line algorithm
+ * with published test vectors, and the TOTP package's API changed shape between its v12 and
+ * v13 majors. A dependency that must be re-read on every upgrade to confirm how to call it
+ * is a worse trade than the code it would replace; `test/nowpayments.test.js` checks this
+ * against the RFC's own vectors.
+ *
+ * `epochSeconds` is a parameter so the test can pin the counter. Left to the clock, the
+ * function is untestable at any interesting instant: it is correct for exactly one 30-second
+ * window and changes on its own.
+ */
+function generateTotp(secret, { digits = 6, epochSeconds = Math.floor(Date.now() / 1000), period = 30 } = {}) {
+    const key = base32ToBuffer(secret);
+    if (!key) return null;
+
+    // The counter is the number of whole periods since the Unix epoch, as a big-endian
+    // 64-bit integer. `writeBigUInt64BE` is used rather than arithmetic because a counter
+    // expressed in 8 bytes is what the HMAC is defined over, and building it by shifting in
+    // JavaScript numbers would be limited to 32 bits of range.
+    const counter = writeCounter(epochSeconds, period);
+    const digest = createHmac('sha1', key).update(counter).digest();
+
+    // Dynamic truncation, RFC 4226 section 5.3. The low nibble of the last byte selects the
+    // offset of the 4-byte window, and the top bit is masked off so the result is a
+    // non-negative 31-bit integer.
+    const offset = digest[digest.length - 1] & 0x0f;
+    const binary =
+        ((digest[offset] & 0x7f) << 24) |
+        ((digest[offset + 1] & 0xff) << 16) |
+        ((digest[offset + 2] & 0xff) << 8) |
+        (digest[offset + 3] & 0xff);
+
+    return String(binary % 10 ** digits).padStart(digits, '0');
+}
+
+/** The 8-byte big-endian TOTP counter for a point in time. */
+function writeCounter(epochSeconds, period) {
+    const buffer = Buffer.alloc(8);
+    buffer.writeBigUInt64BE(BigInt(Math.floor(epochSeconds / period)));
+    return buffer;
+}
+
+/**
+ * Whether automatic 2FA is possible.
+ *
+ * Without a TOTP secret the payout can be *created* but never *sent*: the provider holds the
+ * batch until a verification code arrives, and the only way to produce one is an interactive
+ * email code. That is why this is reported by `preflight` rather than discovered when a
+ * withdrawal quietly stops completing.
+ */
+function twoFactorConfigured() {
+    return Boolean(String(process.env.NOWPAYMENTS_2FA_SECRET || '').trim());
+}
+
+/**
+ * Confirms a created batch so the provider actually releases it.
+ *
+ * This is the step that makes a payout automatic. `POST /v1/payout` only *creates* a batch:
+ * the funds stay in the custody balance and nothing is sent until the batch is verified with
+ * a 2FA code. A batch that is created and never verified is not a payout that failed -- it is
+ * a payout that does not exist yet, which is why skipping this call produces a withdrawal that
+ * sits in `processing` forever with no error anywhere.
+ *
+ * A fresh token is fetched rather than reusing the cached one. The create call may already
+ * have consumed most of the token's five-minute life, and a verify that fails on an expired
+ * token would be reported as a rejected 2FA code, which sends the operator looking in exactly
+ * the wrong place.
+ */
+async function verifyPayoutBatch(batchId, { verificationCode, logger = console } = {}) {
+    const batch = String(batchId || '').trim();
+    if (!batch) {
+        throw new NowPaymentsError('Cannot verify a payout batch with no batch id.');
+    }
+    if (!twoFactorConfigured()) {
+        throw new NowPaymentsError(
+            'NOWPAYMENTS_2FA_SECRET is not set, so the batch cannot be verified and the payout will not be sent.'
+        );
+    }
+
+    const code = String(verificationCode || '').trim() || generateTotp(process.env.NOWPAYMENTS_2FA_SECRET);
+    if (!code) {
+        throw new NowPaymentsError('Could not generate a NOWPayments 2FA code from the configured secret.');
+    }
+
+    await request('POST', '/v1/payout/verify', {
+        authToken: await getAuthToken(),
+        body: { batch_withdrawal_id: batch, verification_code: code },
+        timeoutMs: 20000
+    });
+
+    logger.log(`Verified NOWPayments payout batch ${batch}; it is now released for sending.`);
+    return { batchId: batch, verified: true };
 }
 
 
@@ -763,6 +904,8 @@ module.exports = {
     payoutsConfigured,
     getAuthToken,
     resetAuthTokenCache,
+    twoFactorConfigured,
+    generateTotp,
 
     getSupportedCurrencies,
     getCurrencyLimits,
@@ -777,6 +920,7 @@ module.exports = {
     getPayoutFee,
     getPayoutMinimum,
     submitPayoutBatch,
+    verifyPayoutBatch,
     getPayoutBatch,
 
     sortKeysDeep,

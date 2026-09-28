@@ -335,3 +335,164 @@ test('an unrecognised currency window yields no maximum rather than a wrong one'
     }
 });
 
+test('the TOTP generator matches the RFC 6238 test vectors', () => {
+    // RFC 6238 publishes these for the ASCII secret "12345678901234567890", which is
+    // "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ" in Base32 -- the form a dashboard actually shows.
+    // Checking against the published vectors is the only way to know the implementation is
+    // right: a code that is merely self-consistent still produces codes the provider rejects,
+    // and the symptom is a payout that silently never gets released.
+    const secret = 'GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ';
+    const vectors = [
+        [59, '94287082'],
+        [1111111109, '07081804'],
+        [1111111111, '14050471'],
+        [1234567890, '89005924'],
+        [2000000000, '69279037'],
+        [20000000000, '65353130']
+    ];
+    for (const [epochSeconds, expected] of vectors) {
+        assert.equal(
+            nowPayments.generateTotp(secret, { digits: 8, epochSeconds }),
+            expected,
+            `TOTP for t=${epochSeconds}`
+        );
+    }
+
+    // The provider wants six digits, and a short one must be left-padded: a five-digit code
+    // is rejected outright rather than accepted as a shorter number.
+    const code = nowPayments.generateTotp(secret, { epochSeconds: 59 });
+    assert.match(code, /^\d{6}$/);
+
+    // The whole code space is reachable, including the low values that only appear if the
+    // counter and the modulo are right. A TOTP stuck on a narrow band would still pass a
+    // single vector comparison and be wrong most of the time.
+    const seen = new Set();
+    for (let step = 0; step < 200; step += 1) {
+        seen.add(nowPayments.generateTotp(secret, { epochSeconds: 1000 + step * 30 }));
+    }
+    assert.equal(seen.size, 200, 'each 30s period must produce its own code');
+});
+
+test('a secret pasted with padding, lowercase, or spaces still works', () => {
+    // These are the ways a correct Base32 secret gets pasted wrong, and each of them is
+    // invisible in a dashboard screenshot. Failing on them would look exactly like the
+    // provider rejecting a valid code.
+    const secret = 'JBSWY3DPEHPK3PXP';
+    const options = { epochSeconds: 1111111109 };
+    const expected = nowPayments.generateTotp(secret, options);
+    assert.equal(nowPayments.generateTotp('jbswy3dpehpk3pxp', options), expected);
+    assert.equal(nowPayments.generateTotp('JBSW Y3DP EHPK 3PXP', options), expected);
+
+    // Anything outside the alphabet is refused rather than silently mis-decoded. A secret read
+    // with a character dropped would produce a valid-looking code that the provider rejects.
+    assert.equal(nowPayments.generateTotp('JBSWY3DP1EHPK3PXP', options), null);
+    assert.equal(nowPayments.generateTotp('', options), null);
+    assert.equal(nowPayments.generateTotp(undefined, options), null);
+});
+
+/** Stubs a payout flow: `/v1/auth` then whichever endpoint the caller exercises. */
+async function withPayoutFetch(run, { verifyStatus = 200, payoutBody = { batch_withdrawal_id: 'batch-1' } } = {}) {
+    const priorApiKey = process.env.NOWPAYMENTS_API_KEY;
+    const priorEmail = process.env.NOWPAYMENTS_EMAIL;
+    const priorPassword = process.env.NOWPAYMENTS_PASSWORD;
+    const priorTwoFactor = process.env.NOWPAYMENTS_2FA_SECRET;
+    const originalFetch = global.fetch;
+    const seen = [];
+
+    process.env.NOWPAYMENTS_API_KEY = 'test-unit-key';
+    process.env.NOWPAYMENTS_EMAIL = 'ops@example.test';
+    process.env.NOWPAYMENTS_PASSWORD = 'account-password';
+    process.env.NOWPAYMENTS_2FA_SECRET = 'JBSWY3DPEHPK3PXP';
+    nowPayments.resetAuthTokenCache();
+
+    global.fetch = async (url, options) => {
+        const target = String(url);
+        const body = options?.body ? JSON.parse(options.body) : null;
+        seen.push({ url: target, body, headers: options?.headers || {} });
+
+        if (target.includes('/v1/auth')) {
+            return new Response(JSON.stringify({ token: 'jwt-token' }), {
+                status: 200, headers: { 'Content-Type': 'application/json' }
+            });
+        }
+        if (target.endsWith('/v1/payout/verify')) {
+            return new Response(JSON.stringify({ success: true }), {
+                status: verifyStatus, headers: { 'Content-Type': 'application/json' }
+            });
+        }
+        if (target.endsWith('/v1/payout')) {
+            return new Response(JSON.stringify(payoutBody), {
+                status: 200, headers: { 'Content-Type': 'application/json' }
+            });
+        }
+        return originalFetch(url, options);
+    };
+
+    try {
+        return { result: await run(seen), seen };
+    } finally {
+        global.fetch = originalFetch;
+        nowPayments.resetAuthTokenCache();
+        if (priorApiKey === undefined) delete process.env.NOWPAYMENTS_API_KEY;
+        else process.env.NOWPAYMENTS_API_KEY = priorApiKey;
+        if (priorEmail === undefined) delete process.env.NOWPAYMENTS_EMAIL;
+        else process.env.NOWPAYMENTS_EMAIL = priorEmail;
+        if (priorPassword === undefined) delete process.env.NOWPAYMENTS_PASSWORD;
+        else process.env.NOWPAYMENTS_PASSWORD = priorPassword;
+        if (priorTwoFactor === undefined) delete process.env.NOWPAYMENTS_2FA_SECRET;
+        else process.env.NOWPAYMENTS_2FA_SECRET = priorTwoFactor;
+    }
+}
+
+test('verifying a batch posts the batch id and a six-digit code, and is refused without a secret', async () => {
+    const { seen } = await withPayoutFetch(
+        async () => nowPayments.verifyPayoutBatch('batch-1', { logger: { log() {} } })
+    );
+
+    const auth = seen.find((call) => call.url.includes('/v1/auth'));
+    assert.ok(auth, 'payout endpoints need a JWT, which comes from the account credentials');
+    assert.equal(auth.body.email, 'ops@example.test');
+
+    const verify = seen.find((call) => call.url.endsWith('/v1/payout/verify'));
+    assert.ok(verify, 'the verify endpoint was not called');
+    // The id must be the one that was created, or the confirmation applies to nothing.
+    assert.equal(verify.body.batch_withdrawal_id, 'batch-1');
+    assert.match(verify.body.verification_code, /^\d{6}$/);
+    assert.equal(verify.headers.Authorization, 'Bearer jwt-token');
+
+    // Without a secret there is no code to generate, and the call must not be attempted: an
+    // empty code would be rejected by the provider and reported as a bad 2FA code, sending
+    // the operator to debug the wrong thing.
+    await withPayoutFetch(async () => {
+        delete process.env.NOWPAYMENTS_2FA_SECRET;
+        assert.equal(nowPayments.twoFactorConfigured(), false);
+        await assert.rejects(
+            () => nowPayments.verifyPayoutBatch('batch-1'),
+            /NOWPAYMENTS_2FA_SECRET/
+        );
+    });
+});
+
+test('a batch carries the callback URL, so a finished payout is noticed', async () => {
+    const entries = [{ payoutId: 'wd-5', address: 'bc1qexample', currency: 'btc', amount: 0.001 }];
+
+    const { seen } = await withPayoutFetch(() => nowPayments.submitPayoutBatch(entries, {
+        ipnCallbackUrl: 'https://example.test/api/payments/nowpayments/ipn',
+        logger: { log() {} }
+    }));
+
+    const create = seen.find((call) => call.url.endsWith('/v1/payout'));
+    assert.ok(create);
+    assert.equal(create.body.ipn_callback_url, 'https://example.test/api/payments/nowpayments/ipn');
+    assert.deepEqual(create.body.withdrawals[0].payoutId, 'wd-5');
+    assert.equal(create.body.withdrawals[0].currency, 'btc');
+
+    // Left to the dashboard setting when the caller has no usable origin, so a batch is never
+    // pointed at a host that cannot receive it.
+    const without = await withPayoutFetch(() => nowPayments.submitPayoutBatch(entries, {
+        logger: { log() {} }
+    }));
+    const noCallback = without.seen.find((call) => call.url.endsWith('/v1/payout'));
+    assert.equal('ipn_callback_url' in noCallback.body, false);
+});
+

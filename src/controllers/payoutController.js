@@ -14,6 +14,7 @@ const {
     distinctProviderCoins,
 } = require('../services/payoutOptions');
 const nowPayments = require('../services/nowPayments');
+const autoPayouts = require('../services/autoPayouts');
 
 // ---------------------------------------------------------------------------
 // Schema prerequisite
@@ -529,9 +530,35 @@ async function requestWithdrawal(req, res) {
 
         await client.query('COMMIT');
 
+        // The withdrawal is now real and the balance is debited, so the payout is attempted
+        // from here rather than waiting for a scheduled run: the user asked to be paid, and
+        // the point of automatic payouts is that nobody has to notice their request afterwards.
+        //
+        // This runs after the commit and cannot fail the request. A provider outage here
+        // leaves the withdrawal `pending` in the queue for the batch run or an operator,
+        // which is where it would have been anyway. Failing the response instead would be
+        // actively harmful: the user would retry, and the retry is a second withdrawal.
+        let automaticPayout = null;
+        if (paymentMethod === 'crypto') {
+            try {
+                const outcome = await autoPayouts.dispatchPayoutForWithdrawal({
+                    withdrawalId,
+                    convertToCoin: autoPayouts.usdToCoin
+                });
+                if (outcome.attempted) automaticPayout = outcome;
+            } catch (error) {
+                console.error(`Automatic payout for withdrawal ${withdrawalId} did not complete:`, error.message);
+            }
+        }
+
         return res.status(200).json({
-            message: 'Withdrawal request queued for review. Funds have not been sent yet.',
+            message: automaticPayout?.verified
+                ? 'Withdrawal sent. It will be confirmed on-chain shortly.'
+                : 'Withdrawal request queued for review. Funds have not been sent yet.',
             withdrawalId,
+            ...(automaticPayout
+                ? { payout: { batchId: automaticPayout.batchId, sent: automaticPayout.verified } }
+                : {}),
         });
     } catch (error) {
         if (client) await client.query('ROLLBACK').catch(() => {});

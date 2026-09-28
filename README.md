@@ -97,8 +97,12 @@ with `contentSecurityPolicy: false`, and with `frameguard: false`:
 | `NOWPAYMENTS_API_BASE_URL` | optional | Defaults to `https://api.nowpayments.io`. |
 | `NOWPAYMENTS_FIXED_RATE`, `NOWPAYMENTS_FEE_PAID_BY_USER` | optional | `POST /v1/payment` options. Default `false`. |
 | `NOWPAYMENTS_EMAIL`, `NOWPAYMENTS_PASSWORD` | for crypto payouts | JWT for the payout endpoints. Case-sensitive. |
+| `NOWPAYMENTS_2FA_SECRET` | for crypto payouts | Base32 TOTP secret. Without it a batch is created but never verified, so the payout is never sent. |
 | `NOWPAYMENTS_AUTO_PAYOUTS` | optional | `true` sends eligible **crypto** withdrawals automatically. Unset means off. See [Automatic crypto payouts](#automatic-crypto-payouts). |
-| `RESEND_API_KEY`, `EMAIL_FROM` | for reset email | Sends password reset messages. |
+| `BREVO_API_KEY`, `EMAIL_FROM` | for signup and reset email | Default provider. Brevo needs no domain of your own. `EMAIL_FROM` must be a sender registered in Brevo. |
+| `RESEND_API_KEY` | optional | Only if `EMAIL_PROVIDER=resend`, and only once you have verified a custom domain — Resend will not send to anyone but the account owner until then. |
+| `EMAIL_PROVIDER` | optional | `brevo` (default) or `resend`. Inferred from whichever key is set if unset. |
+| `EMAIL_FROM_NAME` | optional | Display name on outgoing mail. Defaults to `RewardZone`. |
 | `CORS_ORIGIN` | optional | Comma-separated extra browser origins. |
 | `TRUST_PROXY` | optional | Defaults to `true` on Vercel; set `false` to disable. |
 | `TRACKING_CLICK_PARAM` | optional | Click ID parameter sent to advertisers (default `aff_sub`). |

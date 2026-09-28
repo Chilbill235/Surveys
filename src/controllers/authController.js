@@ -4,6 +4,7 @@ const jwt = require('jsonwebtoken');
 const pool = require('../config/db');
 const { consumeRateLimit } = require('../services/security');
 const { sendPasswordResetEmail } = require('../services/resetEmail');
+const mailer = require('../services/mailer');
 const {
     generateCode,
     hashCode,
@@ -29,9 +30,10 @@ const VERIFICATION_FAILED_MESSAGE =
     'That code is not valid. Check the newest email, or request a new code.';
 
 /** New codes per address per window. Enough for a real person, not enough to bury an inbox. */
-const RESEND_LIMIT_PER_ADDRESS = 3;
-const RESEND_LIMIT_PER_IP = 10;
-const RESEND_WINDOW_SECONDS = 15 * 60;
+/** How many times one address may ask for a fresh code, and how often. */
+const RESEND_CODE_LIMIT_PER_ADDRESS = 3;
+const RESEND_CODE_LIMIT_PER_IP = 10;
+const RESEND_CODE_WINDOW_SECONDS = 15 * 60;
 
 /**
  * Whether email can be sent at all.
@@ -39,9 +41,12 @@ const RESEND_WINDOW_SECONDS = 15 * 60;
  * Checked before an account is created rather than after, because a deployment without this
  * cannot confirm anyone: registration would "succeed", the user would wait for a code that
  * never came, and the account they just made would be permanently unusable.
+ *
+ * Read from the shared mailer rather than from a provider key here, so the check follows
+ * whichever provider is configured instead of hard-coding one that may no longer be in use.
  */
 function isEmailConfigured() {
-    return Boolean(process.env.RESEND_API_KEY && process.env.EMAIL_FROM);
+    return mailer.isEmailConfigured();
 }
 
 // ---------------------------------------------------------------------------
@@ -327,9 +332,9 @@ const authController = {
         }
         if (!emailReady) {
             console.warn(
-                'RESEND_API_KEY / EMAIL_FROM are not set: new accounts are being accepted ' +
-                'without email confirmation. This is a development convenience and is refused ' +
-                'in production.'
+                'No email provider is configured: new accounts are being accepted without email ' +
+                'confirmation. Set BREVO_API_KEY (or RESEND_API_KEY) and EMAIL_FROM. This is a ' +
+                'development convenience and is refused in production.'
             );
         }
 
@@ -512,13 +517,13 @@ const authController = {
         const [perAddress, perIp] = await Promise.all([
             consumeRateLimit({
                 bucket: `verify-email:${email}`,
-                maxAttempts: RESEND_LIMIT_PER_ADDRESS,
-                windowSeconds: RESEND_WINDOW_SECONDS
+                maxAttempts: RESEND_CODE_LIMIT_PER_ADDRESS,
+                windowSeconds: RESEND_CODE_WINDOW_SECONDS
             }),
             consumeRateLimit({
                 bucket: `verify-email:ip:${ip}`,
-                maxAttempts: RESEND_LIMIT_PER_IP,
-                windowSeconds: RESEND_WINDOW_SECONDS
+                maxAttempts: RESEND_CODE_LIMIT_PER_IP,
+                windowSeconds: RESEND_CODE_WINDOW_SECONDS
             })
         ]);
         if (!perAddress.allowed || !perIp.allowed) {
@@ -558,7 +563,7 @@ const authController = {
                 message: 'If that address needs confirming, a new code is on its way.'
             });
         } catch (error) {
-            console.error('Resend verification Error:', error.message);
+            console.error('Could not issue a new verification code:', error.message);
             if (isDatabaseUnreachable(error)) {
                 return res.status(503).json({ error: 'This service is temporarily unavailable.' });
             }

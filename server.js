@@ -28,6 +28,7 @@ require('dotenv').config();
 })();
 
 const { resolvePublicBaseUrl, isPubliclyReachable, defaultPort } = require('./src/services/publicBaseUrl');
+const { emailConfiguration } = require('./src/services/mailer');
 
 const isProduction = process.env.NODE_ENV === 'production';
 
@@ -82,8 +83,13 @@ function validateRuntimeConfiguration() {
         if (!process.env.PROXYCHECK_KEY) {
             console.warn('Warning: PROXYCHECK_KEY is not set, so VPN/proxy checks are skipped.');
         }
-        if (!process.env.RESEND_API_KEY || !process.env.EMAIL_FROM) {
-            console.warn('Warning: RESEND_API_KEY and EMAIL_FROM are not set, so password reset emails cannot be delivered.');
+        const mail = emailConfiguration();
+        if (!mail.configured) {
+            console.warn(
+                `Warning: no email provider is fully configured (provider: ${mail.provider || 'none'}, ` +
+                'sender: ' + (mail.sender || 'unset') + '), so signup confirmation and password reset ' +
+                'emails cannot be delivered. Set BREVO_API_KEY and EMAIL_FROM.'
+            );
         }
         const hasStripe = Boolean(process.env.STRIPE_SECRET_KEY && process.env.STRIPE_WEBHOOK_SECRET);
         const hasNowPayments = Boolean(process.env.NOWPAYMENTS_API_KEY && process.env.NOWPAYMENTS_IPN_SECRET);

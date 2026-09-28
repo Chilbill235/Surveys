@@ -150,6 +150,15 @@ async function withRecordedDatabase(run, { candidates = [] } = {}) {
         if (String(query).includes('FOR UPDATE SKIP LOCKED')) {
             return { rows: candidates, rowCount: candidates.length };
         }
+        // The claim is an `UPDATE ... RETURNING`, and its result is what tells the caller it
+        // won the row. Without this every claim looks lost, which silently turns "the payout
+        // was sent" assertions into "nothing was claimed" ones.
+        if (String(query).includes("payout_status = 'CREATING'") && String(query).includes('RETURNING')) {
+            const row = candidates[0]
+                ? [{ id: candidates[0].id, payout_address: candidates[0].payment_address, payout_currency: null, payout_coin_amount: null, payout_fee_coin: null }]
+                : [];
+            return { rows: row, rowCount: row.length };
+        }
         return { rows: [], rowCount: 0 };
     };
 
@@ -271,5 +280,274 @@ test('a refused submission releases the claim, and an unknown one holds it', asy
         assert.equal(wroteValue(held.statements, 'pending'), false);
     } finally {
         nowPayments.submitPayoutBatch = originalSubmit;
+    }
+});
+
+/**
+ * The batch is created but not sent until it is verified.
+ *
+ * This is the step whose absence produces no error at all: the provider accepts the batch,
+ * holds it, and waits. So these assert the call is made, and that a verification that fails
+ * is treated by the same determinate/unknown rule as the submission itself.
+ */
+test('a created batch is verified, because a batch that is not verified is never sent', async () => {
+    const claimed = [{ id: 5, payoutId: 'wd-5', address: 'bc1qexample', currency: 'btc', amount: 0.001 }];
+    const originalSubmit = nowPayments.submitPayoutBatch;
+    const originalVerify = nowPayments.verifyPayoutBatch;
+    const verified = [];
+    try {
+        nowPayments.submitPayoutBatch = async () => ({
+            batchId: 'batch-1',
+            withdrawals: [{ payoutId: 'wd-5', providerWithdrawalId: 'p-1', status: 'WAITING' }]
+        });
+        nowPayments.verifyPayoutBatch = async (batchId) => {
+            verified.push(batchId);
+            return { batchId, verified: true };
+        };
+
+        const { result } = await withRecordedDatabase(() => autoPayouts.submitClaimedPayouts(claimed));
+
+        // The exact id the provider returned, not a fresh one: verifying an id that was never
+        // submitted would confirm nothing while appearing to succeed.
+        assert.deepEqual(verified, ['batch-1']);
+        assert.equal(result.verified, true);
+        assert.equal(result.uncertain, 0);
+        assert.equal(result.released, 0);
+    } finally {
+        nowPayments.submitPayoutBatch = originalSubmit;
+        nowPayments.verifyPayoutBatch = originalVerify;
+    }
+});
+
+test('a refused verification releases the claim, and an undetermined one holds it', async () => {
+    const claimed = [{ id: 5, payoutId: 'wd-5', address: 'bc1qexample', currency: 'btc', amount: 0.001 }];
+    const originalSubmit = nowPayments.submitPayoutBatch;
+    const originalVerify = nowPayments.verifyPayoutBatch;
+    try {
+        nowPayments.submitPayoutBatch = async () => ({
+            batchId: 'batch-1',
+            withdrawals: [{ payoutId: 'wd-5', providerWithdrawalId: 'p-1', status: 'WAITING' }]
+        });
+
+        // A 4xx from verify means the batch was not released, so no funds moved and the row can
+        // go back for an operator.
+        nowPayments.verifyPayoutBatch = async () => {
+            throw new nowPayments.NowPaymentsError('bad code', { status: 400 });
+        };
+        const released = await withRecordedDatabase(() => autoPayouts.submitClaimedPayouts(claimed));
+        assert.equal(released.result.verified, false);
+        assert.equal(released.result.uncertain, 0);
+        assert.equal(
+            matching(released.statements, "SET status = 'pending'").length,
+            1,
+            'a provably-unverified batch must be released back for manual handling'
+        );
+
+        // A timeout on verify is the dangerous case: the batch may have been released, and
+        // releasing the row would let it be paid a second time.
+        nowPayments.verifyPayoutBatch = async () => {
+            throw new Error('socket hang up');
+        };
+        const held = await withRecordedDatabase(() => autoPayouts.submitClaimedPayouts(claimed));
+        assert.equal(held.result.uncertain, 1);
+        assert.equal(
+            matching(held.statements, "SET status = 'pending'").length,
+            0,
+            'an undetermined verification must never be released for a resend'
+        );
+        assert.equal(wroteValue(held.statements, 'VERIFY_UNKNOWN'), true);
+    } finally {
+        nowPayments.submitPayoutBatch = originalSubmit;
+        nowPayments.verifyPayoutBatch = originalVerify;
+    }
+});
+
+test('a claim is still releasable after the provider status was recorded', async () => {
+    // Regression guard for an ordering mistake: verification happens after the per-item status
+    // is written, so a release gated on `payout_status = 'CREATING'` would match no rows at
+    // all. The claim would then be stranded in `processing` with nothing in the logs, which is
+    // the exact state the release path exists to prevent.
+    const claimed = [{ id: 5, payoutId: 'wd-5', address: 'bc1qexample', currency: 'btc', amount: 0.001 }];
+    const originalSubmit = nowPayments.submitPayoutBatch;
+    const originalVerify = nowPayments.verifyPayoutBatch;
+    try {
+        nowPayments.submitPayoutBatch = async () => ({
+            batchId: 'batch-1',
+            // 'WAITING' is a real status, so `recordSubmission` overwrites 'CREATING' with it
+            // before verification runs.
+            withdrawals: [{ payoutId: 'wd-5', providerWithdrawalId: 'p-1', status: 'WAITING' }]
+        });
+        nowPayments.verifyPayoutBatch = async () => {
+            throw new nowPayments.NowPaymentsError('bad code', { status: 400 });
+        };
+
+        const { statements } = await withRecordedDatabase(() => autoPayouts.submitClaimedPayouts(claimed));
+
+        assert.equal(wroteValue(statements, 'WAITING'), true, 'the provider status must be recorded');
+        const release = matching(statements, "SET status = 'pending'");
+        assert.equal(release.length, 1, 'the release must still match after the status changed');
+        // Ownership is asserted on the id, and only a final state is protected.
+        assert.match(release[0].sql, /WHERE id = \$2/);
+        assert.match(release[0].sql, /NOT IN \('FINISHED', 'REJECTED', 'REJECTED_NOT_CHECKED'\)/);
+    } finally {
+        nowPayments.submitPayoutBatch = originalSubmit;
+        nowPayments.verifyPayoutBatch = originalVerify;
+    }
+});
+
+test('a batch that is never verified is not a completed payout', async () => {
+    // With no batch id there is nothing to verify, so nothing was sent. The rows are reported
+    // as uncertain rather than submitted, because their fate is genuinely unknown.
+    const claimed = [{ id: 5, payoutId: 'wd-5', address: 'bc1qexample', currency: 'btc', amount: 0.001 }];
+    const originalSubmit = nowPayments.submitPayoutBatch;
+    const originalVerify = nowPayments.verifyPayoutBatch;
+    let verifyCalls = 0;
+    try {
+        nowPayments.submitPayoutBatch = async () => ({
+            batchId: null,
+            withdrawals: [{ payoutId: 'wd-5', providerWithdrawalId: null, status: null }]
+        });
+        nowPayments.verifyPayoutBatch = async () => {
+            verifyCalls += 1;
+            return { verified: true };
+        };
+
+        const { result } = await withRecordedDatabase(() => autoPayouts.submitClaimedPayouts(claimed));
+        assert.equal(verifyCalls, 0, 'there is no id to verify');
+        assert.equal(result.verified, false);
+        assert.equal(result.uncertain, 1);
+    } finally {
+        nowPayments.submitPayoutBatch = originalSubmit;
+        nowPayments.verifyPayoutBatch = originalVerify;
+    }
+});
+
+test('preflight names the missing 2FA secret, which is the one that fails silently', () => {
+    const priorAuto = process.env.NOWPAYMENTS_AUTO_PAYOUTS;
+    const priorIpn = process.env.NOWPAYMENTS_IPN_SECRET;
+    const priorTwoFactor = process.env.NOWPAYMENTS_2FA_SECRET;
+    try {
+        process.env.NOWPAYMENTS_AUTO_PAYOUTS = 'true';
+        process.env.NOWPAYMENTS_IPN_SECRET = 'ipn-secret';
+        delete process.env.NOWPAYMENTS_2FA_SECRET;
+
+        const check = autoPayouts.preflight();
+        assert.equal(check.ready, false);
+        const reason = check.reasons.find((entry) => entry.code === 'two-factor');
+        assert.ok(reason, 'a missing TOTP secret must be reported');
+        // Every other missing setting fails loudly. This one lets the batch be created without
+        // error and simply never be sent, so the message has to say what actually happens.
+        assert.match(reason.detail, /never verified/);
+
+        // Setting it is what makes the deployment ready.
+        process.env.NOWPAYMENTS_2FA_SECRET = 'JBSWY3DPEHPK3PXP';
+        assert.equal(
+            autoPayouts.preflight().reasons.some((entry) => entry.code === 'two-factor'),
+            false
+        );
+    } finally {
+        if (priorAuto === undefined) delete process.env.NOWPAYMENTS_AUTO_PAYOUTS;
+        else process.env.NOWPAYMENTS_AUTO_PAYOUTS = priorAuto;
+        if (priorIpn === undefined) delete process.env.NOWPAYMENTS_IPN_SECRET;
+        else process.env.NOWPAYMENTS_IPN_SECRET = priorIpn;
+        if (priorTwoFactor === undefined) delete process.env.NOWPAYMENTS_2FA_SECRET;
+        else process.env.NOWPAYMENTS_2FA_SECRET = priorTwoFactor;
+    }
+});
+
+/**
+ * The trigger that makes a payout automatic: the withdrawal request sends it.
+ *
+ * The claim is the property that matters. Being triggered from a request must not be a way to
+ * skip the guard, or a double-clicked button would pay a user twice.
+ */
+test('a new withdrawal is dispatched immediately, and only while automatic payouts are on', async () => {
+    const priorAuto = process.env.NOWPAYMENTS_AUTO_PAYOUTS;
+    const originalSubmit = nowPayments.submitPayoutBatch;
+    const originalVerify = nowPayments.verifyPayoutBatch;
+    const cryptoRow = {
+        id: 9, user_id: 1, amount: '20.00', payment_method: 'crypto',
+        payment_address: 'bc1qexample', asset_code: 'BTC', network: 'bitcoin',
+        destination_tag: null, status: 'pending'
+    };
+    const convertToCoin = async () => 0.002;
+
+    try {
+        let sends = 0;
+        nowPayments.submitPayoutBatch = async () => {
+            sends += 1;
+            return {
+                batchId: 'batch-9',
+                withdrawals: [{ payoutId: 'wd-9', providerWithdrawalId: 'p-9', status: 'WAITING' }]
+            };
+        };
+        nowPayments.verifyPayoutBatch = async () => ({ verified: true });
+
+        // Off by default: the withdrawal is recorded and left in the queue.
+        delete process.env.NOWPAYMENTS_AUTO_PAYOUTS;
+        const off = await withRecordedDatabase(
+            () => autoPayouts.dispatchPayoutForWithdrawal({ withdrawalId: 9, convertToCoin }),
+            { candidates: [cryptoRow] }
+        );
+        assert.equal(off.result.attempted, false);
+        assert.equal(sends, 0, 'nothing may be sent while automatic payouts are disabled');
+
+        // On: the same row is claimed and sent without an operator.
+        process.env.NOWPAYMENTS_AUTO_PAYOUTS = 'true';
+        const on = await withRecordedDatabase(
+            () => autoPayouts.dispatchPayoutForWithdrawal({ withdrawalId: 9, convertToCoin }),
+            { candidates: [cryptoRow] }
+        );
+        assert.equal(on.result.attempted, true);
+        assert.equal(on.result.verified, true);
+        assert.equal(on.result.batchId, 'batch-9');
+        assert.equal(sends, 1);
+
+        // The claim still requires a `pending` crypto row. A PayPal withdrawal, or one that
+        // was already claimed, is not something this path can send.
+        // Matched on the SET clause rather than on `payout_status = 'CREATING'`, which also
+        // appears in the WHERE of the statement that records the provider's reply -- so
+        // matching the bare phrase counts two statements and proves nothing.
+        const claim = matching(on.statements, "SET status = 'processing'");
+        assert.equal(claim.length, 1, 'exactly one claim, and exactly one send');
+        assert.match(claim[0].sql, /payout_status = 'CREATING'/);
+        assert.match(claim[0].sql, /WHERE id = \$5 AND status = 'pending' AND payout_status IS NULL/);
+        const targeted = matching(on.statements, 'FOR UPDATE SKIP LOCKED')[0];
+        assert.match(targeted.sql, /payment_method = 'crypto'/);
+        assert.match(targeted.sql, /WHERE id = \$1/);
+    } finally {
+        nowPayments.submitPayoutBatch = originalSubmit;
+        nowPayments.verifyPayoutBatch = originalVerify;
+        if (priorAuto === undefined) delete process.env.NOWPAYMENTS_AUTO_PAYOUTS;
+        else process.env.NOWPAYMENTS_AUTO_PAYOUTS = priorAuto;
+    }
+});
+
+test('a row that is no longer claimable is never sent by the request path', async () => {
+    const priorAuto = process.env.NOWPAYMENTS_AUTO_PAYOUTS;
+    const originalSubmit = nowPayments.submitPayoutBatch;
+    try {
+        process.env.NOWPAYMENTS_AUTO_PAYOUTS = 'true';
+        let sends = 0;
+        nowPayments.submitPayoutBatch = async () => {
+            sends += 1;
+            return { batchId: 'batch-9', withdrawals: [] };
+        };
+
+        // An empty candidate list is what a duplicate request or an already-claimed row sees.
+        const { result } = await withRecordedDatabase(
+            () => autoPayouts.dispatchPayoutForWithdrawal({
+                withdrawalId: 9,
+                convertToCoin: async () => 0.002
+            }),
+            { candidates: [] }
+        );
+
+        assert.equal(result.attempted, false);
+        assert.equal(sends, 0, 'a withdrawal that cannot be claimed must not be sent');
+    } finally {
+        nowPayments.submitPayoutBatch = originalSubmit;
+        if (priorAuto === undefined) delete process.env.NOWPAYMENTS_AUTO_PAYOUTS;
+        else process.env.NOWPAYMENTS_AUTO_PAYOUTS = priorAuto;
     }
 });

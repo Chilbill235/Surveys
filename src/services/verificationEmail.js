@@ -1,4 +1,5 @@
 const { createHash, randomInt, timingSafeEqual } = require('node:crypto');
+const { sendEmail, isEmailConfigured } = require('./mailer');
 
 /**
  * Six-digit email verification.
@@ -36,9 +37,6 @@ const CODE_LIFETIME_MINUTES = 15;
  * this the honest options are "ask for another code", which is cheap.
  */
 const MAX_ATTEMPTS = 5;
-
-/** The email is delivered through the same Resend endpoint as the password reset. */
-const RESEND_ENDPOINT = 'https://api.resend.com/emails';
 
 /** A fresh code, uniformly random over the whole range including leading zeros. */
 function generateCode() {
@@ -111,44 +109,19 @@ function buildMessage({ code, minutes = CODE_LIFETIME_MINUTES }) {
 /**
  * Sends a verification code.
  *
- * When Resend is not configured the code is logged rather than emailed, matching the reset
- * flow: local development can still complete the flow, and the operator sees a warning
- * instead of a silent failure.
+ * Delivery is delegated to the shared mailer, so the provider is chosen by configuration
+ * rather than baked in here. When no provider is configured the code is logged rather than
+ * emailed: local development can still complete the flow, and the operator sees a plain
+ * warning instead of a silent failure.
  */
 async function sendVerificationEmail({ to, code }) {
-    const apiKey = process.env.RESEND_API_KEY;
-    const from = process.env.EMAIL_FROM;
-    if (!apiKey || !from) {
+    if (!isEmailConfigured()) {
         console.error(`Email verification code (email is not configured, code only): ${code}`);
         return { sent: false, reason: 'email-not-configured' };
     }
 
     const { subject, text, html } = buildMessage({ code });
-
-    try {
-        const response = await fetch(RESEND_ENDPOINT, {
-            method: 'POST',
-            headers: {
-                Authorization: `Bearer ${apiKey}`,
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({ from, to: [to], subject, text, html }),
-            signal: AbortSignal.timeout(10000)
-        });
-
-        if (!response.ok) {
-            // The provider's own error body names the real problem -- an unverified sending
-            // domain, a rate limit -- and the operator needs it to fix the configuration.
-            const detail = await response.text().catch(() => '');
-            return {
-                sent: false,
-                reason: `email provider returned ${response.status}${detail ? `: ${detail.slice(0, 200)}` : ''}`
-            };
-        }
-        return { sent: true };
-    } catch (error) {
-        return { sent: false, reason: error.message };
-    }
+    return sendEmail({ to, subject, text, html });
 }
 
 module.exports = {

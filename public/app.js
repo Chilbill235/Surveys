@@ -1368,7 +1368,24 @@ async function loadDepositOptions() {
             option.textContent = range.length ? `${name} (${range.join(', ')})` : name;
             return option;
         }));
-        if (options.cryptoCurrencies.includes(previous)) currencySelect.value = previous;
+        if (options.cryptoCurrencies.includes(previous)) {
+            currencySelect.value = previous;
+        } else {
+            // Open on the coin the provider will accept the least of. The app advertises a
+            // $1.00 minimum, and that is only true in practice if the coin the form happens to
+            // start on can actually be funded for that little. Taking the provider's order
+            // made the first thing a depositor met a coin with a floor near $18.80, so the
+            // advertised minimum was unreachable without the user first having to work out
+            // which coins were cheap to start.
+            const cheapest = [...options.cryptoCurrencies].sort((a, b) => {
+                const floor = (code) => {
+                    const value = Number(options.minimums?.[code]);
+                    return Number.isFinite(value) && value > 0 ? value : Number.MAX_SAFE_INTEGER;
+                };
+                return floor(a) - floor(b);
+            })[0];
+            if (cheapest) currencySelect.value = cheapest;
+        }
 
         const amount = document.getElementById('deposit-amount');
         amount.min = String(minimumForSelectedCurrency());

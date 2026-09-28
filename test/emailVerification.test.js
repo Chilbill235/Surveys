@@ -32,6 +32,7 @@ let server;
 let origin;
 const priorEnvironment = process.env.NODE_ENV;
 const priorJwt = process.env.JWT_SECRET;
+const priorBrevo = process.env.BREVO_API_KEY;
 const priorResend = process.env.RESEND_API_KEY;
 const priorFrom = process.env.EMAIL_FROM;
 
@@ -181,7 +182,8 @@ before(async () => {
     process.env.JWT_SECRET = 'verification-test-secret';
     // Nothing is sent, but the endpoints are configured so the "no email configured" path
     // cannot be mistaken for a delivery failure.
-    process.env.RESEND_API_KEY = 'test-key';
+    process.env.BREVO_API_KEY = 'xkeysib-test-key';
+    delete process.env.RESEND_API_KEY;
     process.env.EMAIL_FROM = 'test@example.test';
 
     server = app.listen(0);
@@ -205,6 +207,8 @@ after(async () => {
     else process.env.NODE_ENV = priorEnvironment;
     if (priorJwt === undefined) delete process.env.JWT_SECRET;
     else process.env.JWT_SECRET = priorJwt;
+    if (priorBrevo === undefined) delete process.env.BREVO_API_KEY;
+    else process.env.BREVO_API_KEY = priorBrevo;
     if (priorResend === undefined) delete process.env.RESEND_API_KEY;
     else process.env.RESEND_API_KEY = priorResend;
     if (priorFrom === undefined) delete process.env.EMAIL_FROM;

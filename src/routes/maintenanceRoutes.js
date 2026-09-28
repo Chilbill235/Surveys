@@ -537,7 +537,7 @@ async function handlePayoutRun(req, res) {
 
     const { claimed, skipped } = await autoPayouts.claimPayoutCandidates({
         limit,
-        convertToCoin: usdToCoin
+        convertToCoin: autoPayouts.usdToCoin
     });
     const outcome = await autoPayouts.submitClaimedPayouts(claimed);
 
@@ -554,24 +554,6 @@ async function handlePayoutRun(req, res) {
         skipped,
         ...(outcome.error ? { error: outcome.error } : {})
     });
-}
-
-/**
- * USD to coin conversion for a payout, using the provider's own estimate.
- *
- * Done here rather than in the service so the conversion has one place to be swapped for a
- * test double. Returning null on failure is deliberate: a withdrawal that cannot be priced
- * is left for an operator rather than sent as a guessed amount.
- */
-async function usdToCoin(usdAmount, ticker) {
-    const amount = Number(usdAmount);
-    if (!Number.isFinite(amount) || amount <= 0) return null;
-    const estimate = await nowPayments.request('GET', '/v1/estimate', {
-        query: { amount: amount, currency_from: 'usd', currency_to: String(ticker).toLowerCase() },
-        timeoutMs: 10000
-    });
-    const coin = Number(estimate?.estimated_amount);
-    return Number.isFinite(coin) && coin > 0 ? coin : null;
 }
 
 /** The crypto withdrawals currently waiting to be sent, for the dry run. */

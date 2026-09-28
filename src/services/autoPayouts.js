@@ -1,6 +1,7 @@
 const pool = require('../config/db');
 const nowPayments = require('./nowPayments');
 const { sendWithdrawal, reverseWithdrawal } = require('./withdrawalResolution');
+const { resolvePublicBaseUrl } = require('./publicBaseUrl');
 
 /**
  * Automatic crypto payouts via the NOWPayments Mass Payouts API.
@@ -101,6 +102,15 @@ function preflight() {
             detail: 'NOWPAYMENTS_IPN_SECRET is required, otherwise finished payouts are never detected.'
         });
     }
+    if (!nowPayments.twoFactorConfigured()) {
+        // The one that fails silently. Every other missing setting stops a payout loudly;
+        // this one lets the batch be *created* without error and simply never be released, so
+        // the withdrawal sits in `processing` with nothing in the logs to explain it.
+        reasons.push({
+            code: 'two-factor',
+            detail: 'NOWPAYMENTS_2FA_SECRET (the Base32 TOTP secret) is required. Without it the batch is created but never verified, so the payout is never sent.'
+        });
+    }
 
     return {
         enabled: autoPayoutsEnabled(),
@@ -154,50 +164,10 @@ async function claimPayoutCandidates({ limit = 10, convertToCoin }) {
         const skipped = [];
 
         for (const row of candidates.rows) {
-            const ticker = payoutTicker(row.asset_code, row.network);
-            if (!ticker) {
-                skipped.push({ id: row.id, reason: `No payout ticker for ${row.asset_code}/${row.network}.` });
-                continue;
-            }
-
-            const coinAmount = await convertToCoin(row.amount, ticker);
-            if (!Number.isFinite(coinAmount) || coinAmount <= 0) {
-                // No conversion means no safe amount. Left unclaimed so an operator can see
-                // it rather than being silently consumed by a run.
-                skipped.push({ id: row.id, reason: `Could not price ${row.amount} in ${ticker.toUpperCase()}.` });
-                continue;
-            }
-
-            const fee = await nowPayments.getPayoutFee(ticker, coinAmount);
-
-            // The whole claim, in one statement, inside the caller's transaction.
-            const result = await client.query(
-                `UPDATE withdrawals
-                 SET status = 'processing',
-                     payout_status = 'CREATING',
-                     payout_claimed_at = NOW(),
-                     payout_address = $1,
-                     payout_currency = $2,
-                     payout_coin_amount = $3,
-                     payout_fee_coin = $4,
-                     updated_at = NOW()
-                 WHERE id = $5 AND status = 'pending' AND payout_status IS NULL
-                 RETURNING id, payout_address, payout_currency, payout_coin_amount, payout_fee_coin`,
-                [row.payment_address, ticker, coinAmount, fee, row.id]
-            );
-
-            if (result.rows.length === 0) continue;
-            claimed.push({
-                id: row.id,
-                // Derived from the withdrawal id rather than random, so a provider response
-                // and a later reconciliation pass both recompute the same key.
-                payoutId: `wd-${row.id}`,
-                address: row.payment_address,
-                currency: ticker,
-                amount: coinAmount,
-                fee,
-                extraId: row.destination_tag || null
-            });        }
+            const outcome = await claimOneRow(client, row, convertToCoin);
+            if (outcome.claimed) claimed.push(outcome.claimed);
+            else if (outcome.skipped) skipped.push(outcome.skipped);
+        }
 
         await client.query('COMMIT');
         return { claimed, skipped };
@@ -227,13 +197,13 @@ async function submitClaimedPayouts(claimed) {
 
     let response;
     try {
-        response = await nowPayments.submitPayoutBatch(claimed);
+        response = await nowPayments.submitPayoutBatch(claimed, { ipnCallbackUrl: payoutIpnCallbackUrl() });
     } catch (error) {
         const unknown = isUndetermined(error);
         await releaseOrHoldClaims(claimed, unknown ? 'SUBMISSION_UNKNOWN' : 'SUBMIT_FAILED', error.message);
         return {
             submitted: 0,
-            released: 0,
+            released: unknown ? 0 : claimed.length,
             batchId: null,
             uncertain: unknown ? claimed.length : 0,
             error: error.message
@@ -245,12 +215,61 @@ async function submitClaimedPayouts(claimed) {
         await recordSubmission(entry, batchId);
     }
 
+    // Creating a batch does not send it. The provider holds the batch until it is verified
+    // with a 2FA code, so without this call the withdrawal is stored, the batch exists, no
+    // money moves, and no error is raised anywhere -- the row simply sits in `processing`
+    // until an operator notices. This is the step that makes the payout automatic.
+    if (batchId === null) {
+        return {
+            submitted: response.withdrawals.length,
+            released: 0,
+            batchId: null,
+            verified: false,
+            uncertain: claimed.length
+        };
+    }
+
+    try {
+        await nowPayments.verifyPayoutBatch(batchId);
+    } catch (error) {
+        // A 4xx means the provider understood and refused, so the batch was not released and
+        // no funds moved: the rows can safely go back to `pending` for an operator. Anything
+        // else -- a timeout, a dropped connection, a 5xx -- leaves it unknown whether the
+        // batch was released, and releasing those rows is the one action that can pay a
+        // withdrawal twice. They stay claimed for reconciliation instead.
+        const unknown = isUndetermined(error);
+        await releaseOrHoldClaims(claimed, unknown ? 'VERIFY_UNKNOWN' : 'VERIFY_FAILED', error.message);
+        return {
+            submitted: response.withdrawals.length,
+            released: unknown ? 0 : claimed.length,
+            batchId,
+            verified: false,
+            uncertain: unknown ? claimed.length : 0,
+            error: error.message
+        };
+    }
+
     return {
         submitted: response.withdrawals.length,
         released: 0,
         batchId,
-        uncertain: batchId === null ? claimed.length : 0
+        verified: true,
+        uncertain: 0
     };
+}
+
+/**
+ * The URL the provider posts payout status updates to.
+ *
+ * The same endpoint as payments, because the incoming body is already classified into both
+ * shapes and either can arrive on the one URL. Returns null when the public origin is not
+ * usable, which leaves the provider's dashboard setting in charge rather than sending a
+ * callback to a host that cannot receive it.
+ */
+function payoutIpnCallbackUrl() {
+    const publicBaseUrl = resolvePublicBaseUrl();
+    if (!publicBaseUrl.ok) return null;
+    return new URL('/api/payments/nowpayments/ipn', publicBaseUrl.baseUrl).toString();
 }
 
 /**
@@ -306,34 +325,48 @@ function withdrawalIdFromPayoutId(payoutId) {
 /**
  * Releases a claim back to the operator queue, or parks it for inspection.
  *
- * `SUBMIT_FAILED` provably sent nothing, so the row goes back to `pending` and an operator
- * can send it manually. `SUBMISSION_UNKNOWN` leaves the row in `processing`: the balance is
- * still debited, the user is still waiting, and the batch may or may not exist. Releasing it
- * would let the next run send it a second time, and marking it failed would refund a user
- * whose money may already be moving. It stays claimed and visible until reconciliation says
- * what happened.
+ * `SUBMIT_FAILED` and `VERIFY_FAILED` provably sent nothing, so the row goes back to
+ * `pending` and an operator can send it manually. `SUBMISSION_UNKNOWN` and `VERIFY_UNKNOWN`
+ * leave the row in `processing`: the balance is still debited, the user is still waiting, and
+ * the batch may or may not exist. Releasing one of those would let the next run send it a
+ * second time, and marking it failed would refund a user whose money may already be moving.
+ * It stays claimed and visible until reconciliation says what happened.
+ *
+ * The ownership gate is the id, not the `CREATING` status. This used to require
+ * `payout_status = 'CREATING'`, which was correct while nothing wrote a status between the
+ * claim and this call. Verification now happens *after* the provider's per-item status has
+ * been recorded, so that condition no longer held and both updates silently matched zero
+ * rows -- leaving a row in `processing` with no explanation, which is the state this whole
+ * function exists to prevent. The rows still belong exclusively to this invocation because
+ * they came from the claim query; the status is now only checked to avoid clobbering a payout
+ * that has already reached a final state.
  */
+const UNRESOLVED_PAYOUT_STATES = "('FINISHED', 'REJECTED', 'REJECTED_NOT_CHECKED')";
+
 async function releaseOrHoldClaims(claimed, status, detail) {
     for (const entry of claimed) {
         const id = withdrawalIdFromPayoutId(entry.payoutId);
         if (id === null) continue;
 
-        if (status === 'SUBMIT_FAILED') {
+        if (status === 'SUBMIT_FAILED' || status === 'VERIFY_FAILED') {
             await pool.query(
                 `UPDATE withdrawals
                  SET status = 'pending', payout_status = NULL, payout_claimed_at = NULL,
                      payout_address = NULL, payout_currency = NULL,
                      payout_coin_amount = NULL, payout_fee_coin = NULL,
                      payout_error = $1, updated_at = NOW()
-                 WHERE id = $2 AND payout_status = 'CREATING' AND status = 'processing'`,
+                 WHERE id = $2
+                   AND status = 'processing'
+                   AND (payout_status IS NULL OR payout_status NOT IN ${UNRESOLVED_PAYOUT_STATES})`,
                 [String(detail || 'The provider refused the payout batch.').slice(0, 500), id]
             );
         } else {
             await pool.query(
                 `UPDATE withdrawals
                  SET payout_status = $1, payout_error = $2, updated_at = NOW()
-                 WHERE id = $3 AND payout_status = 'CREATING'`,
-                ['SUBMISSION_UNKNOWN', String(detail || 'The provider did not answer.').slice(0, 500), id]
+                 WHERE id = $3
+                   AND (payout_status IS NULL OR payout_status NOT IN ${UNRESOLVED_PAYOUT_STATES})`,
+                [status, String(detail || 'The provider did not answer.').slice(0, 500), id]
             );
         }
     }
@@ -456,11 +489,160 @@ async function reconcilePayouts({ limit = 20 } = {}) {
     return outcomes;
 }
 
+/**
+ * Claims one withdrawal inside the caller's transaction.
+ *
+ * Shared by the batch run and the single-withdrawal dispatch so both go through the identical
+ * pricing, ticker resolution, and durable-claim rules. Two copies of this would be two places
+ * for the "record the claim before sending" invariant to be forgotten in.
+ *
+ * Returns `{ claimed }` on success, `{ skipped }` when the row cannot be priced, and neither
+ * when another run won the race -- in which case the row is left alone rather than claimed.
+ */
+async function claimOneRow(client, row, convertToCoin) {
+    const ticker = payoutTicker(row.asset_code, row.network);
+    if (!ticker) {
+        return { skipped: { id: row.id, reason: `No payout ticker for ${row.asset_code}/${row.network}.` } };
+    }
+
+    const coinAmount = await convertToCoin(row.amount, ticker);
+    if (!Number.isFinite(coinAmount) || coinAmount <= 0) {
+        // No conversion means no safe amount. Left unclaimed so an operator can see
+        // it rather than being silently consumed by a run.
+        return { skipped: { id: row.id, reason: `Could not price ${row.amount} in ${ticker.toUpperCase()}.` } };
+    }
+
+    const fee = await nowPayments.getPayoutFee(ticker, coinAmount);
+
+    // The whole claim, in one statement, inside the caller's transaction.
+    const result = await client.query(
+        `UPDATE withdrawals
+         SET status = 'processing',
+             payout_status = 'CREATING',
+             payout_claimed_at = NOW(),
+             payout_address = $1,
+             payout_currency = $2,
+             payout_coin_amount = $3,
+             payout_fee_coin = $4,
+             updated_at = NOW()
+         WHERE id = $5 AND status = 'pending' AND payout_status IS NULL
+         RETURNING id, payout_address, payout_currency, payout_coin_amount, payout_fee_coin`,
+        [row.payment_address, ticker, coinAmount, fee, row.id]
+    );
+
+    if (result.rows.length === 0) return {};
+    return {
+        claimed: {
+            id: row.id,
+            // Derived from the withdrawal id rather than random, so a provider response
+            // and a later reconciliation pass both recompute the same key.
+            payoutId: `wd-${row.id}`,
+            address: row.payment_address,
+            currency: ticker,
+            amount: coinAmount,
+            fee,
+            extraId: row.destination_tag || null
+        }
+    };
+}
+
+/**
+ * Sends one just-created crypto withdrawal, immediately, in the request that created it.
+ *
+ * This is what makes a payout automatic rather than queued: the user asks to withdraw and the
+ * payout is submitted in the same interaction, instead of waiting for someone to run the
+ * maintenance endpoint.
+ *
+ * Two properties are deliberate.
+ *
+ * It goes through the same claim as the batch run, so being triggered from a request buys no
+ * privilege: the row is only sent if it was `pending`, only if it is crypto, and only once.
+ * A duplicate request cannot send twice, because the second finds the row already claimed.
+ *
+ * And it never throws. The withdrawal is already committed and the balance already debited by
+ * the time this runs, so a provider outage here must not turn a completed withdrawal into an
+ * error the user retries -- a retry would be a second withdrawal. A failure is left in the
+ * queue for the batch run or the operator, which is exactly where it would have been without
+ * this call.
+ */
+async function dispatchPayoutForWithdrawal({ withdrawalId, convertToCoin }) {
+    const unattempted = { attempted: false, submitted: 0, batchId: null, verified: false, uncertain: 0 };
+    if (!autoPayoutsEnabled()) return unattempted;
+
+    const id = Number(withdrawalId);
+    if (!Number.isSafeInteger(id) || id <= 0) return unattempted;
+
+    let claimed = [];
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const row = await client.query(
+            `SELECT id, user_id, amount, payment_method, payment_address, asset_code, network,
+                    destination_tag, status
+             FROM withdrawals
+             WHERE id = $1
+               AND status = 'pending'
+               AND payment_method = 'crypto'
+               AND payout_status IS NULL
+               AND asset_code IS NOT NULL
+               AND network IS NOT NULL
+             FOR UPDATE SKIP LOCKED`,
+            [id]
+        );
+        if (row.rows.length > 0) {
+            const outcome = await claimOneRow(client, row.rows[0], convertToCoin);
+            if (outcome.claimed) claimed.push(outcome.claimed);
+        }
+        await client.query('COMMIT');
+    } catch (error) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error(`Could not claim withdrawal ${id} for automatic payout: ${error.message}`);
+        return unattempted;
+    } finally {
+        client.release();
+    }
+
+    if (claimed.length === 0) return unattempted;
+
+    const outcome = await submitClaimedPayouts(claimed);
+    return {
+        attempted: true,
+        submitted: outcome.submitted,
+        batchId: outcome.batchId,
+        verified: outcome.verified,
+        uncertain: outcome.uncertain
+    };
+}
+
+/**
+ * USD to coin conversion for a payout, using the provider's own estimate.
+ *
+ * Lives here rather than in the route so the withdrawal request and the batch run price a
+ * payout the same way; a second copy is a second answer to "how many coins is $20". The
+ * `convertToCoin` parameter on the claim functions remains the seam for a test double, which
+ * is why this default does not need to be swappable itself.
+ *
+ * Returns null on failure: a withdrawal that cannot be priced is left for an operator rather
+ * than sent as a guessed amount.
+ */
+async function usdToCoin(usdAmount, ticker) {
+    const amount = Number(usdAmount);
+    if (!Number.isFinite(amount) || amount <= 0) return null;
+    const estimate = await nowPayments.request('GET', '/v1/estimate', {
+        query: { amount, currency_from: 'usd', currency_to: String(ticker).toLowerCase() },
+        timeoutMs: 10000
+    });
+    const coin = Number(estimate?.estimated_amount);
+    return Number.isFinite(coin) && coin > 0 ? coin : null;
+}
+
 module.exports = {
     autoPayoutsEnabled,
     preflight,
+    usdToCoin,
     payoutTicker,
     claimPayoutCandidates,
+    dispatchPayoutForWithdrawal,
     submitClaimedPayouts,
     applyPayoutCallback,
     reconcilePayouts,
