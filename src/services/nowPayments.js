@@ -29,7 +29,8 @@
  */
 
 const { createHmac, timingSafeEqual } = require('node:crypto');
-const { ProxyAgent } = require('undici');
+const undici = require('undici');
+const { ProxyAgent } = undici;
 
 const PRODUCTION_BASE_URL = 'https://api.nowpayments.io';
 
@@ -302,7 +303,18 @@ async function request(method, path, {
     let response;
     try {
         // Keyed on `path`, not `url`, so the documented per-endpoint limit applies.
-        response = await rateLimited(method, path, () => fetch(url, {
+        //
+        // Undici's own `fetch` is used rather than the global one. Node 24 ships a
+        // V8-native `fetch` that is a separate implementation, and when a dispatcher is
+        // passed it hands `dispatcher.dispatch` a *legacy v1* handler (`onConnect`,
+        // `onHeaders`, `onData`, `onComplete`, `onError`). Undici's `ProxyAgent` expects
+        // the v2 handler shape (`onRequestStart`, `onResponseStart`, ...) and rejects
+        // anything else with `invalid onRequestStart method` -- which is exactly the
+        // error the payout endpoints were throwing whenever `FIXIE_URL` was set. Calling
+        // through the `undici` module object keeps the reference live: tests swap
+        // `undici.fetch` to mock the provider, and a future undici major can replace
+        // the function without a call-site change.
+        response = await rateLimited(method, path, () => undici.fetch(url, {
             method,
             headers,
             body: body === null ? undefined : JSON.stringify(body),
@@ -952,7 +964,12 @@ async function submitPayoutBatch(entries, { logger = console, ipnCallbackUrl = n
     // thing that resolves a payout in real time.
     if (ipnCallbackUrl) body.ipn_callback_url = String(ipnCallbackUrl);
 
-    const result = await request('POST', '/v1/payout', { body, timeoutMs: 30000, viaProxy: true });
+    const result = await request('POST', '/v1/payout', {
+    authToken: await getAuthToken(),
+    body,
+    timeoutMs: 30000,
+    viaProxy: true,
+});
 
     // The provider reports the batch under either spelling depending on version; both are
     // read because the batch id is the only durable link back to our rows.

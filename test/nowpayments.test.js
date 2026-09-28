@@ -11,6 +11,7 @@
 const assert = require('node:assert/strict');
 const { createHmac } = require('node:crypto');
 const { test } = require('node:test');
+const undici = require('undici');
 
 const nowPayments = require('../src/services/nowPayments');
 const { isPaymentFullyPaid, knownProviderStatuses } = require('../src/services/depositCredit');
@@ -166,9 +167,9 @@ test('the merchant coin list is read from the field the provider actually uses',
     }
 
     const priorApiKey = process.env.NOWPAYMENTS_API_KEY;
-    const originalFetch = global.fetch;
+    const originalFetch = undici.fetch;
     const seen = [];
-    global.fetch = async (url, options) => {
+    undici.fetch = async (url, options) => {
         const target = String(url);
         if (target.includes('/v1/merchant/coins')) {
 
@@ -192,7 +193,7 @@ test('the merchant coin list is read from the field the provider actually uses',
         assert.equal(seen.length, 1, 'the global list must not be consulted when the merchant list answers');
         assert.ok(seen[0].includes('/v1/merchant/coins'));
     } finally {
-        global.fetch = originalFetch;
+        undici.fetch = originalFetch;
         if (priorApiKey === undefined) delete process.env.NOWPAYMENTS_API_KEY;
         else process.env.NOWPAYMENTS_API_KEY = priorApiKey;
         if (baseUrl === undefined) delete process.env.NOWPAYMENTS_API_BASE_URL;
@@ -208,9 +209,9 @@ test('a pair minimum is requested in fiat, not read as a coin amount', async () 
     // dollars put a $18.81 floor on Bitcoin Cash and refused ordinary deposits under it.
     const priorApiKey = process.env.NOWPAYMENTS_API_KEY;
     process.env.NOWPAYMENTS_API_KEY = 'test-unit-key';
-    const originalFetch = global.fetch;
+    const originalFetch = undici.fetch;
     const seen = [];
-    global.fetch = async (url) => {
+    undici.fetch = async (url) => {
         const target = String(url);
         if (target.includes('/v1/min-amount')) {
             seen.push(target);
@@ -235,7 +236,7 @@ test('a pair minimum is requested in fiat, not read as a coin amount', async () 
             'the conversion parameter was not requested, so the units are unknown'
         );
     } finally {
-        global.fetch = originalFetch;
+        undici.fetch = originalFetch;
         if (priorApiKey === undefined) delete process.env.NOWPAYMENTS_API_KEY;
         else process.env.NOWPAYMENTS_API_KEY = priorApiKey;
     }
@@ -247,9 +248,9 @@ test('an unconverted minimum is converted, never returned as dollars', async () 
     // figure, so it is converted through the estimate endpoint instead.
     const priorApiKey = process.env.NOWPAYMENTS_API_KEY;
     process.env.NOWPAYMENTS_API_KEY = 'test-unit-key';
-    const originalFetch = global.fetch;
+    const originalFetch = undici.fetch;
     const seen = [];
-    global.fetch = async (url) => {
+    undici.fetch = async (url) => {
         const target = String(url);
         if (target.includes('/v1/min-amount')) {
             seen.push(target);
@@ -275,7 +276,7 @@ test('an unconverted minimum is converted, never returned as dollars', async () 
             'the coin minimum was never converted'
         );
     } finally {
-        global.fetch = originalFetch;
+        undici.fetch = originalFetch;
         if (priorApiKey === undefined) delete process.env.NOWPAYMENTS_API_KEY;
         else process.env.NOWPAYMENTS_API_KEY = priorApiKey;
     }
@@ -287,8 +288,8 @@ test('a minimum is omitted rather than guessed when it cannot be converted', asy
     // lets the caller apply its own floor, which errs towards accepting the deposit.
     const priorApiKey = process.env.NOWPAYMENTS_API_KEY;
     process.env.NOWPAYMENTS_API_KEY = 'test-unit-key';
-    const originalFetch = global.fetch;
-    global.fetch = async (url) => {
+    const originalFetch = undici.fetch;
+    undici.fetch = async (url) => {
         const target = String(url);
         if (target.includes('/v1/min-amount')) {
             return new Response(JSON.stringify({ min_amount: 18.81 }), {
@@ -306,7 +307,7 @@ test('a minimum is omitted rather than guessed when it cannot be converted', asy
     try {
         assert.equal(await nowPayments.getMinimumAmount('usd', 'bch'), null);
     } finally {
-        global.fetch = originalFetch;
+        undici.fetch = originalFetch;
         if (priorApiKey === undefined) delete process.env.NOWPAYMENTS_API_KEY;
         else process.env.NOWPAYMENTS_API_KEY = priorApiKey;
     }
@@ -317,8 +318,8 @@ test('an unrecognised currency window yields no maximum rather than a wrong one'
     // The published OpenAPI schema for `/v1/currencies?fixed_rate=true` declares
     // `currencies: string[]` and names no amount fields, so a shape change must degrade
     // to "no limit known" rather than to a number that would refuse valid deposits.
-    const originalFetch = global.fetch;
-    global.fetch = async (url) => {
+    const originalFetch = undici.fetch;
+    undici.fetch = async (url) => {
         const target = String(url);
         if (target.includes('/v1/currencies')) {
             return new Response(JSON.stringify({ currencies: ['btc', 'usdt'] }), {
@@ -331,7 +332,7 @@ test('an unrecognised currency window yields no maximum rather than a wrong one'
     try {
         assert.deepEqual(await nowPayments.getCurrencyLimits({ logger: { warn() {} } }), {});
     } finally {
-        global.fetch = originalFetch;
+        undici.fetch = originalFetch;
     }
 });
 
@@ -396,7 +397,7 @@ async function withPayoutFetch(run, { verifyStatus = 200, payoutBody = { batch_w
     const priorEmail = process.env.NOWPAYMENTS_EMAIL;
     const priorPassword = process.env.NOWPAYMENTS_PASSWORD;
     const priorTwoFactor = process.env.NOWPAYMENTS_2FA_SECRET;
-    const originalFetch = global.fetch;
+    const originalFetch = undici.fetch;
     const seen = [];
 
     process.env.NOWPAYMENTS_API_KEY = 'test-unit-key';
@@ -405,7 +406,7 @@ async function withPayoutFetch(run, { verifyStatus = 200, payoutBody = { batch_w
     process.env.NOWPAYMENTS_2FA_SECRET = 'JBSWY3DPEHPK3PXP';
     nowPayments.resetAuthTokenCache();
 
-    global.fetch = async (url, options) => {
+    undici.fetch = async (url, options) => {
         const target = String(url);
         const body = options?.body ? JSON.parse(options.body) : null;
         seen.push({ url: target, body, headers: options?.headers || {} });
@@ -438,7 +439,7 @@ async function withPayoutFetch(run, { verifyStatus = 200, payoutBody = { batch_w
     try {
         return { result: await run(seen), seen };
     } finally {
-        global.fetch = originalFetch;
+        undici.fetch = originalFetch;
         nowPayments.resetAuthTokenCache();
         if (priorApiKey === undefined) delete process.env.NOWPAYMENTS_API_KEY;
         else process.env.NOWPAYMENTS_API_KEY = priorApiKey;
@@ -453,7 +454,7 @@ async function withPayoutFetch(run, { verifyStatus = 200, payoutBody = { batch_w
 
 test('verifying a batch posts the batch id and a six-digit code, and is refused without a secret', async () => {
     const { seen } = await withPayoutFetch(
-        async () => nowPayments.verifyPayoutBatch('batch-1', { logger: { log() {} } })
+        async () => nowPayments.verifyPayoutBatch('batch-1', { logger: { log() {}, warn() {} } })
     );
 
     const auth = seen.find((call) => call.url.includes('/v1/auth'));
@@ -520,7 +521,7 @@ test('a refused payout minimum is reported once, and then not retried per coin',
     const saved = Object.fromEntries(
         ['NOWPAYMENTS_API_KEY', 'NOWPAYMENTS_IPN_SECRET'].map((key) => [key, process.env[key]])
     );
-    const originalFetch = global.fetch;
+    const originalFetch = undici.fetch;
     const warnings = [];
     const recovery = [];
     const originalWarn = console.warn;
@@ -532,7 +533,7 @@ test('a refused payout minimum is reported once, and then not retried per coin',
     console.warn = (...args) => warnings.push(args.join(' '));
     console.log = (...args) => recovery.push(args.join(' '));
 
-    global.fetch = async (url) => {
+    undici.fetch = async (url) => {
         if (String(url).includes('/payout-withdrawal/min-amount/')) {
             calls += 1;
             // The provider's literal response, including its unresolved "undefined".
@@ -588,7 +589,7 @@ test('a refused payout minimum is reported once, and then not retried per coin',
         // Once the cool-off is cleared the endpoint is tried again, and a success both returns
         // a real minimum and reports availability.
         nowPayments.resetPayoutMinimumAvailability();
-        global.fetch = async (url) => {
+        undici.fetch = async (url) => {
             if (String(url).includes('/payout-withdrawal/min-amount/')) {
                 return new Response(JSON.stringify({ min_amount: 7.5 }), {
                     status: 200, headers: { 'Content-Type': 'application/json' }
@@ -607,7 +608,7 @@ test('a refused payout minimum is reported once, and then not retried per coin',
     } finally {
         console.warn = originalWarn;
         console.log = originalLog;
-        global.fetch = originalFetch;
+        undici.fetch = originalFetch;
         nowPayments.resetPayoutMinimumAvailability();
         for (const [key, value] of Object.entries(saved)) {
             if (value === undefined) delete process.env[key];
@@ -657,7 +658,7 @@ test('a provider refusal is read from the shape NOWPayments actually sends', () 
 
 test('a transport failure says why, not just that it happened', async () => {
     const saved = { ...process.env };
-    const originalFetch = global.fetch;
+    const originalFetch = undici.fetch;
     process.env.NOWPAYMENTS_API_KEY = 'test-key';
     delete process.env.FIXIE_URL;
 
@@ -669,7 +670,7 @@ test('a transport failure says why, not just that it happened', async () => {
         // The exact shape undici produces for a proxy CONNECT that fails: a generic outer
         // message with the real reason nested one level down. The previous log printed only the
         // outer message, so an operator saw "could not be completed" and nothing else.
-        global.fetch = async () => {
+        undici.fetch = async () => {
             const outer = new Error('fetch failed');
             outer.cause = Object.assign(new Error('getaddrinfo ENOTFOUND fixie.example'), { code: 'ENOTFOUND' });
             throw outer;
@@ -696,7 +697,7 @@ test('a transport failure says why, not just that it happened', async () => {
         assert.match(warnings[0], /went out via FIXIE_URL/);
         assert.ok(!/FIXIE_URL is unset/.test(warnings[0]));
     } finally {
-        global.fetch = originalFetch;
+        undici.fetch = originalFetch;
         nowPayments.resetAddressValidationAvailability();
         for (const [key, value] of Object.entries(saved)) {
             if (value === undefined) delete process.env[key];
@@ -707,7 +708,7 @@ test('a transport failure says why, not just that it happened', async () => {
 
 test('an unreachable validator is asked once, not once per withdrawal', async () => {
     const saved = { ...process.env };
-    const originalFetch = global.fetch;
+    const originalFetch = undici.fetch;
     process.env.NOWPAYMENTS_API_KEY = 'test-key';
     delete process.env.FIXIE_URL;
 
@@ -717,7 +718,7 @@ test('an unreachable validator is asked once, not once per withdrawal', async ()
     try {
         nowPayments.resetAddressValidationAvailability();
         let calls = 0;
-        global.fetch = async () => {
+        undici.fetch = async () => {
             calls += 1;
             throw Object.assign(new Error('fetch failed'), { code: 'ECONNREFUSED' });
         };
@@ -739,7 +740,7 @@ test('an unreachable validator is asked once, not once per withdrawal', async ()
         // configuration change -- because waiting out five real minutes is not something a
         // test can do, and skipping the cool-off check here would leave the resume path
         // untested.
-        global.fetch = async () => new Response(JSON.stringify({ is_valid: true }), {
+        undici.fetch = async () => new Response(JSON.stringify({ is_valid: true }), {
             status: 200, headers: { 'Content-Type': 'application/json' }
         });
         nowPayments.resetAddressValidationAvailability();
@@ -751,12 +752,12 @@ test('an unreachable validator is asked once, not once per withdrawal', async ()
 
         // And a fresh transport failure re-opens the cool-off and re-reports, so a proxy that
         // is broken again after being fixed does not fail silently from then on.
-        global.fetch = async () => { throw Object.assign(new Error('fetch failed'), { code: 'ECONNRESET' }); };
+        undici.fetch = async () => { throw Object.assign(new Error('fetch failed'), { code: 'ECONNRESET' }); };
         nowPayments.resetAddressValidationAvailability();
         await nowPayments.validatePayoutAddress('bc1qexample', 'btc', { logger });
         assert.equal(warnings.length, 2, 'a second, later failure was never reported');
     } finally {
-        global.fetch = originalFetch;
+        undici.fetch = originalFetch;
         nowPayments.resetAddressValidationAvailability();
         for (const [key, value] of Object.entries(saved)) {
             if (value === undefined) delete process.env[key];
@@ -767,7 +768,7 @@ test('an unreachable validator is asked once, not once per withdrawal', async ()
 
 test('a provider that answers is never cooled off, however bad the answer is', async () => {
     const saved = { ...process.env };
-    const originalFetch = global.fetch;
+    const originalFetch = undici.fetch;
     process.env.NOWPAYMENTS_API_KEY = 'test-key';
 
     try {
@@ -776,7 +777,7 @@ test('a provider that answers is never cooled off, however bad the answer is', a
         // A definitive rejection is a real answer, not a transport failure. Caching that verdict
         // for five minutes would let someone resubmit the same bad address repeatedly, and would
         // also mean the very first address a user typed was the one that got checked.
-        global.fetch = async () => {
+        undici.fetch = async () => {
             calls += 1;
             return new Response(JSON.stringify({ is_valid: false, error: 'Not a valid address' }), {
                 status: 200, headers: { 'Content-Type': 'application/json' }
@@ -792,7 +793,7 @@ test('a provider that answers is never cooled off, however bad the answer is', a
         assert.deepEqual(second, first);
         assert.equal(calls, 2, 'a definitive rejection was cached instead of re-checked');
     } finally {
-        global.fetch = originalFetch;
+        undici.fetch = originalFetch;
         nowPayments.resetAddressValidationAvailability();
         for (const [key, value] of Object.entries(saved)) {
             if (value === undefined) delete process.env[key];
@@ -803,7 +804,7 @@ test('a provider that answers is never cooled off, however bad the answer is', a
 
 test('a refusal is reported as a refusal, which is not the same as no figure', async () => {
     const saved = { ...process.env };
-    const originalFetch = global.fetch;
+    const originalFetch = undici.fetch;
     process.env.NOWPAYMENTS_API_KEY = 'test-key';
 
     try {
@@ -823,7 +824,7 @@ test('a refusal is reported as a refusal, which is not the same as no figure', a
         assert.equal(nowPayments.isPayoutMinimumRefused(), true, 'a 403 did not register as a refusal');
 
         // A usable answer is not a refusal.
-        global.fetch = async () => new Response(JSON.stringify({ min_amount: 3 }), {
+        undici.fetch = async () => new Response(JSON.stringify({ min_amount: 3 }), {
             status: 200, headers: { 'Content-Type': 'application/json' }
         });
         nowPayments.resetPayoutMinimumAvailability();
@@ -835,7 +836,7 @@ test('a refusal is reported as a refusal, which is not the same as no figure', a
         // single coin had an odd window, which is a much worse outcome than falling back to
         // the app default for that one coin.
         nowPayments.resetPayoutMinimumAvailability();
-        global.fetch = async () => new Response(JSON.stringify({ something_else: 1 }), {
+        undici.fetch = async () => new Response(JSON.stringify({ something_else: 1 }), {
             status: 200, headers: { 'Content-Type': 'application/json' }
         });
         assert.equal(await nowPayments.getPayoutMinimum('btc'), null);
@@ -845,7 +846,7 @@ test('a refusal is reported as a refusal, which is not the same as no figure', a
             'a response with no usable minimum was reported as an account refusal'
         );
     } finally {
-        global.fetch = originalFetch;
+        undici.fetch = originalFetch;
         nowPayments.resetPayoutMinimumAvailability();
         for (const [key, value] of Object.entries(saved)) {
             if (value === undefined) delete process.env[key];
@@ -856,7 +857,7 @@ test('a refusal is reported as a refusal, which is not the same as no figure', a
 
 test('a refused payout minimum stops the whole catalogue being asked, not just one coin', async () => {
     const saved = { ...process.env };
-    const originalFetch = global.fetch;
+    const originalFetch = undici.fetch;
     process.env.NOWPAYMENTS_API_KEY = 'test-key';
     process.env.NOWPAYMENTS_EMAIL = 'ops@example.test';
     process.env.NOWPAYMENTS_PASSWORD = 'test-password';
@@ -870,7 +871,7 @@ test('a refused payout minimum stops the whole catalogue being asked, not just o
         nowPayments.resetPayoutMinimumAvailability();
 
         let minimumCalls = 0;
-        global.fetch = async (url) => {
+        undici.fetch = async (url) => {
             if (String(url).includes('/payout-withdrawal/min-amount/')) {
                 minimumCalls += 1;
                 return new Response('Access denied', { status: 403 });
@@ -905,7 +906,7 @@ test('a refused payout minimum stops the whole catalogue being asked, not just o
         // The consequence that reaches the user: the $1.00 floor is unconfirmed.
         assert.equal(limits.minimumsConfirmed, false, 'a refusal was reported as a confirmed minimum');
     } finally {
-        global.fetch = originalFetch;
+        undici.fetch = originalFetch;
         nowPayments.resetPayoutMinimumAvailability();
         require('../src/controllers/payoutController').resetPayoutLimitsCache();
         for (const [key, value] of Object.entries(saved)) {
@@ -917,7 +918,7 @@ test('a refused payout minimum stops the whole catalogue being asked, not just o
 
 test('a working endpoint still reads every coin, and confirms the floors', async () => {
     const saved = { ...process.env };
-    const originalFetch = global.fetch;
+    const originalFetch = undici.fetch;
     process.env.NOWPAYMENTS_API_KEY = 'test-key';
 
     try {
@@ -928,7 +929,7 @@ test('a working endpoint still reads every coin, and confirms the floors', async
         nowPayments.resetPayoutMinimumAvailability();
 
         const seen = new Set();
-        global.fetch = async (url) => {
+        undici.fetch = async (url) => {
             if (String(url).includes('/payout-withdrawal/min-amount/')) {
                 seen.add(String(url).split('/').pop());
                 return new Response(JSON.stringify({ min_amount: 2 }), {
@@ -955,7 +956,7 @@ test('a working endpoint still reads every coin, and confirms the floors', async
         assert.equal(limits.minimumsConfirmed, true, 'a successful read was not reported as confirmed');
         assert.equal(Object.keys(limits.minimums).length, expected.length);
     } finally {
-        global.fetch = originalFetch;
+        undici.fetch = originalFetch;
         nowPayments.resetPayoutMinimumAvailability();
         require('../src/controllers/payoutController').resetPayoutLimitsCache();
         for (const [key, value] of Object.entries(saved)) {
