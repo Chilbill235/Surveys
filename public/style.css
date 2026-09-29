@@ -1868,6 +1868,8 @@ select.form-control:disabled { cursor: not-allowed; background-image: none; padd
 }
 
 @media (max-width: 720px) {
+    :root { --header-h: 68px; }
+
     .demo-actions { gap: 8px; }
     .demo-actions .button { min-height: 48px; }
     .survey-prompt { font-size: var(--step-0); }
@@ -1877,13 +1879,16 @@ select.form-control:disabled { cursor: not-allowed; background-image: none; padd
     .topbar { flex-direction: row; align-items: center; gap: 12px; padding: 10px 16px; }
     .header-action { display: none; }
     .account-tools { display: block; min-width: 0; }
+    .notification-popover { width: 100%; display: flex; justify-content: flex-end; }
     .balance-block { display: grid; min-width: 0; gap: 0; padding: 0; border: 0; text-align: right; }
     .balance-label { font-size: 0.66rem; }
     .balance-block strong { font-size: var(--step-0); line-height: 1.25; }
     .demo-balance-line { justify-content: flex-end; font-size: 0.62rem; }
 
+    .desktop-return { display: none; }
     .action-bar { display: flex; }
     .has-action-bar { padding-bottom: calc(68px + env(safe-area-inset-bottom)); }
+    :root { --action-bar-h: 68px; }
     .site-footer { padding-bottom: 20px; }
 
     .topbar::after { display: none; }
@@ -2320,6 +2325,12 @@ select.form-control:disabled { cursor: not-allowed; background-image: none; padd
    immediate visibility; this dropdown keeps the history.
    ========================================================================== */
 
+.notification-popover {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+}
+
 .notification-bell {
     position: relative;
     width: 40px;
@@ -2375,10 +2386,10 @@ select.form-control:disabled { cursor: not-allowed; background-image: none; padd
 
 .notification-dropdown {
     position: absolute;
-    top: calc(var(--header-h) + 12px);
-    right: 16px;
+    top: 100%;
+    right: 0;
     z-index: 990;
-    width: min(360px, calc(100% - 32px));
+    width: min(360px, calc(100vw - 16px));
     max-height: min(50vh, 480px);
     display: flex;
     flex-direction: column;
@@ -2526,10 +2537,16 @@ select.form-control:disabled { cursor: not-allowed; background-image: none; padd
 }
 
 @media (max-width: 640px) {
+    .notification-bell { min-width: 48px; min-height: 48px; }
+    .notification-popover {
+        display: block;
+    }
     .notification-dropdown {
-        top: calc(56px + 12px);
+        position: fixed;
+        top: calc(var(--header-h) + env(safe-area-inset-top) + 8px);
         right: 8px;
         left: 8px;
+        max-width: calc(100vw - 16px);
     }
 }
 

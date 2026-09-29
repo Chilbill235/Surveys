@@ -67,36 +67,48 @@ function isLocalAddress(hostname) {
  */
 function resolvePublicBaseUrl() {
     const isProduction = process.env.NODE_ENV === 'production';
-    const rawBaseUrl = (process.env.APP_BASE_URL || '').trim() ||
+    const rawEnv = (process.env.APP_BASE_URL || '').trim() ||
         (isProduction ? '' : defaultDevelopmentBaseUrl);
-    if (!rawBaseUrl) {
+    if (!rawEnv) {
         return { ok: false, error: 'Public site URL is not configured. Set APP_BASE_URL.' };
     }
 
-    let parsed;
-    try {
-        parsed = new URL(rawBaseUrl);
-    } catch {
-        return { ok: false, error: 'Configure APP_BASE_URL as a valid public origin.' };
+    // Support a comma-separated list of origins (e.g. for local testing on both
+    // localhost and a LAN address: `APP_BASE_URL=http://localhost:3001,http://192.168.1.10:3001`).
+    // The first well-formed origin is returned as `baseUrl` for callback URLs; the
+    // full list is returned as `baseUrls` for CORS and other multi-origin checks.
+    const rawUrls = rawEnv.split(',').map((s) => s.trim()).filter(Boolean);
+    if (rawUrls.length === 0) {
+        return { ok: false, error: 'Public site URL is not configured. Set APP_BASE_URL.' };
     }
-    if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password) {
-        return { ok: false, error: 'Configure APP_BASE_URL as a valid public origin.' };
+
+    const parsedUrls = [];
+    for (const raw of rawUrls) {
+        let parsed;
+        try {
+            parsed = new URL(raw);
+        } catch {
+            return { ok: false, error: `Configure APP_BASE_URL as a valid public origin. (${raw} was not parseable)` };
+        }
+        if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password) {
+            return { ok: false, error: `Configure APP_BASE_URL as a valid public origin. (${raw} was invalid)` };
+        }
+        parsedUrls.push(parsed);
     }
 
     if (isProduction) {
-        // The local check is here so a deployment that set APP_BASE_URL to a LAN
-        // address gets the same clear error as one that set it to localhost. The
-        // previous version only caught the latter, so `10.0.0.5` slipped through
-        // and every provider callback was silently undeliverable.
-        if (parsed.protocol !== 'https:' || isLocalAddress(parsed.hostname)) {
-            return {
-                ok: false,
-                error: 'APP_BASE_URL must be the public HTTPS origin in production, otherwise provider webhooks cannot reach the app.'
-            };
+        // Every origin in a production list must be HTTPS and publicly reachable.
+        for (const parsed of parsedUrls) {
+            if (parsed.protocol !== 'https:' || isLocalAddress(parsed.hostname)) {
+                return {
+                    ok: false,
+                    error: 'APP_BASE_URL must be the public HTTPS origin in production, otherwise provider webhooks cannot reach the app.'
+                };
+            }
         }
     }
 
-    return { ok: true, baseUrl: parsed };
+    return { ok: true, baseUrl: parsedUrls[0], baseUrls: parsedUrls };
 }
 
 /**

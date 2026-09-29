@@ -153,6 +153,9 @@ function dismissToast(id) {
 
 const NOTIFICATIONS_KEY = 'offerNetworkNotifications';
 const NOTIFICATIONS_LIMIT = 50;
+/** Recently pushed titles, used to suppress duplicate notifications within a short window. */
+const notificationDedupe = new Map();
+const NOTIFICATION_DEDUPE_MS = 3000;
 
 function loadNotifications() {
     try {
@@ -179,6 +182,18 @@ function unreadCount() {
 }
 
 function pushNotification({ title, message, tone = 'info', href = null, category = null }) {
+    // Suppress duplicates that arrive within a short window. Two calls with the same
+    // title in quick succession usually mean the same event was pushed twice (a race
+    // between the immediate form-submit notification and the first poll), not two
+    // genuinely different events.
+    const dedupeKey = title;
+    const now = Date.now();
+    if (notificationDedupe.has(dedupeKey) && now - notificationDedupe.get(dedupeKey) < NOTIFICATION_DEDUPE_MS) {
+        return;
+    }
+    notificationDedupe.set(dedupeKey, now);
+    setTimeout(() => notificationDedupe.delete(dedupeKey), NOTIFICATION_DEDUPE_MS);
+
     notificationStore.push({
         id: Date.now() + Math.random(),
         title,
@@ -829,7 +844,14 @@ function applyLiveUpdate(payload) {
         if (credited && !creditedDepositsSeen.has(item.id)) {
             creditedDepositsSeen.add(item.id);
             liveState.creditedDepositTotal += Number(item.amount) || 0;
-            if (isDialogOpen('deposit-dialog')) showDepositSuccess(item);
+            // Announce the credit everywhere: when the dialog is open the user sees the
+            // success screen, otherwise they get just the toast and bell so the money
+            // arriving is an event, not a number they have to be watching for.
+            if (isDialogOpen('deposit-dialog')) {
+                showDepositSuccess(item);
+            } else {
+                notifyDepositConfirmed(item);
+            }
         }
     }
 

@@ -24,7 +24,15 @@ require('dotenv').config();
     const port = Number.isInteger(parsedPort) && parsedPort > 0 ? parsedPort : 3001;
     const localOrigin = `http://localhost:${port}`;
     if (!process.env.APP_BASE_URL) process.env.APP_BASE_URL = localOrigin;
-    if (!process.env.CORS_ORIGIN) process.env.CORS_ORIGIN = localOrigin;
+    // If CORS_ORIGIN is not set, allow every origin in APP_BASE_URL (comma-separated)
+    // plus the localhost origin, so local testing from multiple devices works.
+    if (!process.env.CORS_ORIGIN) {
+        const allOrigins = process.env.APP_BASE_URL
+            .split(',')
+            .map((s) => s.trim())
+            .filter(Boolean);
+        process.env.CORS_ORIGIN = allOrigins.join(',');
+    }
 })();
 
 const { resolvePublicBaseUrl, isPubliclyReachable, defaultPort } = require('./src/services/publicBaseUrl');
