@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="theme-color" content="#131c4a" media="(prefers-color-scheme: dark)">
+    <meta name="theme-color" content="#2449d8" media="(prefers-color-scheme: light)">
+    <meta name="description" content="View your deposit, withdrawal, and reward history.">
+    <title>History | RewardZone</title>
+    <link rel="stylesheet" href="/style.css">
+    <link rel="icon" href="/favicon.ico" sizes="any">
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+    <link rel="icon" href="/favicon-32.png" sizes="32x32" type="image/png">
+    <link rel="icon" href="/icon-192.png" sizes="192x192" type="image/png">
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+    <link rel="manifest" href="/site.webmanifest">
+    <script src="/app.js" defer></script>
+    <script src="/history.js" defer></script>
+</head>
+<body class="has-action-bar">
+    <div class="toast-region" id="toast-region" aria-live="polite"></div>
+    <header class="topbar">
+        <a class="brand" href="/" aria-label="RewardZone home">
+            <img class="brand-mark" src="/brand.gif" alt="" width="36" height="36">
+            <span>reward<span class="brand-light">zone</span></span>
+        </a>
+        <nav class="header-nav">
+            <a class="header-nav-link" href="/offers">Offers</a>
+            <a class="header-nav-link" href="/history" aria-current="page">History</a>
+        </nav>
+        <div class="account-tools">
+            <div class="balance-block" aria-live="polite">
+                <span class="balance-label">Available balance</span>
+                <strong id="user-balance">--</strong>
+                <span class="demo-balance-line">Test-only balance <strong id="demo-balance">--</strong></span>
+                <span class="live-indicator" id="live-indicator" hidden></span>
+            </div>
+            <button type="button" class="button button-ghost button-square notification-bell"
+                    id="notification-bell" aria-label="Notifications" aria-haspopup="dialog" aria-expanded="false" hidden>
+                <span class="notification-icon" aria-hidden="true"></span>
+                <span class="notification-count" id="notification-count" hidden>0</span>
+            </button>
+            <div class="notification-dropdown" id="notification-dropdown" hidden role="dialog" aria-labelledby="notification-title" aria-modal="false">
+                <div class="notification-header">
+                    <h3 id="notification-title">Notifications</h3>
+                    <button type="button" class="link-button notification-mark-all" id="notification-mark-all" aria-label="Mark all as read">Mark all read</button>
+                </div>
+                <div class="notification-list" id="notification-list">
+                    <p class="notification-empty">No new notifications.</p>
+                </div>
+            </div>
+            <button class="button button-light header-action" id="account-button" type="button">Connect account</button>
+            <button class="button button-light header-action" id="deposit-button" type="button" disabled>Deposit</button>
+            <button class="button button-accent header-action" id="withdraw-button" type="button" disabled>Withdraw</button>
+        </div>
+    </header>
+
+    <main id="main" class="page-shell">
+        <section class="history-section" aria-labelledby="history-title">
+            <div class="home-section-heading">
+                <div>
+                    <p class="eyebrow">Your account</p>
+                    <h1 id="history-title" class="display">Transaction history</h1>
+                </div>
+            </div>
+
+            <p id="history-intro" class="body-text">
+                Every deposit, withdrawal, and reward credited to your balance, in order.
+            </p>
+
+            <div class="history-filters" role="tablist" aria-label="Filter by type">
+                <button type="button" class="history-filter-button is-active" data-filter="all" aria-selected="true">All</button>
+                <button type="button" class="history-filter-button" data-filter="deposit" aria-selected="false">Deposits</button>
+                <button type="button" class="history-filter-button" data-filter="withdrawal" aria-selected="false">Withdrawals</button>
+                <button type="button" class="history-filter-button" data-filter="conversion" aria-selected="false">Rewards</button>
+                <button type="button" class="history-filter-button" data-filter="refund" aria-selected="false">Refunds</button>
+            </div>
+
+            <div id="history-container">
+                <p id="history-loading" class="body-text">Loading your history&hellip;</p>
+                <p id="history-error" class="body-text is-error" hidden>Could not load your history.</p>
+                <div id="history-list" hidden>
+                    <!-- Transaction rows are rendered here by history.js -->
+                </div>
+                <div id="history-list-empty" class="history-list-empty" hidden>
+                    <div class="history-list-icon" aria-hidden="true">&#128190;</div>
+                    <p>No transactions yet.</p>
+                    <p class="body-text is-muted">Your deposits, withdrawals, and rewards will appear here once they happen.</p>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <dialog id="account-dialog" class="auth-dialog" aria-labelledby="account-dialog-title">
+        <form method="dialog" class="dialog-content" id="account-dialog-content">
+            <h2 id="account-dialog-title">Connect account</h2>
+            <!-- The auth form lives in the offers page's index.html and is
+                 controlled by app.js, which shares account state via sessionStorage.
+                 This dialog is a thin shell that delegates to the same code path. -->
+            <button type="button" class="button button-accent button-wide" id="open-offers-signin">
+                Open offers page to sign in
+            </button>
+        </form>
+    </dialog>
+
+    <div class="action-bar" role="toolbar" aria-label="Quick actions">
+        <button class="action-bar-item is-primary" id="action-deposit" disabled>
+            <span class="action-bar-label">Deposit</span>
+        </button>
+        <button class="action-bar-item is-warning" id="action-withdraw" disabled>
+            <span class="action-bar-label">Withdraw</span>
+        </button>
+    </div>
+</body>
+</html>

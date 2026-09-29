@@ -102,7 +102,7 @@ router.use((req, res, next) => {
  * user is on localhost.
  */
 function withReceiptUrl(deposit) {
-    return { ...deposit, receipt_url: `/deposit/${deposit.id}` };
+    return { ...deposit, receipt_url: `/receipt/deposit/${deposit.id}` };
 }
 
 /** Classifies a database error so the same cause always produces the same status. */
@@ -356,6 +356,34 @@ router.get('/deposits/:id', async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// Combined transaction history
+// ---------------------------------------------------------------------------
+
+/**
+ * A flat list of every balance movement, in descending order.
+ *
+ * This is the single query the history page needs: deposits, withdrawals, and
+ * reward credits all appear here in chronological order. The frontend does not
+ * need to join separate deposit and withdrawal lists to tell the user a credit
+ * followed a withdrawal refund, or that a reward landed between two deposits.
+ */
+router.get('/history', async (req, res) => {
+    try {
+        const result = await pool.query(
+            `SELECT id, amount, transaction_type, source_id, description, created_at
+             FROM balance_transactions
+             WHERE user_id = $1
+             ORDER BY created_at DESC, id DESC
+             LIMIT $2`,
+            [req.user.id, HISTORY_PAGE_SIZE]
+        );
+        return res.json(result.rows);
+    } catch (error) {
+        return sendDatabaseFailure(res, 'History Error', error);
+    }
+});
+
+// ---------------------------------------------------------------------------
 // Options and financial mutations
 // ---------------------------------------------------------------------------
 
@@ -364,18 +392,12 @@ router.get('/withdrawal-options', payoutController.withdrawalOptions);
 router.post('/deposits', financialMutationLimit, paymentController.createDeposit);
 router.post('/withdraw', financialMutationLimit, payoutController.requestWithdrawal);
 
-// Declared alongside the routes above so a request that reaches the right path with the
-// wrong verb is answered 405 rather than falling through to the generic "API route not
-// found" -- which reads as the endpoint not existing when it does.
+registerMethod(/^\/api\/user\/history\/?$/, ['GET']);
 registerMethod(/^\/api\/user\/payment-options\/?$/, ['GET']);
 registerMethod(/^\/api\/user\/withdrawal-options\/?$/, ['GET']);
 registerMethod(/^\/api\/user\/deposits\/?$/, ['GET', 'POST']);
 registerMethod(/^\/api\/user\/deposits\/\d{1,19}\/?$/, ['GET']);
 
-// The list and the create action disagree on naming: one is the plural noun, the other a
-// bare verb. The plural is the readable form, so it is accepted as an alias for the create
-// endpoint rather than leaving two names for one action. Declared once, with both verbs,
-// so a GET to it is answered 405 with an `Allow` that names the verb that was wanted.
 router.post('/withdrawals/code', financialMutationLimit, payoutController.sendWithdrawalCode);
 router.post('/withdrawals', financialMutationLimit, payoutController.requestWithdrawal);
 registerMethod(/^\/api\/user\/withdrawals\/?$/, ['GET', 'POST']);

@@ -148,19 +148,19 @@ app.get(['/reset-password', '/reset-password/'], (req, res) => {
     res.sendFile(path.join(publicDirectory, 'reset-password.html'));
 });
 
-app.get('/deposit/:id', (req, res) => {
+app.get('/receipt/deposit/:id', (req, res) => {
     res.sendFile(path.join(publicDirectory, 'deposit-receipt.html'));
 });
 
 app.get(['/demo', '/demo/'], (req, res) => {
-    // Demo mode, not NODE_ENV. The demo page and the demo offers in the catalog are one
-    // feature: if the catalog shows a demo offer, this page has to be reachable, and if it
-    // is not, the catalog has nothing to point at. Keying them off different variables is
-    // how a deployment ends up advertising surveys that lead to a 404.
     if (!isDemoModeEnabled()) {
         return res.status(404).send('Page not found.');
     }
     return res.sendFile(path.join(publicDirectory, 'demo.html'));
+});
+
+app.get(['/history', '/history/'], (req, res) => {
+    res.sendFile(path.join(publicDirectory, 'history.html'));
 });
 
 // `/index.html` is a valid file in the public directory and static would serve

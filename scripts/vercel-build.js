@@ -142,7 +142,7 @@ function checkRouting(config) {
     if (!catchAll) {
         return {
             ok: false,
-            reason: 'no catch-all. Non-API paths are unrouted, so /offer/engage, /, /reset-password, and /deposit/:id will 404.'
+            reason: 'no catch-all. Non-API paths are unrouted, so /offer/engage, /, /reset-password, and /receipt/deposit/:id will 404.'
         };
     }
     if (/index\.html$/.test(catchAll.destination)) {
@@ -150,7 +150,7 @@ function checkRouting(config) {
             ok: false,
             reason: 'non-API paths go to index.html. That swallows /offer/engage, so clicking an ' +
                 'offer returns the user to the catalog instead of the advertiser, and breaks /, ' +
-                '/reset-password, and /deposit/:id. Point it at the function instead.'
+                '/reset-password, and /receipt/deposit/:id. Point it at the function instead.'
         };
     }
     if (!/^\/api\//.test(catchAll.destination)) {

@@ -43,7 +43,7 @@
             ]
         },
         {
-            "source": "/deposit/:id",
+            "source": "/receipt/deposit/:id",
             "headers": [
                 { "key": "Cache-Control", "value": "no-store" }
             ]

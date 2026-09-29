@@ -392,12 +392,12 @@ test('a deposit receipt is reachable by reference and belongs only to its owner'
         const deposit = await found.json();
         // A crypto deposit has no checkout_url, so the receipt link is what a caller has
         // to follow. It is derived from the id, not from a configured base URL.
-        assert.equal(deposit.receipt_url, '/deposit/91');
+        assert.equal(deposit.receipt_url, '/receipt/deposit/91');
         assert.equal(deposit.checkout_url, null);
         assert.equal(deposit.status, 'pending');
 
         // The shell must serve for any numeric id, since the id is only read by the page.
-        const page = await fetch(`${origin}/deposit/91`);
+        const page = await fetch(`${origin}/receipt/deposit/91`);
         assert.equal(page.status, 200);
         assert.match(page.headers.get('content-type') || '', /text\/html/);
         assert.match(await page.text(), /deposit-receipt\.js/);
@@ -2467,8 +2467,8 @@ test('every page the app serves is reachable under the deployed routing', () => 
     // rather than discovered from a 404 in production.
     const deployed = require('../vercel.json');
     const pagePaths = ['/', '/offers', '/reset-password', '/demo'];
-    // `/deposit/:id` is a pattern, so it is checked as the shape the rewrite must cover.
-    const patterns = [/^\/deposit\/:id$/, /^\/offer\/engage$/, /^\/click\/:offerId$/];
+    // `/receipt/deposit/:id` is a pattern, so it is checked as the shape the rewrite must cover.
+    const patterns = [/^\/receipt\/deposit\/:id$/, /^\/offer\/engage$/, /^\/click\/:offerId$/];
 
     const catchAll = deployed.rewrites.find((rule) => !/^\/api\//.test(rule.source));
     assert.ok(catchAll, 'there is no catch-all rewrite for page requests');

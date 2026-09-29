@@ -96,6 +96,14 @@ const TOAST_ICONS = {
     error: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M4 4l8 8M12 4L4 12" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></svg>'
 };
 
+const NOTIFICATION_CATEGORY_ICONS = {
+    deposit: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M14 10h2v6H2v-6h2M6 2h4v4H6zM6 2l-4 4M10 2l4 4" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+    withdrawal: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M3 7l5 5 5-5" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/><path d="M8 12V2" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>',
+    reward: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M8 2l2 6h6l-5 4 2 6-5-4-5 4 2-6-5-4h6z" stroke="currentColor" stroke-width="2" fill="none"/></svg>',
+    survey: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M4 4h8v8H4zM9 2h2v4h-2zM5 9h6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+    magic: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M8 2v4l2 2 2-2V2h-4zM6 14h6V6H6v8zM6 14a2 2 0 1 1-4 0 2 2 0 0 1 4 0z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>'
+};
+
 function showToast(title, message, { tone = 'info', duration = 4500 } = {}) {
     if (!toastRegion) return;
     const id = ++toastCount;
@@ -104,6 +112,7 @@ function showToast(title, message, { tone = 'info', duration = 4500 } = {}) {
     toast.dataset.id = id;
     toast.setAttribute('role', 'status');
     toast.setAttribute('aria-live', 'polite');
+    toast.style.setProperty('--toast-duration', `${duration / 1000}s`);
     toast.innerHTML = `
         <span class="toast-icon" aria-hidden="true">${TOAST_ICONS[tone] || TOAST_ICONS.info}</span>
         <div class="toast-body">
@@ -113,6 +122,12 @@ function showToast(title, message, { tone = 'info', duration = 4500 } = {}) {
         <button class="toast-close" type="button" aria-label="Dismiss notification">&times;</button>
     `;
     toast.querySelector('.toast-close').addEventListener('click', () => dismissToast(id));
+
+    const existing = toastRegion.querySelector(`.toast[data-id="${id - 1}"]`);
+    if (existing) {
+        existing.style.marginTop = '0';
+    }
+
     toastRegion.appendChild(toast);
 
     if (duration > 0) {
@@ -163,19 +178,20 @@ function unreadCount() {
     return notificationStore.filter((n) => !n.read).length;
 }
 
-function pushNotification({ title, message, tone = 'info', href = null }) {
+function pushNotification({ title, message, tone = 'info', href = null, category = null }) {
     notificationStore.push({
         id: Date.now() + Math.random(),
         title,
         message,
         tone,
         href,
+        category,
         read: false,
         timestamp: Date.now()
     });
     saveNotifications(notificationStore);
     renderNotificationBell();
-    if (notificationDropdown && !notificationDropdown.hidden) {
+    if (!notificationDropdown.hidden) {
         renderNotificationList();
     }
 }
@@ -232,14 +248,15 @@ function renderNotificationList() {
     for (const item of recent) {
         const el = document.createElement('div');
         el.className = `notification-item is-${item.tone} ${item.read ? '' : 'unread'}`;
+        const iconSvg = NOTIFICATION_CATEGORY_ICONS[item.category] || TOAST_ICONS[item.tone];
         el.innerHTML = `
-            <span class="notification-item-icon" aria-hidden="true">${TOAST_ICONS[item.tone] || TOAST_ICONS.info}</span>
+            <span class="notification-item-icon" aria-hidden="true">${iconSvg}</span>
             <div class="notification-item-content">
                 <div class="notification-item-title">${escapeHtml(item.title)}</div>
                 ${item.message ? `<div class="notification-item-message">${escapeHtml(item.message)}</div>` : ''}
+                <div class="notification-item-time">${formatTimeAgo(item.timestamp)}</div>
             </div>
-            <span class="notification-item-time">${formatTimeAgo(item.timestamp)}</span>
-            <button class="notification-item-close" type="button" aria-label="Dismiss">&times;</button>
+            <button type="button" class="notification-item-close" aria-label="Dismiss">&times;</button>
         `;
 
         el.querySelector('.notification-item-close').addEventListener('click', () => dismissNotification(item.id));
@@ -317,28 +334,28 @@ function notifyDepositConfirmed(item) {
     const title = 'Deposit credited';
     const message = `${formatBalance(item.amount)} ${item.currency_code || 'USD'} added to your balance.`;
     showToast(title, message, { tone: 'success' });
-    pushNotification({ title, message, tone: 'success' });
+    pushNotification({ title, message, tone: 'success', category: 'deposit' });
 }
 
 function notifyWithdrawalSubmitted(item) {
     const title = 'Withdrawal submitted';
     const message = `Your request to withdraw ${formatBalance(item.amount)} is being processed.`;
     showToast(title, message, { tone: 'info' });
-    pushNotification({ title, message, tone: 'info' });
+    pushNotification({ title, message, tone: 'info', category: 'withdrawal' });
 }
 
 function notifyWithdrawalPaid(item) {
     const title = 'Withdrawal sent';
     const message = `${formatBalance(item.amount)} has been sent to your payment method.`;
     showToast(title, message, { tone: 'success' });
-    pushNotification({ title, message, tone: 'success' });
+    pushNotification({ title, message, tone: 'success', category: 'withdrawal' });
 }
 
 function notifyWithdrawalFailed(item) {
     const title = 'Withdrawal failed';
     const message = item.failureReason || 'Your withdrawal could not be completed.';
     showToast(title, message, { tone: 'error' });
-    pushNotification({ title, message, tone: 'error' });
+    pushNotification({ title, message, tone: 'error', category: 'withdrawal' });
 }
 
 function notifySessionExpired() {
@@ -848,7 +865,7 @@ function applyLiveUpdate(payload) {
             const title = 'Reward credited';
             const message = `${formatBalance(adjusted)} credited to your balance from a completed offer.`;
             showToast(title, message, { tone: 'success' });
-            pushNotification({ title, message, tone: 'success' });
+            pushNotification({ title, message, tone: 'success', category: 'reward' });
         }
     }
 
@@ -861,7 +878,7 @@ function applyLiveUpdate(payload) {
             const title = 'Demo reward credited';
             const message = `${formatBalance(demoDelta)} demo added to your balance.`;
             showToast(title, message, { tone: 'info' });
-            pushNotification({ title, message, tone: 'info' });
+            pushNotification({ title, message, tone: 'info', category: 'reward' });
         }
     }
 
@@ -1518,9 +1535,10 @@ async function sendMagicLink() {
     const form = document.getElementById('account-form');
     const email = form.dataset.verifyEmail || document.getElementById('account-email').value.trim();
     const button = document.getElementById('verify-magic-link');
+    const messageBox = document.getElementById('verify-message');
 
     button.disabled = true;
-    button.textContent = 'Sending...';
+    button.textContent = 'Sending magic link...';
     setFormMessage('verify-message', '');
 
     try {
@@ -1533,13 +1551,16 @@ async function sendMagicLink() {
         pushNotification({
             title: 'Magic link sent',
             message: 'Check your email for a sign-in link.',
-            tone: 'success'
+            tone: 'success',
+            category: 'magic'
         });
-        // Auto-open the dialog if the user clicked the link from outside the sign-in dialog.
-        // If they are already on the verify step, leave them there.
+        button.textContent = 'Magic link sent';
+        setTimeout(() => {
+            button.disabled = false;
+            button.textContent = 'Resend magic link';
+        }, 2000);
     } catch (error) {
         setFormMessage('verify-message', error.message, 'error');
-    } finally {
         button.disabled = false;
         button.textContent = 'Send me a magic link instead';
     }
@@ -2294,10 +2315,6 @@ function renderDepositInstructions(result) {
 
     const lead = document.createElement('p');
     lead.className = 'receipt-lead';
-    // The amount and the network are repeated as plain text below the QR on purpose. A
-    // wallet that ignores the QR still has to be told the exact figure, and these are the
-    // two values that cannot be guessed.
-    lead.textContent = `Send exactly ${result.payAmount} ${result.assetCode} on the ${result.network} network.`;
 
     const stage = document.createElement('div');
     stage.className = 'receipt-stage';
@@ -2318,6 +2335,18 @@ function renderDepositInstructions(result) {
     const countdown = buildCountdown(result.expiresAt);
     if (countdown) {
         details.append(countdown);
+    }
+
+    const isExpired = countdown && (() => {
+        const deadline = Number(countdown.dataset.deadline);
+        return Number.isFinite(deadline) && Date.now() >= deadline;
+    })();
+
+    if (isExpired) {
+        lead.textContent = 'This deposit address has expired. Start a new deposit to get a fresh address and countdown.';
+        lead.style.color = 'var(--warning)';
+    } else {
+        lead.textContent = `Send exactly ${result.payAmount} ${result.assetCode} on the ${result.network} network.`;
     }
 
     const network = document.createElement('p');
@@ -2365,7 +2394,7 @@ function renderDepositInstructions(result) {
         details.append(extra);
     }
 
-    details.append(network, warning, addressLabel, address, copy);
+     details.append(network, warning, addressLabel, address, copy);
 
     const note = document.createElement('p');
     note.className = 'receipt-note';
@@ -2380,7 +2409,12 @@ function renderDepositInstructions(result) {
     again.textContent = 'Make another deposit';
     again.addEventListener('click', resetDepositForAnother);
 
-    stage.append(details);
+    // Only show the QR and payment details when the address is still live. An expired
+    // address that the user scans or copies is money in the wind.
+    if (!isExpired) {
+        stage.append(details);
+    }
+
     instructions.append(heading, lead, stage, note, again);
     // Tracked so the live sync can find this panel's note without another id lookup, and so
     // it knows which deposit the status belongs to.
@@ -3333,7 +3367,7 @@ async function showDepositSuccess(deposit) {
     document.getElementById('deposit-success-balance').textContent = balanceText;
 
     const receiptLink = document.getElementById('deposit-success-receipt');
-    receiptLink.href = deposit.receipt_url || `/deposit/${deposit.id}`;
+        receiptLink.href = deposit.receipt_url || `/receipt/deposit/${deposit.id}`;
 
     // A toast as well as the dialog: the dialog only appears when the poll that
     // noticed the credit is running, which is while the deposit dialog is open.

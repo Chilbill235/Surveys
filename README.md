@@ -39,7 +39,7 @@ tracking hop are served by the function, not by static files.
 | --- | --- |
 | `/api/**` | the function (`api/index.js` -> `src/app.js`) |
 | `/style.css`, `/*.js`, `/*.html` | Vercel's static files, served before any rewrite |
-| `/`, `/offers`, `/reset-password`, `/deposit/:id`, `/demo` | the function, which picks the right page |
+| `/`, `/offers`, `/reset-password`, `/receipt/deposit/:id`, `/demo` | the function, which picks the right page |
 | **`/offer/engage`** | the function — this is the redirect to the advertiser |
 | everything else | the function, which answers 404 |
 
@@ -51,7 +51,7 @@ it looks completely reasonable, but `/offer/engage` is not under `/api` — so t
 redirect was swallowed, every user who clicked an offer landed back on the offers page, and
 nothing anywhere reported an error. The same rewrite also broke `/` (the home page became
 the catalog), `/reset-password` (password reset could never load its form), and
-`/deposit/:id` (no receipt). The tests could not catch it, because under `npm start` Express
+`/receipt/deposit/:id` (no receipt). The tests could not catch it, because under `npm start` Express
 serves all of them correctly and `vercel.json` is not consulted.
 
 `npm run vercel-build` now parses `vercel.json` and fails the build if the catch-all points

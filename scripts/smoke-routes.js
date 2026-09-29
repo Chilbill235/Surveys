@@ -33,7 +33,7 @@ const { createHmac } = require('crypto');
     await check('home page', '/', (r, b) => r.status === 200 && !b.includes('id="offer-grid"'));
     await check('offers page', '/offers', (r, b) => r.status === 200 && b.includes('id="offer-grid"'));
     await check('password reset page', '/reset-password', (r, b) => r.status === 200 && !b.includes('id="offer-grid"'));
-    await check('deposit receipt page', '/deposit/1', (r, b) => r.status === 200 && !b.includes('id="offer-grid"'));
+    await check('deposit receipt page', '/receipt/deposit/1', (r, b) => r.status === 200 && !b.includes('id="offer-grid"'));
     await check('demo page (non-production)', '/demo', (r) => r.status === 200);
     await check('static script', '/app.js', (r) => r.status === 200);
     await check('stylesheet', '/style.css', (r) => r.status === 200);
