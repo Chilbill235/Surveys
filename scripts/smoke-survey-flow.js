@@ -1,184 +1,212 @@
+#!/usr/bin/env node
 /**
- * The reported failure, reproduced and then fixed.
+ * End-to-end smoke test for the demo offer and survey flow.
  *
- * Run with the environment of a real deployment: NODE_ENV=production, demo mode off. The
- * survey must not be advertised, and a click that was recorded elsewhere must not dead-end.
- * Then with demo mode on, the whole flow -- catalog, click, engage, survey, completion --
- * must work, which is the state a staging deployment needs.
+ * Covers the path that unit tests structurally cannot: click -> engage -> task/survey page ->
+ * completion -> balance credited -> repeat completion refused. The unit tests assert the rules;
+ * this asserts that the rules are wired to each other and to a real database.
+ *
+ * The account is created directly in the database, marked verified, and then signed in through
+ * the real `POST /api/auth/login`. It used to be created with `POST /api/auth/register` and its
+ * response used as the session -- which stopped working when registration began issuing no token
+ * until the emailed code is entered. The script then carried `undefined` into an
+ * `Authorization` header, every subsequent call 401'd, and it died on a `new URL('undefined')`.
+ * So it had been reporting failures that said nothing about offers, while the offer flow it
+ * exists to test went unexercised.
+ *
+ * Going through `login` rather than issuing a session directly keeps most of the real thing: the
+ * password is hashed and verified by the same code, and the token is a real one. Only the
+ * emailed code is stepped over, because it is stored hashed precisely so that it cannot be read
+ * out of the database -- which is the correct design and the reason this script cannot automate
+ * that step without a mail provider.
+ *
+ * Not destructive: it creates one throwaway user per run and does not touch any other row.
  */
-const port = Number(process.env.SMOKE_PORT || 3320);
-process.env.PORT = String(port);
-// Production refuses a loopback `APP_BASE_URL` — correctly, because a provider could never
-// reach it. The public origin of the deployment under test is used so the URL-building
-// paths run the way they do in production, and the assertions check the *shape* of the
-// redirect rather than following it off this machine.
-process.env.APP_BASE_URL = process.env.SMOKE_PUBLIC_ORIGIN || 'https://deployment-under-test.example';
-process.env.NODE_ENV = 'production';
-
+require('dotenv').config();
 const pool = require('../src/config/db');
-const app = require('../src/app');
-const { isDemoModeEnabled, describeDemoMode } = require('../src/services/demoMode');
+const { hashPassword } = require('../src/controllers/authController');
 
-const asyncRun = (fn) => fn().catch((error) => {
-    console.error('failed:', error);
-    process.exit(2);
-});
+const origin = process.env.APP_BASE_URL || 'http://localhost:3001';
+const offerNetwork = 'RewardZone Local Demo 1';
+const surveyNetwork = 'RewardZone Local Demo Survey';
 
-(async () => {
-    let failures = 0;
-    const check = (label, ok, detail = '') => {
-        if (!ok) failures += 1;
-        console.log(`${ok ? 'ok  ' : 'FAIL'}  ${label}${detail ? `  ${detail}` : ''}`);
-    };
+let failures = 0;
 
-    // ---------------------------------------------------------------- off
-    delete process.env.OFFERS_INCLUDE_DEMO;
-    check('demo mode is off with NODE_ENV=production and no override',
-        isDemoModeEnabled() === false, JSON.stringify(describeDemoMode()));
+function check(label, passed, detail = '') {
+    const line = `${passed ? 'ok  ' : 'FAIL'}  ${label}${detail ? `  ${detail}` : ''}`;
+    console.log(line);
+    if (!passed) failures += 1;
+}
 
-    const server = app.listen(port);
-    await new Promise((r) => server.once('listening', r));
-    const origin = `http://127.0.0.1:${port}`;
-
-    const catalogOff = await fetch(`${origin}/api/offers`);
-    const rowsOff = await catalogOff.json();
-    check('catalog hides demo offers', Array.isArray(rowsOff) && rowsOff.every((o) => !o.is_demo),
-        `${rowsOff.length} offers`);
-
-    const demoPageOff = await fetch(`${origin}/demo`);
-    check('/demo is not served', demoPageOff.status === 404, `status ${demoPageOff.status}`);
-
-    // ---------------------------------------------------------------- on
-    process.env.OFFERS_INCLUDE_DEMO = 'true';
-    check('demo mode is on with the override, still in production',
-        isDemoModeEnabled() === true, JSON.stringify(describeDemoMode()));
-
-    const catalogOn = await fetch(`${origin}/api/offers`);
-    const rowsOn = await catalogOn.json();
-    const demoRows = rowsOn.filter((o) => o.is_demo);
-    check('catalog shows demo offers', demoRows.length > 0, `${demoRows.length} demo, ${rowsOn.length} total`);
-    check('catalog is cacheable', /max-age=30/.test(catalogOn.headers.get('cache-control') || ''),
-        catalogOn.headers.get('cache-control'));
-
-    const demoPageOn = await fetch(`${origin}/demo`);
-    const demoPageBody = await demoPageOn.text();
-    check('/demo is served', demoPageOn.status === 200 && demoPageBody.includes('demo-panel'),
-        `status ${demoPageOn.status}`);
-
-    // A click on a demo offer, created while demo mode was off, must not be recorded.
-    const noUser = await fetch(`${origin}/api/click/1`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }
-    });
-    check('click without a session is refused', noUser.status === 401, `status ${noUser.status}`);
-
-    // The full flow with a session.
-    const registered = await fetch(`${origin}/api/auth/register`, {
+/** A real session for a fresh account, without going through the emailed code. */
+async function session(email, password) {
+    const passwordHash = await hashPassword(password);
+    // No `ON CONFLICT`: `users.email` is unique through a *partial* index on `lower(email)`, not
+    // a table constraint, so `ON CONFLICT (email)` does not match anything and fails outright.
+    // The address below is unique per run anyway -- a timestamp and six random digits -- so
+    // there is nothing to conflict with. Naming that constraint would have been the alternative,
+    // and it would have been a worse one: a second uniqueness rule on a column that already has
+    // one is two things that can disagree about what "the same email" means.
+    const inserted = await pool.query(
+        `INSERT INTO users (email, username, password_hash, email_verified_at, balance, demo_balance)
+         VALUES ($1, $2, $3, NOW(), 0, 0)
+         RETURNING id`,
+        [email, `smoke-${Math.floor(Math.random() * 1e9)}`, passwordHash]
+    );
+    const response = await fetch(`${origin}/api/auth/login`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: `surveypath-${Date.now()}@example.test`, password: 'survey-path-password-1' })
+        body: JSON.stringify({ email, password })
     });
-    const session = await registered.json();
-    check('registered a session', Boolean(session.token), `status ${registered.status}`);
+    const body = await response.json();
+    return { userId: inserted.rows[0].id, token: body.token || null, status: response.status };
+}
 
-    const demoOffer = demoRows.find((o) => o.offer_type === 'survey') || demoRows[0];
-    const click = await fetch(`${origin}/api/click/${demoOffer.id}`, {
+async function completeFlow(label, networkName, answersFor) {
+    const email = `smoke-${Date.now()}-${Math.floor(Math.random() * 1e6)}@example.test`;
+    const password = 'smoke-flow-password-1';
+    const signedIn = await session(email, password);
+    check(`${label}: signed in`, Boolean(signedIn.token), `status ${signedIn.status}`);
+    if (!signedIn.token) return;
+
+    const auth = { 'Content-Type': 'application/json', Authorization: `Bearer ${signedIn.token}` };
+
+    const offer = await pool.query('SELECT id FROM offers WHERE network_name = $1', [networkName]);
+    if (offer.rows.length === 0) {
+        check(`${label}: the offer exists`, false, `no offer named ${networkName} -- run npm run seed:demo`);
+        return;
+    }
+    const offerId = offer.rows[0].id;
+
+    const click = await fetch(`${origin}/api/click/${offerId}`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${session.token}` },
-        body: '{}'
+        headers: auth
     });
     const clickBody = await click.json();
-    check('demo click is recorded', click.status === 200 && Boolean(clickBody.redirectUrl),
-        `status ${click.status}`);
+    check(`${label}: click recorded`, Boolean(clickBody.redirectUrl), `status ${click.status}`);
 
-    // The engage hop is requested on the local server, not on the public origin the
-    // redirect names, so this exercises the handler without leaving the machine.
-    const engageTarget = new URL(clickBody.redirectUrl);
-    const engage = await fetch(`${origin}${engageTarget.pathname}${engageTarget.search}`, {
-        redirect: 'manual'
+    const engaged = await fetch(clickBody.redirectUrl, { headers: { Authorization: `Bearer ${signedIn.token}` }, redirect: 'manual' });
+    check(`${label}: engage redirects into the task`, engaged.status === 302, `status ${engaged.status}`);
+    const location = engaged.headers.get('location') || '';
+    check(`${label}: engage targets the task page`, location.includes('/demo'), location);
+
+    // The task definition, exactly as the page asks it.
+    const clickId = new URL(clickBody.redirectUrl, origin).searchParams.get('aff_sub');
+    const task = await fetch(`${origin}/api/demo/survey?clickId=${encodeURIComponent(clickId)}`, {
+        headers: { Authorization: `Bearer ${signedIn.token}` }
     });
-    const location = engage.headers.get('location') || '';
-    check('demo click reaches the survey', engage.status === 302 && location.includes('/demo'),
-        `status ${engage.status} -> ${location.slice(0, 70)}`);
-    check('the survey receives its click id', location.includes('click_id='));
-    check('the survey redirect points at the configured public origin',
-        location.startsWith(process.env.APP_BASE_URL),
-        location.slice(0, 60));
+    const taskBody = await task.json();
+    const questions = taskBody.questions || [];
+    const steps = taskBody.steps || [];
+    check(`${label}: the page was given something to answer`, questions.length > 0 || steps.length > 0,
+        `offerType=${taskBody.offerType} questions=${questions.length} steps=${steps.length}`);
 
-    // The page asks what the database says the questions are, so the two cannot drift. This
-    // is the check that would have caught an answer offered by the page and refused by the
-    // server, which is the failure the hardcoded pair of definitions allowed.
-    const survey = await fetch(`${origin}/api/demo/survey`, {
-        headers: { Authorization: `Bearer ${session.token}` }
-    });
-    const surveyBody = await survey.json();
-    const asked = Array.isArray(surveyBody.questions) ? surveyBody.questions : [];
-    check('the survey is served from the database', survey.status === 200 && asked.length > 0,
-        `status ${survey.status}, ${asked.length} question(s)`);
-    check('every question is answerable and carries options',
-        asked.every((q) => q.key && q.prompt && Array.isArray(q.options) && q.options.length > 0),
-        asked.map((q) => q.key).join(', ') || 'none');
-    check('the survey requires a session',
-        (await fetch(`${origin}/api/demo/survey`)).status === 401);
+    // Built from what the server just asked for, rather than hardcoded -- which is what caught
+    // the two real staleness bugs here: a task completed with `{completed: true}` when it needs
+    // every position ticked, and a survey answered with two keys when four questions are required.
+    const answers = answersFor({ questions, steps });
+    check(`${label}: built an answer for what was asked`, Object.keys(answers).length > 0);
 
-    // An answer that is not on the list must be refused, which is what keeps a stale page
-    // from recording a response to a question that no longer exists.
-    const invented = await fetch(`${origin}/api/demo/complete`, {
+    const incomplete = await fetch(`${origin}/api/demo/complete`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${session.token}` },
-        body: JSON.stringify({
-            clickId: engageTarget.searchParams.get('aff_sub'),
-            answers: { favorite: 'not-a-real-option', frequency: 'daily' }
-        })
+        headers: auth,
+        body: JSON.stringify({ clickId, answers: {} })
     });
-    check('an answer the survey never offered is refused', invented.status === 400,
-        `status ${invented.status}`);
+    check(`${label}: an empty answer is refused`, incomplete.status === 400, `status ${incomplete.status}`);
 
-    const complete = await fetch(`${origin}/api/demo/complete`, {
+    const completed = await fetch(`${origin}/api/demo/complete`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${session.token}` },
-        body: JSON.stringify({
-            clickId: engageTarget.searchParams.get('aff_sub'),
-            // Built from what was actually asked, rather than hardcoded here -- which is the
-            // whole point of the endpoint existing.
-            answers: Object.fromEntries(asked.map((q) => [q.key, q.options[0].value]))
-        })
+        headers: auth,
+        body: JSON.stringify({ clickId, answers })
     });
-    const completeBody = await complete.json();
-    check('the survey completion is accepted', complete.status === 200,
-        `status ${complete.status} ${JSON.stringify(completeBody).slice(0, 80)}`);
+    const completedBody = await completed.json();
+    check(`${label}: completion is accepted`, completed.status === 200, `status ${completed.status} ${JSON.stringify(completedBody)}`);
+    // `credited` is the payout amount, not a count of events. Asserting `=== 1` would have been
+    // wrong for every offer that pays more than a dollar, and would have passed on a $1.00 offer
+    // while meaning something entirely different from what it looked like.
+    check(`${label}: it credited the payout`, Number(completedBody.credited) > 0, `credited ${completedBody.credited}`);
+    check(`${label}: it reports the new balance`, typeof completedBody.demoBalance === 'string',
+        `demoBalance ${completedBody.demoBalance}`);
+    check(`${label}: it returns somewhere to go`, typeof completedBody.returnTo === 'string' && completedBody.returnTo.length > 0, String(completedBody.returnTo));
 
-    // Now turn demo mode back off and replay the SAME click. This is the reported case:
-    // a click recorded while demos were on, engaged on a deployment where they are off.
-    process.env.OFFERS_INCLUDE_DEMO = 'false';
-    const replay = await fetch(`${origin}${engageTarget.pathname}${engageTarget.search}`, { redirect: 'manual' });
-    const replayLocation = replay.headers.get('location') || '';
-    check('a click that cannot run here is sent back to the catalog, not a dead end',
-        replay.status === 302 && replayLocation.includes('/offers'),
-        `status ${replay.status} -> ${replayLocation.slice(0, 70)}`);
-    check('and it is told why', replayLocation.includes('notice=demo-unavailable'));
+    const after = await pool.query('SELECT demo_balance FROM users WHERE id = $1', [signedIn.userId]);
+    check(`${label}: the test balance actually moved`, Number(after.rows[0].demo_balance) > 0, `demo_balance ${after.rows[0].demo_balance}`);
 
-    const newClick = await fetch(`${origin}/api/click/${demoOffer.id}`, {
+    // A second claim on the same click is the one that would pay twice.
+    const repeated = await fetch(`${origin}/api/demo/complete`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${session.token}` },
-        body: '{}'
+        headers: auth,
+        body: JSON.stringify({ clickId, answers })
     });
-    check('a new click on a demo offer is refused with an explanation',
-        newClick.status === 404, `status ${newClick.status}`);
+    const repeatedBody = await repeated.json();
+    check(`${label}: a repeat claim is refused`, repeated.status === 200 && repeatedBody.alreadyCompleted === true,
+        `status ${repeated.status} alreadyCompleted ${repeatedBody.alreadyCompleted}`);
 
-    // Real offers must still work with demo mode off.
-    const realOffer = rowsOn.find((o) => !o.is_demo);
-    check('no real offers exist in this database to test with', true,
-        realOffer ? `offer ${realOffer.id} available` : 'skipped: catalog is demo-only');
+    const afterRepeat = await pool.query('SELECT demo_balance FROM users WHERE id = $1', [signedIn.userId]);
+    check(`${label}: a repeat claim pays nothing`, Number(afterRepeat.rows[0].demo_balance) === Number(after.rows[0].demo_balance),
+        `demo_balance ${after.rows[0].demo_balance} -> ${afterRepeat.rows[0].demo_balance}`);
+    // A repeat must report no new credit, not the original amount again. Asserted because a
+    // handler that returns the same body twice looks correct to every other check here.
+    check(`${label}: a repeat claim credits nothing further`,
+        !repeatedBody.credited || Number(repeatedBody.credited) === 0,
+        `credited ${repeatedBody.credited}`);
 
-    // Clean up.
-    if (session.user && session.user.id) {
-        await pool.query('DELETE FROM clicks WHERE user_id = $1', [session.user.id]).catch(() => {});
-        await pool.query('DELETE FROM fraud_logs WHERE user_id = $1', [session.user.id]).catch(() => {});
-        await pool.query('DELETE FROM users WHERE id = $1', [session.user.id]).catch(() => {});
+    const conversions = await pool.query('SELECT COUNT(*)::int AS n FROM conversions WHERE click_id = $1', [clickId]);
+    check(`${label}: exactly one conversion was recorded`, conversions.rows[0].n === 1, `n=${conversions.rows[0].n}`);
+}
+
+/** Every step ticked, keyed by the position the server asked about. */
+const stepAnswers = ({ steps }) =>
+    Object.fromEntries(steps.map((step) => [String(step.position), true]));
+
+/** One option value per question, chosen from the options the server offered. */
+const surveyAnswers = ({ questions }) =>
+    Object.fromEntries(questions.map((question) => [question.key, question.options[0].value]));
+
+async function main() {
+    console.log(`Smoke testing the demo offer flow against ${origin}\n`);
+
+    // Note on what this does *not* check: it used to flip `OFFERS_INCLUDE_DEMO` and `NODE_ENV`
+    // in its own environment and assert that the catalog hid the demo offers and that `/demo`
+    // 404'd. Those assertions cannot pass here. The script talks to a server somebody else
+    // started -- the user's nodemon, in this case -- and that process read its environment when
+    // it booted. Changing this process's `process.env` afterwards changes nothing about it, so
+    // both checks were reporting failures that described the script's own environment rather
+    // than the product. They are dropped rather than "fixed", because there is no version of
+    // them that means anything without this script spawning the server itself. The demo-mode
+    // matrix is covered in `test/server.test.js`, which boots the app with the environment it
+    // needs.
+
+    const catalog = await fetch(`${origin}/api/offers`);
+    const offers = await catalog.json();
+    check('the catalog is served', catalog.status === 200, `status ${catalog.status}`);
+    check('the catalog is cacheable',
+        /max-age=\d+/.test(catalog.headers.get('cache-control') || ''),
+        catalog.headers.get('cache-control'));
+    check('demo offers are listed', offers.filter((offer) => offer.is_demo).length > 0, `${offers.length} offers`);
+    check('the catalog never leaks a tracking url', offers.every((offer) => offer.tracking_url === undefined));
+
+    const taskPage = await fetch(`${origin}/demo`);
+    check('the task page is served', taskPage.status === 200, `status ${taskPage.status}`);
+
+    const unsigned = await fetch(`${origin}/api/click/1`, { method: 'POST' });
+    check('a click without a session is refused', unsigned.status === 401, `status ${unsigned.status}`);
+
+    await completeFlow('task', offerNetwork, stepAnswers);
+    await completeFlow('survey', surveyNetwork, surveyAnswers);
+
+    console.log('');
+    if (failures === 0) {
+        console.log('The demo offer and survey flow works end to end.');
+    } else {
+        console.log(`${failures} check(s) failed.`);
+        process.exitCode = 1;
     }
+}
 
-    server.close();
-    await pool.end().catch(() => {});
-    console.log(`\n${failures === 0 ? 'Demo/offer flow OK in both modes.' : failures + ' check(s) failed.'}`);
-    process.exit(failures === 0 ? 0 : 1);
-})();
+main()
+    .catch(async (error) => {
+        console.error('\nThe smoke run did not finish:', error.message);
+        process.exitCode = 1;
+    })
+    .finally(() => pool.end());

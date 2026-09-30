@@ -167,18 +167,22 @@
          explained in home.html. The Terms self-link is the one omission: this page
          already is the Terms, and a footer that links to the page you are on is a
          link that can only ever do nothing. -->
-    <!--
+        <!--
         The footer, identical on every page.
 
-        One column, top to bottom, at every width. The previous layout put Product / Help /
-        Legal side by side as parallel columns on desktop, which reads fine on paper and badly
-        on a screen: someone looking for the Privacy Policy has to guess which of three columns
-        holds it and then check the other two headings to be sure. Stacked, the page has one
-        reading order that is the same on every device, and "the legal links are further down"
-        is an answer a visitor can act on without a strategy.
+        Grouped columns with the brand on the left. Three labelled lists side by side rather than
+        one tall stack: on a desktop the whole footer is one screen, so the reader sees what the
+        site has before scrolling past it, and a stack of twelve links with two headings between
+        them makes the reader travel the height of the page to find out nothing else is coming.
 
-        Every href resolves. That is checked, not assumed: a legal link that goes nowhere is
-        worse than a missing one, because it implies the document exists and cannot be read.
+        Group order is fixed and identical on every page -- Menu, Help, Legal -- because the one
+        real cost of columns is having to guess which one holds the page you want. A heading on
+        every group plus a fixed order makes the guess unnecessary.
+
+        Every href resolves. That is checked, not assumed: a legal link that goes nowhere is worse
+        than a missing one, because it implies the document exists and cannot be read. Only real
+        destinations are linked -- there is no Fairness or Advertise link here, because no such
+        page exists to link to.
     -->
     <footer class="site-footer">
         <div class="site-footer-brand">
@@ -190,23 +194,23 @@
             <p class="site-footer-copy">&copy; <span data-current-year>2026</span> RewardZone. All rights reserved.</p>
         </div>
 
-        <nav class="site-footer-group" aria-label="Product">
-            <h2 class="site-footer-heading">Product</h2>
+        <nav class="site-footer-group" aria-label="Menu">
+            <h2 class="site-footer-heading">Menu</h2>
             <a href="/">Home</a>
             <a href="/offers">Offers</a>
             <a href="/account">Your account</a>
-            <a href="/#home-faq">Frequently asked questions</a>
+            <a href="/login">Sign in</a>
         </nav>
 
         <nav class="site-footer-group" aria-label="Help">
             <h2 class="site-footer-heading">Help</h2>
-            <a href="/account">Sign in or create an account</a>
-            <a href="/reset-password">Reset your password</a>
+            <a href="/#home-faq">Frequently asked</a>
             <a href="#" data-helpdesk-trigger>Help desk</a>
             <a href="#" data-contact-trigger>Contact support</a>
+            <a href="/reset-password">Reset your password</a>
         </nav>
 
-        <nav class="site-footer-group" aria-label="Legal">
+        <nav class="site-footer-group site-footer-group-legal" aria-label="Legal">
             <h2 class="site-footer-heading">Legal</h2>
             <a href="/terms">Terms of service</a>
             <a href="/privacy">Privacy policy</a>
@@ -276,6 +280,10 @@
          scripts below look them up once the DOM is ready. Deferred scripts run in document
          order, so putting it ahead of them is what makes those lookups resolve. -->
     <script src="/clock.js" defer></script>
+    <!-- helpdesk.js binds the footer's "Help desk" link. Without it the link is in the markup on
+         this page with nothing behind it, so it does nothing at all when clicked -- a dead link
+         in the one place a visitor goes looking for help. The other six footer pages load it. -->
+    <script src="/helpdesk.js" defer></script>
     <script src="/contact.js" defer></script>
 
 </body>

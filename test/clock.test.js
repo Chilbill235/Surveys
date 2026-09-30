@@ -45,8 +45,8 @@ function extractFunction(name) {
  * extracted functions to close over. Asserting on its value is the point of the pin tests, so
  * it is read out of the source rather than hardcoded here.
  */
-function clockContext() {
-    const context = { Date, Intl, Math, Number, String, Object };
+function clockContext(IntlOverride) {
+    const context = { Date, Intl: IntlOverride || Intl, Math, Number, String, Object };
     vm.createContext(context);
     vm.runInContext(
         `const CLOCK_ZONE = ${JSON.stringify(/const CLOCK_ZONE = '([^']+)'/.exec(source)[1])};\n`
@@ -81,7 +81,7 @@ test('a moment is formatted identically whatever the host zone is', () => {
     const moment = new Date('2027-01-01T03:30:00Z');
     const { formatTime, formatShortDate } = clockContext();
 
-    assert.equal(formatTime(moment), '22:30:00');
+    assert.equal(formatTime(moment), '10:30:00 PM');
     assert.equal(formatShortDate(moment), 'Thu, Dec 31, 2026');
 });
 
@@ -100,11 +100,35 @@ test('the date carries the weekday, the day, the month and the year', () => {
     assert.doesNotMatch(out, /  +/, 'the separators left a double space');
 });
 
-test('the time is 24-hour and zero-padded', () => {
+test('the time is twelve-hour, and says which half of the day it is', () => {
     const { formatTime } = clockContext();
-    // `hour12: false` on `en-US` is the trap: it renders midnight as "24" rather than "00" in
-    // some engines, which makes a clock tick to 24 before rolling to 01.
-    assert.equal(formatTime(new Date('2026-09-30T00:05:09Z')), '20:05:09');
+
+    // This was 24-hour, which meant "20:05" -- a form a large share of readers take for a
+    // military or broadcast time rather than as eight in the evening. It also meant the clock did
+    // not say whether offers and survey windows closing "at 20:00" close tonight or tomorrow
+    // morning, which for a site whose deadlines are wall-clock events is the whole question.
+    //
+    // The old reason for the zero-padding assertion is now gone rather than fixed: `hour12: false`
+    // on `en-US` renders midnight as "24" in some engines, so the clock used to tick to 24 before
+    // rolling to 01. A twelve-hour clock has no 24, and midnight is unambiguously 12:05 AM.
+    assert.equal(formatTime(new Date('2026-09-30T00:05:09Z')), '8:05:09 PM');
+    assert.equal(formatTime(new Date('2026-09-30T00:05:09Z')).slice(-2), 'PM');
+
+    // Both ends of the day, because "12" is ambiguous on its own and the meridiem is what
+    // resolves it -- the bug this format change is most likely to reintroduce.
+    const at = (iso) => formatTime(new Date(iso));
+    assert.match(at('2026-09-30T04:05:09Z'), /^12:05:09 AM$/, 'midnight must not print as 0 AM or 24:00');
+    assert.match(at('2026-09-30T16:05:09Z'), /^12:05:09 PM$/, 'noon must not print as 0 PM');
+    assert.match(at('2026-09-30T09:05:09Z'), /^5:05:09 AM$/, 'a morning hour');
+    assert.match(at('2026-09-30T14:05:09Z'), /^10:05:09 AM$/, 'a late morning hour');
+
+    // Nothing may print a 24-hour hour, at any hour of the day.
+    for (let hour = 0; hour < 24; hour++) {
+        const shown = formatTime(new Date(Date.UTC(2026, 8, 30, hour, 0, 0)));
+        const printed = Number(shown.split(':')[0]);
+        assert.ok(printed >= 1 && printed <= 12, `hour ${hour} rendered as "${shown}"`);
+        assert.match(shown, /(AM|PM)$/, `hour ${hour} rendered without a meridiem: "${shown}"`);
+    }
 });
 
 test('the zone label is gone from the markup the script builds', () => {
@@ -145,6 +169,22 @@ test('a browser that cannot name the zone does not lose the header', () => {
     // arithmetic fallback. A trimmed-tzdata engine must not take the whole header down over a
     // clock.
     assert.match(extractFunction('zoneFormatter'), /catch\s*\{\s*return null/);
-    assert.match(extractFunction('formatTime'), /pad\(date\.getHours\(\)\)/);
     assert.match(extractFunction('formatShortDate'), /date\.getFullYear\(\)/);
+
+    // The fallback has to render the meridiem too, and it is the version most likely to drift:
+    // it is plain arithmetic rather than `Intl`, so nothing about it is automatic. A fallback that
+    // quietly produced "20:05:09" would mean the browser with the *worst* timezone support is also
+    // the only one showing a 24-hour clock -- the opposite of what this change is for.
+    const fallback = extractFunction('formatTime');
+    assert.match(fallback, /getHours\(\)/, 'the fallback no longer derives the hour itself');
+    assert.match(fallback, /AM|PM/, 'the fallback renders no meridiem');
+
+    // And it is actually run, with `Intl` throwing, so the assertion is about behaviour rather
+    // than about a substring being present.
+    const broken = clockContext({
+        DateTimeFormat() { throw new RangeError('no such zone'); }
+    });
+    const out = broken.formatTime(new Date('2026-09-30T20:05:09'));
+    assert.match(out, /(AM|PM)$/, `the fallback printed "${out}" with no meridiem`);
+    assert.match(out, /^\d{1,2}:\d{2}:\d{2}/, `the fallback printed "${out}"`);
 });

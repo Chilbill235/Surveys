@@ -44,7 +44,7 @@ const HISTORY_MAX_LIMIT = 500;
  * Kept next to the pagination constants because both exist for the same reason -- the endpoint
  * is asked questions about a list rather than only being asked for the list.
  */
-const HISTORY_FILTER_TYPES = new Set(['deposit', 'withdrawal', 'conversion', 'refund', 'adjustment']);
+const HISTORY_FILTER_TYPES = new Set(['deposit', 'withdrawal', 'conversion', 'chargeback', 'refund', 'adjustment']);
 
 /**
  * Reads a positive integer from a query parameter, ignoring anything else.

@@ -93,14 +93,8 @@ async function taskStepsAreValid(ticks, steps = null) {
     return true;
 }
 
-/** The step positions, for a completion response that echoes what was asked. */
-async function offerTaskStepPositions(offerId) {
-    return (await loadOfferTaskSteps(offerId)).map((step) => step.position);
-}
-
 module.exports = {
     loadOfferTaskSteps,
     taskStepsAreValid,
-    offerTaskStepPositions,
     MAX_STEPS
 };

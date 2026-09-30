@@ -17,7 +17,23 @@ const MAX_PROMPT_LENGTH = 300;
 const MAX_OPTION_LABEL_LENGTH = 120;
 
 /**
- * Loads the questions, in the order the page should ask them.
+ * Loads the questions for a survey, in the order the page should ask them.
+ *
+ * `offerId` picks between two sets: the questions that belong to this offer, and the global
+ * default set. The table used to hold only the second, so every survey in the catalog was
+ * literally the same questionnaire -- a partner asking about their product got asked about
+ * favourite genres, and there was nowhere to record what a given survey had actually asked.
+ *
+ * The offer's own questions win, and the default is the fallback rather than a merge. Merging
+ * would produce a survey that is half one thing and half another, and the user could not tell
+ * which -- whereas "this survey has its own questions, and these are they" is a coherent form
+ * with a coherent answer map. An offer that defines none gets the default, which is what makes
+ * every existing survey keep working unchanged.
+ *
+ * One query rather than two: `offer_id = $1 OR offer_id IS NULL` fetches both candidates, and
+ * the preference between them is applied in JS against rows that are already in hand. Asking
+ * the database to do it would mean a window function for a set that is at most 20 rows, and the
+ * ordering rules below are easier to keep honest in one place.
  *
  * The option list is normalised here rather than handed to the page as stored. A row edited
  * by hand can hold a non-array, an option without a `value`, or a label long enough to break
@@ -25,27 +41,38 @@ const MAX_OPTION_LABEL_LENGTH = 120;
  * that silently does not match what was stored. An option without a usable `value` is
  * dropped rather than repaired, because a repaired value is not the one that was recorded.
  */
-async function loadSurveyQuestions() {
+async function loadSurveyQuestions(offerId) {
+    const owned = Number.isInteger(offerId) && offerId > 0 ? offerId : null;
     const result = await pool.query(
-        `SELECT question_key, prompt, options, position, required
+        `SELECT question_key, prompt, options, position, required, offer_id
          FROM survey_questions
+         WHERE offer_id IS NULL OR offer_id = $1
          ORDER BY position ASC, id ASC
-         LIMIT $1`,
-        [MAX_QUESTIONS]
+         LIMIT $2`,
+        [owned, MAX_QUESTIONS * 2]
     );
 
-    return result.rows
-        .map((row) => {
-            const options = readOptions(row.options);
-            if (options.length === 0) return null;
-            return {
-                key: String(row.question_key),
-                prompt: String(row.prompt).slice(0, MAX_PROMPT_LENGTH),
-                options,
-                required: row.required !== false
-            };
-        })
-        .filter(Boolean);
+    const forOffer = [];
+    const fallback = [];
+    for (const row of result.rows) {
+        const question = normaliseQuestion(row);
+        if (!question) continue;
+        if (owned !== null && row.offer_id === owned) forOffer.push(question);
+        else if (row.offer_id === null) fallback.push(question);
+    }
+    return forOffer.length > 0 ? forOffer : fallback;
+}
+
+/** One stored row as a question the page can render, or null if it cannot be rendered. */
+function normaliseQuestion(row) {
+    const options = readOptions(row.options);
+    if (options.length === 0) return null;
+    return {
+        key: String(row.question_key),
+        prompt: String(row.prompt).slice(0, MAX_PROMPT_LENGTH),
+        options,
+        required: row.required !== false
+    };
 }
 
 /** Pulls a usable option list out of a stored JSON value, or an empty list. */
@@ -107,16 +134,10 @@ function sanitiseAnswers(answers, questions) {
     return kept;
 }
 
-/** The question keys, for tests and for a completion response that echoes what was asked. */
-async function surveyQuestionKeys() {
-    return (await loadSurveyQuestions()).map((question) => question.key);
-}
-
 module.exports = {
     loadSurveyQuestions,
     answersAreValid,
     sanitiseAnswers,
-    surveyQuestionKeys,
     readOptions,
     MAX_QUESTIONS,
     MAX_OPTIONS_PER_QUESTION

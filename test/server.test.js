@@ -131,7 +131,14 @@ test('offer API returns the seeded demo offers and survey outside production', a
         // The card renders the blurb and the display partner name, so both have to be in
         // the response; a seeded offer with neither would render a card with no context.
         assert.ok(demoOffers.every((offer) => typeof offer.description === 'string' && offer.description.length > 0));
-        assert.ok(demoOffers.every((offer) => offer.partner_label === 'Demo Partner'));
+        // Every offer has one, and they are not all the same one. Migration 008 backfilled every
+        // demo offer with a single blanket 'Demo Partner', which this assertion used to lock in --
+        // it was testing the backfill's value rather than the thing the comment above describes.
+        // The seed now gives each demo offer its own partner, which is both closer to a real
+        // catalog and a stronger check: one shared string would pass on a card where nothing had
+        // been thought about, and a missing label fails here just as it used to.
+        assert.ok(demoOffers.every((offer) => typeof offer.partner_label === 'string' && offer.partner_label.length > 0));
+        assert.ok(new Set(demoOffers.map((offer) => offer.partner_label)).size === demoOffers.length);
         // The advertiser's tracking URL must never be sent to the browser: anyone who had
         // it could append their own aff_sub and claim credit for untracked clicks.
         assert.ok(offers.every((offer) => offer.tracking_url === undefined));

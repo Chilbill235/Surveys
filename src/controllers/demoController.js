@@ -77,7 +77,7 @@ const demoController = {
                 : { rows: [] };
 
             const offerType = click.rows[0]?.offer_type || 'survey';
-            const questions = offerType === 'survey' ? await loadSurveyQuestions() : null;
+            const questions = offerType === 'survey' ? await loadSurveyQuestions(click.rows[0]?.offer_id) : null;
             const steps = offerType !== 'survey'
                 ? await loadOfferTaskSteps(click.rows[0]?.offer_id)
                 : null;
@@ -136,7 +136,12 @@ const demoController = {
             // in this SELECT the lookup below was handed `undefined`, returned no steps, and
             // every non-survey demo offer answered "Tick every step before submitting."
             // forever -- a task that could be rendered but never completed.
-            const questions = offer.offer_type === 'survey' ? await loadSurveyQuestions() : null;
+            // `offer.id` is `offers.id` under its own name in the SELECT above -- the offer's own id, which is
+// what `loadSurveyQuestions` needs to find that survey's own questions. Reading `offer.offer_id`
+// here instead would be `undefined`, which the loader treats as "no offer" and answers with the
+// global default set, so every survey would quietly get the same twelve questions and the
+// per-offer feature would appear to work while doing nothing.
+const questions = offer.offer_type === 'survey' ? await loadSurveyQuestions(Number(offer.id)) : null;
             const steps = offer.offer_type !== 'survey' ? await loadOfferTaskSteps(offer.id) : null;
             if (offer.offer_type === 'survey') {
                 if (!await answersAreValid(answers, questions)) {
@@ -144,7 +149,21 @@ const demoController = {
                     return res.status(400).json({ error: 'Answer every question before submitting.' });
                 }
             } else {
-                if (!taskStepsAreValid(answers, steps)) {
+                // Awaited, and that is the entire point of the line.
+                //
+                // `taskStepsAreValid` is `async`, so without `await` it hands back a Promise --
+                // which is always truthy -- and `!truthy` is always false. The check therefore
+                // never rejected anything, and every step-based offer could be completed with an
+                // empty `answers` object and the full payout credited. The survey branch above has
+                // always awaited, which is why surveys were safe and offers were not, and why
+                // nothing in the unit tests caught it: the function's own tests all passed while
+                // its one caller had stopped calling it.
+                //
+                // Worth stating plainly because it is not the kind of mistake that announces
+                // itself: there is no error, no log line, and the response is a normal 200 with a
+                // correct-looking credit. The only way it is visible is an end-to-end check that
+                // submits an incomplete payload and insists on a refusal.
+                if (!await taskStepsAreValid(answers, steps)) {
                     await client.query('ROLLBACK');
                     return res.status(400).json({ error: 'Tick every step before submitting.' });
                 }

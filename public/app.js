@@ -1023,14 +1023,14 @@ function notifyWithdrawalPaid(item) {
 
 function notifyWithdrawalFailed(item) {
     const title = 'Withdrawal failed';
-    // Both spellings, because both call sites exist. This is called from the live poll with a raw
-    // API row (`failure_reason`) and the provider's payout error carries the actual reason --
-    // "wallet balance too low" or "invalid address" -- which is the only thing the user can act
-    // on. Reading the camelCase spelling that no payload uses is why the toast said only
-    // "Your withdrawal could not be completed" for every failure, and the one line that could
-    // have told them to check their address did not exist.
-    const reason = item.failure_reason || item.failureReason || item.payout_error;
-    const message = reason || 'Your withdrawal could not be completed.';
+    // Composed from the row's state rather than quoted from `failure_reason`. That field is
+    // written for an operator -- it is often the provider's own error, naming a third party, an
+    // HTTP status and an endpoint path -- and it was being put straight into a toast. Worse, an
+    // "Insufficient balance" from a payout provider describes *our* account, not the user's, so
+    // read literally the toast told them their own balance was short. The user-facing sentence
+    // says the thing they can act on: whether the money is back.
+    const message = withdrawalFailureText(item)
+        || 'We were not able to send this withdrawal. Any amount taken from your balance has been returned.';
     showToast(title, message, { tone: 'error', category: 'withdrawal', withdrawalId: item.id ?? null });
     pushNotification({ title, message, tone: 'error', category: 'withdrawal', withdrawalId: item.id ?? null });
 }
@@ -1229,6 +1229,91 @@ const mayUseThisPage = window.RewardZoneSession ? window.RewardZoneSession.enfor
 // the session existed, and walking back onto one would put the visitor on a private page
 // without a session.
 if (window.RewardZoneSession) window.RewardZoneSession.watchForPrivateHistory();
+
+/**
+ * Fetch the page a link points at while the pointer is still travelling towards it.
+ *
+ * Every navigation in here is a full page load -- Express serves these pages as markup and there
+ * is no client router -- so a click is a round trip for HTML, a stylesheet, a dozen scripts and a
+ * session check before anything appears. That is the "slow" people feel when they click a link on
+ * this site, and it is a network wait, not a slow handler: there is nothing in the click path to
+ * optimise.
+ *
+ * So the work moves to the 100-300ms before the click, when the pointer has already committed to
+ * a target. `<link rel="prefetch">` is a hint: the browser decides whether to spend the bandwidth,
+ * and nothing here waits on it, so a slow or ignored prefetch costs nothing but a wasted request.
+ *
+ * Three things it deliberately does not do:
+ *
+ *   - It only prefetches on `pointerover` and `focusin`, both of which mean the reader is already
+ *     pointing at or tabbing to that link. `pointerenter` on the document would fire for every link
+ *     a cursor sweeps across on the way somewhere else.
+ *   - It skips a link to the page already open, including a different fragment on it. Fetching the
+ *     current document to satisfy `#history-withdrawal-88` is a whole extra page download for
+ *     something the browser handles with no load at all.
+ *   - It respects `navigator.connection.saveData`. A reader who has asked for reduced data usage
+ *     does not get a background prefetch behind their back, and neither does a reader on a
+ *     2G connection -- which is exactly who cannot afford it.
+ */
+function prefetchLinkedPages() {
+    const seen = new Set();
+    const connection = navigator.connection;
+    // `saveData` is the explicit opt-out. An `effectiveType` of slow-2g is not -- it is a hint
+    // about the link, and prefetching is precisely the request that hurts most on that link, so it
+    // is honoured too rather than left to a user agent that may reasonably disagree.
+    if (connection && (connection.saveData || /^(slow-2g|2g)$/.test(connection.effectiveType || ''))) {
+        return;
+    }
+
+    const hint = (anchor) => {
+        const href = anchor.getAttribute('href');
+        if (!href || href.startsWith('#')) return;
+        // Only http(s) on this origin. A `mailto:`, a download or a cross-origin link is not
+        // something to fetch speculatively, and the href is resolved so a relative one is compared
+        // as the destination rather than as the string on the attribute.
+        let url;
+        try {
+            url = new URL(href, window.location.href);
+        } catch {
+            return;
+        }
+        if (url.origin !== window.location.origin) return;
+        if (!/^https?:$/.test(url.protocol)) return;
+        if (url.pathname === window.location.pathname && !url.search) return;
+        // A path that ends in a file extension is a download, not a page: `/invoices/2026-09.csv`
+        // passes every other check here and would have the reader's browser fetch the whole file
+        // because they rested the pointer near it. The export links on the account page are exactly
+        // that shape. The heuristic is the last segment's extension rather than a list of known
+        // types, because a link added tomorrow with a type nobody enumerated still gets caught.
+        if (/\.[a-z0-9]{1,8}$/i.test(url.pathname)) return;
+        if (seen.has(url.href)) return;
+        seen.add(url.href);
+
+        const link = document.createElement('link');
+        link.rel = 'prefetch';
+        link.as = 'document';
+        // `fetchpriority` is about the request this hint causes, not the visible one, so it stays
+        // low. A prefetch that outranked the page the reader is actually on would make the page
+        // slower in order to make the next one faster.
+        link.fetchPriority = 'low';
+        link.href = url.href;
+        document.head.appendChild(link);
+    };
+
+    const from = (event) => {
+        const anchor = event.target instanceof Element
+            ? event.target.closest('a[href]')
+            : null;
+        if (anchor) hint(anchor);
+    };
+
+    document.addEventListener('pointerover', from, { passive: true });
+    document.addEventListener('focusin', from);
+}
+
+// Ungated, unlike most of this file: the footer and the header are on the public pages too, and a
+// reader on `/terms` clicking through to `/privacy` is exactly the navigation this helps.
+document.addEventListener('DOMContentLoaded', prefetchLinkedPages);
 
 if (mayUseThisPage) document.addEventListener('DOMContentLoaded', () => {
     document.getElementById('account-button')?.addEventListener('click', handleAccountButton);
@@ -1545,14 +1630,62 @@ if (mayUseThisPage) document.addEventListener('DOMContentLoaded', () => {
         syncNow();
     });
 
+    // A window can be focused while another window sits in front of it, and on some platforms
+    // that never fires `visibilitychange` -- the document is never hidden, it is merely not what
+    // the reader is looking at. Focusing this window is that reader saying "show me where I am",
+    // so it syncs on that too. `focus` does not bubble, hence `addEventListener` on `window`.
+    window.addEventListener('focus', () => {
+        // Cleared first: a page that was syncing happily while hidden, and then failed twice in
+        // the background, would otherwise spend its first focused moments in a backoff it has no
+        // reason to still be in. The failure count is what the network restores, not the fact
+        // that time passed.
+        if (liveState.consecutiveFailures > 0) {
+            liveState.consecutiveFailures = 0;
+            paintLiveIndicator();
+        }
+        syncNow();
+    });
+
+    // The reconnection case, and the one the backoff made worst. Coming back online is a fact
+    // the browser tells us for free, and the old behaviour was to keep waiting out an interval
+    // that could be up to two minutes -- so the network returned and the page sat there still
+    // announcing a lost connection, refusing to update, until the backoff expired. The event is
+    // the answer; waiting for it to expire was never the plan.
+    window.addEventListener('online', () => {
+        liveState.consecutiveFailures = 0;
+        paintLiveIndicator();
+        syncNow();
+    });
+
+    // Worth saying out loud. `navigator.onLine === false` is a real, immediate, trustworthy
+    // signal that the browser itself is offline -- and it is the one state where the honest
+    // message is "You are offline", not "the connection to the site was lost". Those send the
+    // reader to different places: one to their wifi, the other to a page reload.
+    window.addEventListener('offline', () => {
+        paintLiveIndicator();
+    });
+
     // A session that goes away should stop the loop rather than keep failing against an
     // endpoint with a dead token until the tab is closed.
     window.addEventListener('pagehide', stopLiveSync);
+    // ...and coming back has to start it again, or the stop above is permanent. `pagehide` also
+    // fires when a page enters the back/forward cache, and a page restored from there never
+    // re-runs this script -- so without this the balance sat frozen at whatever it was when the
+    // user clicked away, with the indicator still reading "Live", for the rest of that page's
+    // life. Back is exactly the gesture people use to come back and check their money.
+    window.addEventListener('pageshow', (event) => {
+        // `persisted` is true only for a bfcache restore. A normal load is already starting the
+        // loop from above, and starting it twice would leave two timers racing.
+        if (event.persisted) startLiveSync();
+    });
 });
 
 function startLiveSync() {
     window.clearTimeout(liveState.timer);
     liveState.timer = undefined;
+    // Cleared, because a stop set by `stopLiveSync` is what a start is undoing. Without this the
+    // two cannot be called in any order.
+    liveState.stopped = false;
     liveState.consecutiveFailures = 0;
     if (!getSessionToken()) {
         paintLiveIndicator();
@@ -1562,6 +1695,7 @@ function startLiveSync() {
 }
 
 function stopLiveSync() {
+    liveState.stopped = true;
     window.clearTimeout(liveState.timer);
     liveState.timer = undefined;
 }
@@ -1595,6 +1729,15 @@ function stopLiveSync() {
 const liveState = {
     timer: undefined,
     version: '',
+    /**
+     * Whether the loop has been deliberately stopped.
+     *
+     * Clearing the timer is not enough on its own: `syncNow` reschedules itself from a
+     * `finally`, so a stop requested while a request was still in flight got undone when that
+     * request settled. `scheduleLiveSync` honours this instead, which is what makes the auth
+     * path actually stop instead of resuming against a session it has already discarded.
+     */
+    stopped: false,
     /** Set while a request is in flight, so two syncs cannot overlap. */
     busy: false,
     /** A deposit the user is waiting on, which is what justifies a fast interval. */
@@ -1623,18 +1766,72 @@ const liveState = {
     seeded: false
 };
 
+/**
+ * How long one sync request is given before it is abandoned.
+ *
+ * Without a ceiling, a request that never settles -- a laptop lid closing, a phone leaving wifi
+ * mid-request, a proxy holding the connection open -- is worse than a failed one. A failure
+ * rejects, `finally` runs, the loop reschedules and the next attempt recovers. A hang does none
+ * of that: `liveState.busy` stays true forever, so every later `syncNow` returns at its first
+ * line, and the `finally` that would have rescheduled it never runs at all. The balance freezes
+ * silently and never recovers, with nothing on screen to say so. That is the difference between
+ * a blip the user rides out and a page that needs reloading.
+ *
+ * Longer than the 20s idle interval on purpose: a request this slow is not going to produce
+ * anything useful, and aborting it early buys a retry rather than a result.
+ */
+const LIVE_SYNC_TIMEOUT_MS = 20000;
+
+/**
+ * How many failed polls in a row it takes to call the connection lost.
+ *
+ * It used to take one. A phone changing network, a single slow response, a proxy hiccup -- each
+ * of those painted "Connection lost" immediately and started the backoff, so the page announced
+ * a broken connection for a blip that was over before the user could read it, and then spent the
+ * next two minutes waiting out an interval it had grown purely in response to the blip. The
+ * indicator and the backoff were both answering a question nobody asked: not "has this stopped
+ * working" but "did this fail at all".
+ *
+ * Two is the point where the pattern is a pattern. One failure still retries promptly.
+ */
+const LIVE_SYNC_FAILURE_THRESHOLD = 2;
+
+/** Whether the sync has failed often enough, in a row, to be worth telling the user about. */
+function liveConnectionFailing() {
+    return liveState.consecutiveFailures >= LIVE_SYNC_FAILURE_THRESHOLD;
+}
+
 /** How long to wait before the next check, given whether something is outstanding. */
 function liveIntervalMs() {
-    if (liveState.awaitingDeposit) return 5000;
-    if (liveState.consecutiveFailures > 0) {
-        // Back off when the server is unhappy. Retrying a failing endpoint at the normal
-        // rate turns a database blip into a burst of failing requests that keep it blipped.
-        return Math.min(120000, 10000 * 2 ** Math.min(4, liveState.consecutiveFailures - 1));
+    // Sustained failure first, and unconditionally. The deposit fast-path used to be checked
+    // ahead of it, which meant a deposit in progress pinned the interval at five seconds no
+    // matter how badly the connection was failing -- so the one moment the loop is guaranteed to
+    // be running is the one moment it cannot back off.
+    if (liveConnectionFailing()) {
+        // Capped at 30s, not the two minutes it used to reach. A long cap is right for a client
+        // that has nothing better to do and wrong for a balance page: two minutes of a figure
+        // that is known not to be current is a long time to look at a wrong number, and there is
+        // no state in this app where two minutes of staleness is better than thirty seconds of
+        // one request.
+        return Math.min(
+            30000,
+            4000 * 2 ** Math.min(3, liveState.consecutiveFailures - LIVE_SYNC_FAILURE_THRESHOLD)
+        );
     }
-    return 20000;
+    // Faster than the twenty seconds it was. This endpoint answers a single indexed lookup and
+    // an unchanged account costs a 304 with no body, so the interval was trading a real delay in
+    // every balance, deposit and withdrawal update for a saving nobody was asking for.
+    if (liveState.awaitingDeposit) return 3000;
+    return 8000;
 }
 
 function scheduleLiveSync() {
+    // Respects a stop. It has to be checked here rather than only where the timer is cleared,
+    // because `syncNow` reschedules from a `finally`, and a stop requested while a request was
+    // in flight would otherwise be undone by that `finally` -- the loop restarting seconds after
+    // it was stopped, which is what made the auth path below keep polling a session it had
+    // already thrown away.
+    if (liveState.stopped) return;
     window.clearTimeout(liveState.timer);
     liveState.timer = window.setTimeout(() => { syncNow(); }, liveIntervalMs());
 }
@@ -1655,10 +1852,19 @@ async function syncNow() {
         return false;
     }
     liveState.busy = true;
+    // A hung request is indistinguishable from a slow one from here, and only the second is
+    // worth waiting for, so the request is given a ceiling. See `LIVE_SYNC_TIMEOUT_MS`.
+    const controller = typeof AbortController === 'function' ? new AbortController() : null;
+    const abortTimer = controller
+        ? window.setTimeout(() => { controller.abort(); }, LIVE_SYNC_TIMEOUT_MS)
+        : undefined;
     try {
         const response = await fetch(`/api/user/updates${liveState.version ? `?version=${encodeURIComponent(liveState.version)}` : ''}`, {
             headers: { Authorization: `Bearer ${token}` },
-            cache: 'no-store'
+            cache: 'no-store',
+            // Absent where `AbortController` is unsupported rather than passed as undefined, so
+            // the request is made exactly as it was before.
+            ...(controller ? { signal: controller.signal } : {})
         });
         if (response.status === 304) {
             // The common case, and the reason this endpoint exists: nothing moved.
@@ -1690,6 +1896,9 @@ async function syncNow() {
         paintLiveIndicator();
         return false;
     } finally {
+        // Released first: an aborted request whose timeout is not cleared keeps the timer alive
+        // for the full window after the loop has already moved on.
+        if (abortTimer !== undefined) window.clearTimeout(abortTimer);
         liveState.busy = false;
         scheduleLiveSync();
     }
@@ -1702,6 +1911,37 @@ async function syncNow() {
  * while the user is typing in the amount field cannot move the cursor, re-render a list
  * under the pointer, or replace a message they are reading.
  */
+/**
+ * Announces money returning to the balance, and links to the withdrawal that explains it.
+ *
+ * The link is the reason this can resolve a destination at all: a refund row's `source_id` is
+ * `withdrawal:<id>`, which is the one ledger shape that names the record it belongs to, so the
+ * row id is derivable without the server adding a field. Everything else in the live payload is
+ * keyed on shapes that cannot say which withdrawal they are for.
+ */
+function announceLedgerRefund(entry, amount) {
+    const match = /^withdrawal:(\d+)$/.exec(String(entry.source_id || '').trim());
+    const title = 'Refund received';
+    const message = `${formatBalance(amount)} returned to your balance.`;
+    const options = match
+        ? {
+            tone: 'info',
+            category: 'withdrawal',
+            withdrawalId: match[1]
+        }
+        : { tone: 'info', category: 'reward' };
+    showToast(title, message, options);
+    // The bell entry carries the id rather than a resolved link, so `notificationTarget` can
+    // rebuild the destination from the row that is actually there. See `pushNotification`.
+    pushNotification({
+        title,
+        message,
+        tone: options.tone,
+        category: options.category,
+        ...(match ? { withdrawalId: match[1] } : {})
+    });
+}
+
 function applyLiveUpdate(payload) {
     // The very first update establishes what already happened rather than reporting it.
     //
@@ -1855,8 +2095,21 @@ function applyLiveUpdate(payload) {
         const amount = Number(entry?.amount);
         if (!Number.isFinite(amount) || amount <= 0) continue;
 
-        // Only a credit is an event worth announcing. A debit here is a withdrawal, and the
-        // withdrawal list already has its own announcement for that.
+        // A refund is money coming *back*, and it was announced by nobody. The comment below used
+        // to say a debit "is a withdrawal, and the withdrawal list already has its own
+        // announcement for that" -- which was true of a payout that completes, because
+        // `notifyWithdrawalPaid` fires from the webhook. It was not true of the refund, which is
+        // written by a payout *run* rather than a webhook and therefore has no client-side
+        // caller at all: the only trace it left was a row in the ledger. So when a withdrawal was
+        // abandoned because the provider could not fund it, the user's money came back and the
+        // page said nothing about it.
+        if (entry.transaction_type === 'refund') {
+            announceLedgerRefund(entry, amount);
+            continue;
+        }
+
+        // Only a credit is an event worth announcing. A debit here is a withdrawal request, and
+        // the withdrawal list already announces the one that matters -- the payout.
         if (entry.transaction_type !== 'conversion') continue;
         // The description is the ledger's own words for what paid out, which is more useful
         // than a fixed sentence and is what makes an offer reward read as an offer reward.
@@ -1945,7 +2198,7 @@ function paintDepositStatus() {
 
     if (status === 'confirmed' || status === 'paid') {
         note.classList.add('is-credited');
-        note.textContent = `Credited to your balance on ${new Date(deposit.credited_at || deposit.created_at).toLocaleString()}.`;
+        note.textContent = `Credited to your balance on ${formatDateTime(deposit.credited_at || deposit.created_at)}.`;
         return;
     }
     if (status === 'failed' || status === 'expired') {
@@ -1990,17 +2243,33 @@ function paintLiveIndicator() {
         return;
     }
     indicator.hidden = false;
-    const failing = liveState.consecutiveFailures > 0;
+    const failing = liveConnectionFailing();
     const waiting = liveState.awaitingDeposit;
     indicator.classList.toggle('is-stale', failing);
     indicator.classList.toggle('is-waiting', waiting && !failing);
+    // A separate state, because it is a different fact with a different remedy. "Connection lost"
+    // sends someone to reload the page or blame the site; "You are offline" sends them to their
+    // wifi. The browser already knows this one -- `navigator.onLine` is answered from the OS, not
+    // inferred -- so there is nothing to guess at and no reason to report it as a server problem.
+    if (navigator.onLine === false) {
+        indicator.textContent = 'You are offline';
+        indicator.classList.add('is-stale');
+        return;
+    }
     if (failing) {
-        const seconds = Math.round((Date.now() - liveState.lastSyncedAt) / 1000);
+        // Guarded, because `lastSyncedAt` starts at 0 and the first failure can arrive before any
+        // success has ever set it. Unguarded, the arithmetic below reported how long it had been
+        // since the epoch -- "last updated 1789000000s ago" -- on a page that had simply never
+        // reached the server yet. "Retrying" is the true statement for that state.
+        const seconds = liveState.lastSyncedAt
+            ? Math.round((Date.now() - liveState.lastSyncedAt) / 1000)
+            : 0;
         indicator.textContent = seconds > 0
             ? `Connection lost - last updated ${seconds}s ago`
             : 'Connection lost - retrying';
         return;
     }
+    indicator.classList.remove('is-stale');
     indicator.textContent = waiting ? 'Waiting for payment...' : 'Live';
 }
 
@@ -2093,13 +2362,19 @@ function paintBalanceFreshness(force = false) {
     }
     freshnessEl.hidden = false;
 
-    const failing = liveState.consecutiveFailures > 0;
+    const failing = liveConnectionFailing();
     const waiting = liveState.awaitingDeposit;
     const seconds = balanceChangedAt ? Math.round((Date.now() - balanceChangedAt) / 1000) : null;
 
     let wording;
     let tone;
-    if (failing) {
+    if (navigator.onLine === false) {
+        // The same distinction the header indicator makes, for the same reason. This number is
+        // stale because the reader has no network, which is a different sentence from the site
+        // having stopped answering, and it needs a different response.
+        tone = 'is-stale';
+        wording = 'You are offline - balance may be out of date';
+    } else if (failing) {
         tone = 'is-stale';
         wording = seconds === null
             ? 'Connection lost - balance may be out of date'
@@ -3155,6 +3430,21 @@ function renderProfileEditor() {
 
     nameInput.disabled = !connected || profileState.saving;
     saveBtn.disabled = !connected || profileState.saving || !profileState.dirty;
+
+    // The counter, from the field's own `maxlength` rather than a number written out here, so it
+    // cannot disagree with the limit the input actually enforces. `[...value].length` rather than
+    // `value.length`, because a 60-character limit counted in UTF-16 code units tells an emoji
+    // user they have 60 characters available and then refuses them at 30.
+    const counter = document.getElementById('profile-name-count');
+    if (counter) {
+        const limit = Number(nameInput.getAttribute('maxlength')) || 0;
+        const used = [...(nameInput.value || '')].length;
+        counter.textContent = limit ? `${used} / ${limit}` : '';
+        // Warning well before the limit, and not at it: the browser silently refuses the
+        // characters past the end, so by the time the count reads the limit the user has already
+        // been stopped typing without being told why.
+        counter.classList.toggle('is-warning', limit > 0 && used >= limit - 10);
+    }
 
     const status = document.getElementById('profile-status');
     if (!status) return;
@@ -5397,7 +5687,11 @@ function describeHistorySubtitle(item, kind) {
             const outcome = item.refunded_at
                 ? `Returned to your balance on ${new Date(item.refunded_at).toLocaleDateString()}`
                 : 'No refund was recorded for this request';
-            return item.failure_reason ? `${outcome} · ${item.failure_reason}` : outcome;
+            // The refund is the fact that matters here and it is already said. Appending
+            // `failure_reason` added the provider's error to it, so the row read "Returned to your
+            // balance on Sep 30 · NOWPayments /v1/payout returned 400.: Insufficient balance" --
+            // a completed, settled outcome trailed by a third party's HTTP error.
+            return outcome;
         }
         return item.payment_address
             ? `${item.payment_address} · ${new Date(item.created_at).toLocaleDateString()}`
@@ -5564,11 +5858,41 @@ function coinAmount(value, currency) {
  * Absent rather than "Pending": a row that has not been sent yet has no submission time, and
  * printing a dash for a fact that does not exist reads as a missing record.
  */
+/**
+ * A timestamp, in words, on a twelve-hour clock.
+ *
+ * `hour12` is set explicitly rather than left to the browser's locale. Left alone it follows
+ * whatever the operating system is set to, so the same withdrawal read "4:16 PM" for one reader
+ * and "16:16" for the next -- and a 24-hour clock is one a lot of people read as military time
+ * rather than as a time. A transaction record is kept and compared, so it should not change
+ * shape with the reader's machine settings.
+ *
+ * The date stays in the reader's own locale; only the clock format is pinned. That is the
+ * narrowest change that fixes the complaint: somebody who prefers 24 hours can still change the
+ * number by changing their locale, and nobody gets a date in a format they cannot read.
+ */
 function detailTime(value) {
     if (!value) return '';
     const date = new Date(value);
     if (Number.isNaN(date.getTime())) return '';
-    return date.toLocaleString();
+    return date.toLocaleString(undefined, { hour: 'numeric', minute: '2-digit', hour12: true });
+}
+
+/**
+ * A timestamp with its date, on a twelve-hour clock. Same reasoning as `detailTime`.
+ */
+function formatDateTime(value) {
+    if (!value) return '';
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return '';
+    return date.toLocaleString(undefined, {
+        month: 'short',
+        day: 'numeric',
+        year: 'numeric',
+        hour: 'numeric',
+        minute: '2-digit',
+        hour12: true
+    });
 }
 
 /**
@@ -5600,11 +5924,11 @@ function buildWithdrawalDetails(item) {
         ['Transaction reference', item.provider_reference || ''],
         ['Requested', detailTime(item.created_at)],
         ['Sent to provider', detailTime(item.payout_submitted_at)],
-        ['Confirmed', detailTime(item.paid_at)],
-        ['Refunded', detailTime(item.refunded_at)],
-        ['Payout stage', String(item.payout_status || '').replace(/_/g, ' ').toLowerCase()],
-        ['Reason', item.failure_reason || item.payout_error || '']
-    ].filter(([, value]) => value);
+['Payout stage', payoutStageLabel(item)],
+            ['Confirmed', detailTime(item.paid_at)],
+            ['Refunded', detailTime(item.refunded_at)],
+            ['Reason', withdrawalFailureText(item)]
+        ].filter(([, value]) => value);
     // Nothing but the amount is known until the user asks for it: a withdrawal that has not
     // been claimed has no payout stage, no reference and no timestamps, and a disclosure that
     // opened onto three near-empty lines is worse than no disclosure.
@@ -5810,6 +6134,88 @@ function buildHistoryRow(item, kind) {
 }
 
 /**
+ * Why a withdrawal did not go out, in words the person who owns the money can use.
+ *
+ * Every place this used to render `failure_reason` or `payout_error` verbatim was showing the
+ * provider's own error text to the user: "NOWPayments /v1/payout returned 400.: Insufficient
+ * balance". That names a company they have no relationship with, an HTTP status, and an endpoint
+ * path, and it tells them nothing they can act on -- worse, "Insufficient balance" describes *our*
+ * provider's account, not theirs, so read literally it says the wrong thing about whose money is
+ * short. The raw text is still recorded, because it is right for an operator reading the row, and
+ * right for the logs. It just stops being the sentence shown to a customer.
+ *
+ * The sentence is chosen from the row's own state, because that is what we actually know and what
+ * the user can act on: whether their money came back, or whether it is being held. An empty
+ * return means there is nothing to report, which is the honest answer for a withdrawal that went
+ * out normally.
+ */
+function withdrawalFailureText(item = {}) {
+    const status = String(item.status || '').toLowerCase();
+    const payoutStatus = String(item.payout_status || '').toUpperCase();
+    const refunded = status === 'refunded' || status === 'failed';
+    const stillMoving = ['SUBMISSION_UNKNOWN', 'VERIFY_UNKNOWN'].includes(payoutStatus);
+
+    if (stillMoving) {
+        return 'We are confirming this transfer with our payout provider. Nothing is needed from you, '
+            + 'and the money stays yours either way.';
+    }
+    if (refunded) {
+        return 'We were not able to send this withdrawal, so the full amount has been returned to your balance.';
+    }
+    if (status === 'cancelled') {
+        return 'This withdrawal was cancelled and the full amount has been returned to your balance.';
+    }
+    if (status === 'paid' || payoutStatus === 'FINISHED') return '';
+    if (payoutStatus === 'FAILED' || payoutStatus === 'CANCELLED' || payoutStatus === 'CANCELED'
+        || payoutStatus === 'REJECTED' || payoutStatus === 'REJECTED_NOT_CHECKED') {
+        return 'We were not able to send this withdrawal. If it has not returned to your balance, '
+            + 'it will be refunded shortly.';
+    }
+    return '';
+}
+
+/**
+ * The payout stage as a short noun phrase, or nothing.
+ *
+ * This replaced `String(payout_status || '').replace(/_/g, ' ').toLowerCase()`, which printed the
+ * provider's internal vocabulary at the user: a row stuck in `CREATING` read "creating", which
+ * describes what *our* system is doing and tells the reader nothing about their money. And for a
+ * withdrawal that was never claimed the expression it replaced on the receipt page,
+ * `String(withdrawal.payout_status)` with no fallback, printed the literal text "null" as a
+ * payout stage.
+ *
+ * Unmapped stages fall back to "in progress" rather than to the raw word, for the same reason
+ * `payoutProgressLabel` does: the provider's vocabulary is not a thing a user can act on, and an
+ * unmapped value is the case that most needs a plain answer rather than a silent one.
+ */
+function payoutStageLabel(item = {}) {
+    const stage = String(item.payout_status || '').toUpperCase();
+    if (!stage) return '';
+    switch (stage) {
+        case 'CREATING':
+        case 'NEW':
+        case 'WAITING':
+            return 'Preparing to send';
+        case 'PROCESSING':
+        case 'SENDING':
+            return 'Sending';
+        case 'SUBMISSION_UNKNOWN':
+        case 'VERIFY_UNKNOWN':
+            return 'Confirming with our payout provider';
+        case 'FINISHED':
+            return 'Confirmed on the network';
+        case 'FAILED':
+        case 'CANCELLED':
+        case 'CANCELED':
+        case 'REJECTED':
+        case 'REJECTED_NOT_CHECKED':
+            return 'Not sent';
+        default:
+            return 'In progress';
+    }
+}
+
+/**
  * The provider's payout stage, in words a user can act on.
  *
  * Every state the provider can report is mapped, not just the ones that were first observed.
@@ -5822,9 +6228,14 @@ function buildHistoryRow(item, kind) {
  * The provider's own vocabulary is deliberately not shown: `WAITING` and `REJECTED_NOT_CHECKED`
  * are internal states, and rendering them raw tells the user nothing about whether their money
  * is moving.
+ *
+ * A null or empty stage returns an empty string rather than a word. A withdrawal that was never
+ * claimed has no payout, and printing `null` -- which is what `String(null)` gives -- put the
+ * literal text "null" on a user's receipt as a payout stage.
  */
 function payoutProgressLabel(payoutStatus, item = {}) {
-    switch (String(payoutStatus || '').toUpperCase()) {
+    if (!payoutStatus) return '';
+    switch (String(payoutStatus).toUpperCase()) {
         case 'CREATING':
         case 'NEW':
             return 'Preparing your payout.';
@@ -5844,12 +6255,11 @@ function payoutProgressLabel(payoutStatus, item = {}) {
         case 'CANCELLED':
         case 'CANCELED':
         case 'REJECTED':
-        case 'REJECTED_NOT_CHECKED': {
-            // The provider's rejection reason is the one thing here the user can act on, so it
-            // is quoted rather than summarised away.
-            const reason = String(item.payout_error || '').trim();
-            return reason ? `The payout was not sent: ${reason}` : 'The payout was not sent.';
-        }
+        case 'REJECTED_NOT_CHECKED':
+            // Composed from the row's own state rather than quoted from the provider. The reason
+            // text is still on the row for an operator; see `withdrawalFailureText` for why it
+            // stops being what the user reads.
+            return withdrawalFailureText(item) || 'The payout was not sent.';
         default:
             return 'Your payout is in progress.';
     }
@@ -6018,7 +6428,7 @@ async function showDepositSuccess(deposit) {
         if (deposit.network) rows.push(['Network', deposit.network]);
         if (deposit.pay_amount) rows.push(['Sent', `${deposit.pay_amount} ${deposit.asset_code}`]);
     }
-    rows.push(['Credited', new Date(deposit.credited_at || deposit.created_at).toLocaleString()]);
+    rows.push(['Credited', formatDateTime(deposit.credited_at || deposit.created_at)]);
     renderReceiptFacts(document.getElementById('deposit-success-facts'), rows);
 
     // The balance is read after the credit so the number shown is the one the user just

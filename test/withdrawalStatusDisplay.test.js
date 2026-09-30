@@ -131,15 +131,34 @@ test('a rebuilt list does not close a disclosure the reader has open', () => {
 });
 
 test('a failed withdrawal says why it failed', () => {
-    // This is called from the live poll with a raw API row, which is snake_case. Reading the
-    // camelCase spelling that no payload uses is why the toast fell back to a generic
-    // sentence for every failure and the reason was never shown.
+    // The row handed to this function is the raw API row from the live poll, which is snake_case.
+    // That detail still matters: an earlier version read a camelCase spelling that no payload
+    // uses, so every failure fell through to a generic sentence and the reason was never shown.
+    //
+    // What the toast shows has since changed, though -- it is composed from the row's *state*
+    // rather than quoted from `failure_reason`, because that column holds the provider's own error
+    // and an "insufficient balance" there describes the provider's account, not the user's. So the
+    // contract asserted here is the new one: the row is passed through to the composer untouched,
+    // and the raw column is never interpolated into the sentence. The composer's own mapping is
+    // covered in withdrawalReason.test.js.
     const notify = /function notifyWithdrawalFailed\(item\) \{([\s\S]*?)\n\}/.exec(app);
     assert.ok(notify, 'notifyWithdrawalFailed is gone');
     assert.match(
         notify[1],
-        /item\.failure_reason/,
-        'the failure toast does not read the snake_case reason the live poll actually sends'
+        /withdrawalFailureText\(item\)/,
+        'the failure toast does not compose its message from the row it was given'
+    );
+    assert.doesNotMatch(
+        notify[1],
+        /\$\{[^}]*item\.failure_reason/,
+        'the failure toast quotes the operator-facing reason column at the user'
+    );
+    // And the fallback must still be a complete sentence rather than empty. An empty reason plus an
+    // empty fallback is the silent-failure case this test originally existed to catch.
+    assert.match(
+        notify[1],
+        /\|\|\s*'[^']+'/,
+        'the failure toast has no complete fallback sentence'
     );
 });
 

@@ -214,16 +214,38 @@
         }
     }
 
+    /**
+     * The clock, on a twelve-hour clock, with the meridiem spelled out.
+     *
+     * It was `hour12: false`, which reads as "16:16" -- and a good half of the people seeing that
+     * read it as a military or a broadcast time rather than as four in the afternoon. The
+     * meridiem is written out ("PM", not "pm") and kept at full weight because that suffix is the
+     * only thing on screen that says which half of the day it is; leaving it off and hoping the
+     * reader infers it is the same error in the other direction.
+     *
+     * The zone is still the site's, not the reader's, because the whole point of this element is
+     * to tell you when offers and survey windows close -- and those are on site time.
+     *
+     * `hour: 'numeric'` rather than `'2-digit'`: a twelve-hour clock pads 9am to "09:07:32", and
+     * the leading zero on a clock face is a twenty-four-hour habit that looks like an error next
+     * to "PM". The fallback below has to match, so it derives the meridiem itself.
+     */
     function formatTime(date) {
         const formatter = zoneFormatter({
-            hour: '2-digit',
+            hour: 'numeric',
             minute: '2-digit',
             second: '2-digit',
-            hour12: false
+            hour12: true
         });
         if (formatter) return formatter.format(date);
+
+        // No `Intl`, or a browser that does not know America/New_York. The zone is then the
+        // machine's, which is the best available, and the meridiem still has to be there.
         const pad = (n) => String(n).padStart(2, '0');
-        return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+        const hours = date.getHours();
+        const meridiem = hours < 12 ? 'AM' : 'PM';
+        const twelve = hours % 12 === 0 ? 12 : hours % 12;
+        return `${twelve}:${pad(date.getMinutes())}:${pad(date.getSeconds())} ${meridiem}`;
     }
 
     function paint() {

@@ -648,7 +648,7 @@ function renderHistoryPagination() {
  * the result is interpolated below without escaping: it can only ever be one of these
  * strings. Do not inline the raw column in markup instead -- use this.
  */
-const HISTORY_TYPES = ['deposit', 'withdrawal', 'conversion', 'refund', 'adjustment'];
+const HISTORY_TYPES = ['deposit', 'withdrawal', 'conversion', 'chargeback', 'refund', 'adjustment'];
 
 function historyTypeFor(value) {
     return HISTORY_TYPES.includes(value) ? value : 'adjustment';
@@ -659,6 +659,10 @@ function historyIconFor(type) {
         case 'deposit':    return NOTIFICATION_CATEGORY_ICONS.deposit;
         case 'withdrawal': return NOTIFICATION_CATEGORY_ICONS.withdrawal;
         case 'conversion': return NOTIFICATION_CATEGORY_ICONS.reward;
+        // A reversal is a reward taken back, so it reads as the negative of a reward rather than
+        // as a gift. Reusing the refund icon would put an advertiser chargeback in the same
+        // visual bucket as a withdrawal that never left, which are opposite events.
+        case 'chargeback':  return NOTIFICATION_CATEGORY_ICONS.reward;
         case 'refund':     return NOTIFICATION_CATEGORY_ICONS.magic;
         case 'adjustment': return NOTIFICATION_CATEGORY_ICONS.survey;
         default:           return TOAST_ICONS.info;
@@ -695,6 +699,10 @@ function historyTitleFor(item) {
             if (item.status === 'refunded') return 'Withdrawal refunded';
             return 'Withdrawal requested';
         case 'conversion': return isTestRow(item) ? 'Test offer reward' : 'Offer reward credited';
+        // Named after what happened rather than after the ledger's word for it. "Reversed" says
+        // to the person whose balance it was that money was taken back; "Chargeback" is the
+        // network's term and tells them nothing they can act on.
+        case 'chargeback':  return 'Reward reversed';
         case 'refund':     return 'Withdrawal refunded';
         default:           return 'Balance adjustment';
     }
@@ -718,11 +726,19 @@ function formatHistoryAmount(item) {
 function formatDateTime(ts) {
     if (!ts) return '';
     const date = new Date(ts);
+    // An unparseable timestamp renders as "Invalid Date", which on a money history reads as a
+    // corrupted record rather than as a missing value. Blanking it keeps a bad row from looking
+    // worse than an empty one.
+    if (Number.isNaN(date.getTime())) return '';
+    // `hour12` is pinned rather than inherited from the reader's locale: a transaction history is
+    // compared across records and across readers, so "16:16" for one person and "4:16 PM" for
+    // the next is noise the reader has to translate back every time they look.
     return date.toLocaleString(undefined, {
         month: 'short',
         day: 'numeric',
         hour: 'numeric',
-        minute: '2-digit'
+        minute: '2-digit',
+        hour12: true
     });
 }
 

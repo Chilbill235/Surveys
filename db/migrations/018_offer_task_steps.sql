@@ -31,22 +31,54 @@ CREATE INDEX IF NOT EXISTS offer_task_steps_offer_idx
 
 -- The two demo offers get real steps. Without them the task page shows the old single
 -- checkbox, which is what this migration exists to replace.
-INSERT INTO offer_task_steps (offer_id, position, prompt, action_label, url) VALUES
-    (1, 1, 'Visit the partner site and create an account',
-     'Open the partner site', 'https://example.com/partner'),
-    (1, 2, 'Confirm the email address they send you',
-     'I confirmed my email', NULL),
-    (1, 3, 'Make a first purchase of at least $5',
-     'I made a purchase', NULL)
+--
+-- These were plain `INSERT ... VALUES` rows against literal offer ids 1 and 2. `offers` is
+-- created by migration 000 and is *empty* at this point on a fresh database, so the insert raised
+-- a foreign-key violation and `scripts/migrate.js` aborted the whole chain: `npm run migrate`
+-- could not build a fresh database, which is the entire reason these files exist and the thing
+-- the Vercel build step depends on. `ON CONFLICT DO NOTHING` does not suppress an FK violation,
+-- so nothing about it made the insert safe.
+--
+-- Written as `INSERT ... SELECT ... WHERE EXISTS` so each offer's steps land only when that offer
+-- is actually there. On an existing database -- where 1 and 2 are the two seeded demo offers --
+-- the behaviour is unchanged. On a fresh one, the steps are skipped and the offers, which are
+-- created later by `scripts/seed-demo-offers.js`, carry no steps until that script attaches them.
+-- That is why the seed script owns steps now: steps belong to the offers it creates, rather than
+-- to whatever happens to hold a particular id.
+INSERT INTO offer_task_steps (offer_id, position, prompt, action_label, url)
+SELECT 1, 1, 'Visit the partner site and create an account',
+     'Open the partner site', 'https://example.com/partner'
+WHERE EXISTS (SELECT 1 FROM offers WHERE id = 1)
 ON CONFLICT DO NOTHING;
 
-INSERT INTO offer_task_steps (offer_id, position, prompt, action_label, url) VALUES
-    (2, 1, 'Download the partner app from the app store',
-     'Open the app store', 'https://example.com/app'),
-    (2, 2, 'Install the app and sign in',
-     'I am signed in', NULL),
-    (2, 3, 'Complete the first task inside the app',
-     'I finished the task', NULL)
+INSERT INTO offer_task_steps (offer_id, position, prompt, action_label, url)
+SELECT 1, 2, 'Confirm the email address they send you',
+     'I confirmed my email', NULL
+WHERE EXISTS (SELECT 1 FROM offers WHERE id = 1)
+ON CONFLICT DO NOTHING;
+
+INSERT INTO offer_task_steps (offer_id, position, prompt, action_label, url)
+SELECT 1, 3, 'Make a first purchase of at least $5',
+     'I made a purchase', NULL
+WHERE EXISTS (SELECT 1 FROM offers WHERE id = 1)
+ON CONFLICT DO NOTHING;
+
+INSERT INTO offer_task_steps (offer_id, position, prompt, action_label, url)
+SELECT 2, 1, 'Download the partner app from the app store',
+     'Open the app store', 'https://example.com/app'
+WHERE EXISTS (SELECT 1 FROM offers WHERE id = 2)
+ON CONFLICT DO NOTHING;
+
+INSERT INTO offer_task_steps (offer_id, position, prompt, action_label, url)
+SELECT 2, 2, 'Install the app and sign in',
+     'I am signed in', NULL
+WHERE EXISTS (SELECT 1 FROM offers WHERE id = 2)
+ON CONFLICT DO NOTHING;
+
+INSERT INTO offer_task_steps (offer_id, position, prompt, action_label, url)
+SELECT 2, 3, 'Complete the first task inside the app',
+     'I finished the task', NULL
+WHERE EXISTS (SELECT 1 FROM offers WHERE id = 2)
 ON CONFLICT DO NOTHING;
 
 COMMIT;

@@ -106,7 +106,7 @@ async function markWithdrawalPaid(client, withdrawalId, providerReference) {
  *
  * Must be called with a client that already has an open transaction.
  */
-async function refundWithdrawal(client, withdrawalId, reason) {
+async function refundWithdrawal(client, withdrawalId, reason, { description } = {}) {
     const settled = await client.query(
         `SELECT w.id, w.user_id, w.amount, w.status, w.provider_reference,
                 w.payment_method, w.payment_address, w.asset_code, w.network,
@@ -134,9 +134,30 @@ async function refundWithdrawal(client, withdrawalId, reason) {
 
     const failureReason = String(reason || '').trim().slice(0, 500) || 'Withdrawal rejected on review';
 
+    // The ledger description is what the user reads in their history, so it is not the operator's
+    // reason by default. "NOWPayments /v1/payout returned 400.: Insufficient balance" is the right
+    // thing to keep on `failure_reason`, where an operator and a log will read it, and the wrong
+    // thing to put in front of someone whose money it is: it names a company they have no
+    // relationship with, an HTTP status, and an endpoint path. Callers that have words for the
+    // user supply them; the fallback keeps the old behaviour for the operators who do not.
+    const ledgerDescription = String(description || '').trim().slice(0, 500) || failureReason;
+
     const closed = await client.query(
         `UPDATE withdrawals
-         SET status = 'failed', failure_reason = $1, updated_at = NOW()
+         SET status = 'failed',
+             failure_reason = $1,
+             -- A refund means no payout is coming. Leaving the row in CREATING -- the state a
+             -- claim writes before the provider is called -- said the opposite for ever: the
+             -- reconciliation sweep picked it up on every pass, because CREATING is
+             -- deliberately reconcilable, and the user was shown a progress stage for a
+             -- withdrawal that had already been given back to them. CREATING is the only value
+             -- cleared, and only because it is the only one that means "claimed, not yet sent";
+             -- a real provider status is left alone, since that is the record of what happened to
+             -- the money. Safe to clear because status = 'failed' above already takes the row
+             -- out of the queue, which only claims rows still pending.
+             payout_status = CASE WHEN payout_status = 'CREATING' THEN NULL ELSE payout_status END,
+             payout_claimed_at = CASE WHEN payout_status = 'CREATING' THEN NULL ELSE payout_claimed_at END,
+             updated_at = NOW()
          WHERE id = $2 AND status = ANY($3)
          RETURNING ${WITHDRAWAL_RETURN_COLUMNS.join(', ')}`,
         [failureReason, withdrawalId, [...resolvableStatuses]]
@@ -171,7 +192,7 @@ async function refundWithdrawal(client, withdrawalId, reason) {
          VALUES ($1, $2, 'refund', $3, $4)
          ON CONFLICT (transaction_type, source_id) DO NOTHING
          RETURNING id`,
-        [withdrawal.user_id, withdrawal.amount, refundSourceId(withdrawalId), failureReason]
+        [withdrawal.user_id, withdrawal.amount, refundSourceId(withdrawalId), ledgerDescription]
     );
     if (ledgerInsert.rowCount !== 1) {
         throw new Error(
@@ -355,16 +376,18 @@ async function sendWithdrawal(withdrawalId, providerReference) {
  * Closes a withdrawal and refunds the balance.
  *
  * `reason` is the operator's record of why, and it is written to the row. `options.emailReason`
- * is what the user is shown instead, when the two need to differ -- which is the case for every
- * failure that originates at the provider. "NOWPayments /v1/payout returned 400.: Insufficient
- * balance" is the right thing to keep on the row and the wrong thing to put in an email: it
- * names a third party the user has no relationship with, an HTTP status, and an endpoint path.
- * The email carries the same fact in words the user can act on, and both are sent from here so
- * the refund and the message announcing it remain one event.
+ * is what the user is shown in the email instead, and `options.description` is what is written
+ * to their history -- which needed to be its own option rather than reusing the email's, because
+ * the two are read in different places by different people and the history entry outlives the
+ * message. All three can differ when a failure originates at the provider. "NOWPayments /v1/
+ * payout returned 400.: Insufficient balance" is the right thing to keep on the row and the wrong
+ * thing to put in front of the user: it names a third party they have no relationship with, an
+ * HTTP status, and an endpoint path. Both are sent from here so the refund and the messages
+ * announcing it remain one event.
  */
-async function reverseWithdrawal(withdrawalId, reason, { emailReason } = {}) {
+async function reverseWithdrawal(withdrawalId, reason, { emailReason, description } = {}) {
     const result = await withTransaction((client) =>
-        refundWithdrawal(client, Number(withdrawalId), reason)
+        refundWithdrawal(client, Number(withdrawalId), reason, { description })
     );
     if (result.changed) {
         await notifyRefunded(result.withdrawal, emailReason || reason).catch((error) => {

@@ -386,8 +386,11 @@ async function abandonClaimedPayouts(claimed, detail, providerMessage, userReaso
         try {
             const result = await reverseWithdrawal(id, detail.slice(0, 500), {
                 // Omitted entirely when the caller has nothing better to say, so the operator
-                // detail reaches the email rather than a blank callout.
-                ...(userReason ? { emailReason: userReason } : {})
+                // detail reaches the email rather than a blank callout. It is also the wording
+                // that goes into the user's history, which is a second reader of the same fact:
+                // an entry sitting in someone's transaction list is read by them, not by whoever
+                // is on call, so the provider's error string is not left there.
+                ...(userReason ? { emailReason: userReason, description: userReason } : {})
             });
             if (result.changed) {
                 abandoned += 1;

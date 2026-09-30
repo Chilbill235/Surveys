@@ -233,16 +233,6 @@ function createQuestionGroup(question) {
     return fieldset;
 }
 
-function renderConfirmationTask() {
-    const fields = document.getElementById('demo-fields');
-    const titleEl = document.getElementById('demo-title');
-    if (titleEl) titleEl.textContent = 'Demo partner task';
-    const copyEl = document.getElementById('demo-copy');
-    if (copyEl) copyEl.textContent =
-        'This local task tests click tracking and completion without leaving RewardZone.';
-    if (fields) fields.append(createConfirmationTask());
-}
-
 /**
  * One step of a partner task: a checkbox the participant ticks to say they did the thing.
  *

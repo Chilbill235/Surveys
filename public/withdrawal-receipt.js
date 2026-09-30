@@ -33,6 +33,96 @@ function requireSession() {
     return Boolean(sessionStorage.getItem(sessionKey));
 }
 
+/**
+ * Why a withdrawal did not go out, in words the owner of the money can use.
+ *
+ * A copy of the helper in `app.js`, which this page does not load -- it is a standalone page with
+ * two other scripts and no app bundle. Duplicated deliberately rather than shared through a new
+ * file: a shared module would mean a `<script>` tag on every page that formats a receipt, and
+ * this is a single pure function whose whole body is a switch over the row's own state. The risk
+ * worth guarding is the two drifting apart, and `test/withdrawalReason.test.js` asserts both say
+ * the same thing about the same rows.
+ */
+function withdrawalFailureText(withdrawal = {}) {
+    const status = String(withdrawal.status || '').toLowerCase();
+    const payoutStatus = String(withdrawal.payout_status || '').toUpperCase();
+
+    if (['SUBMISSION_UNKNOWN', 'VERIFY_UNKNOWN'].includes(payoutStatus)) {
+        return 'We are confirming this transfer with our payout provider. Nothing is needed from you, '
+            + 'and the money stays yours either way.';
+    }
+    if (status === 'refunded' || status === 'failed') {
+        return 'We were not able to send this withdrawal, so the full amount has been returned to your balance.';
+    }
+    if (status === 'cancelled') {
+        return 'This withdrawal was cancelled and the full amount has been returned to your balance.';
+    }
+    if (status === 'paid' || payoutStatus === 'FINISHED') return '';
+    if (['FAILED', 'CANCELLED', 'CANCELED', 'REJECTED', 'REJECTED_NOT_CHECKED'].includes(payoutStatus)) {
+        return 'We were not able to send this withdrawal. If it has not returned to your balance, '
+            + 'it will be refunded shortly.';
+    }
+    return '';
+}
+
+/**
+ * The payout stage as a short noun phrase.
+ *
+ * Replaced `String(withdrawal.payout_status).replace(/_/g, ' ').toLowerCase()`, which printed the
+ * provider's internal vocabulary: a row in `CREATING` read "creating", which describes what our
+ * system is doing rather than anything about the money. The `String(...)` with no fallback also
+ * printed the literal text "null" wherever `payout_status` was null.
+ */
+function payoutStageLabel(withdrawal = {}) {
+    const stage = String(withdrawal.payout_status || '').toUpperCase();
+    if (!stage) return '';
+    switch (stage) {
+        case 'CREATING':
+        case 'NEW':
+        case 'WAITING':
+            return 'Preparing to send';
+        case 'PROCESSING':
+        case 'SENDING':
+            return 'Sending';
+        case 'SUBMISSION_UNKNOWN':
+        case 'VERIFY_UNKNOWN':
+            return 'Confirming with our payout provider';
+        case 'FINISHED':
+            return 'Confirmed on the network';
+        case 'FAILED':
+        case 'CANCELLED':
+        case 'CANCELED':
+        case 'REJECTED':
+        case 'REJECTED_NOT_CHECKED':
+            return 'Not sent';
+        default:
+            return 'In progress';
+    }
+}
+
+/**
+ * A timestamp, in words.
+ *
+ * `hour12` is set explicitly rather than left to the browser's locale. Left alone it follows
+ * whatever the operating system is set to, so the same receipt read "4:16 PM" for one reader and
+ * "16:16" for the next -- and a 24-hour clock reads as military time to anyone who has not grown
+ * up with it. A receipt is a record someone keeps, so it should not change shape with the reader's
+ * machine. The date stays in the reader's own locale; only the clock format is pinned.
+ */
+function formatDateTime(value) {
+    if (!value) return '';
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return '';
+    return date.toLocaleString(undefined, {
+        month: 'short',
+        day: 'numeric',
+        year: 'numeric',
+        hour: 'numeric',
+        minute: '2-digit',
+        hour12: true
+    });
+}
+
 function formatMoney(value) {
     const amount = Number(value);
     return Number.isFinite(amount)
@@ -76,7 +166,11 @@ function outcomeOf(withdrawal) {
         return {
             state: 'failed',
             title: 'This withdrawal was not sent',
-            lead: withdrawal.failure_reason || 'The payout could not be completed.'
+            // Composed rather than quoted: `failure_reason` is the operator's record and is
+            // usually the provider's own error text, which reads as a statement about the
+            // user's own balance when it is not -- "Insufficient balance" describes our payout
+            // provider's account. The one thing they can act on is whether the money came back.
+            lead: withdrawalFailureText(withdrawal) || 'The payout could not be completed.'
         };
     }
     return {
@@ -147,21 +241,21 @@ function renderFacts(withdrawal) {
         ['Destination', withdrawal.payout_address || withdrawal.payment_address || ''],
         ['Sent', coin(withdrawal.payout_coin_amount, withdrawal.payout_currency || withdrawal.asset_code)],
         ['Network fee', coin(withdrawal.payout_fee_coin, withdrawal.payout_currency || withdrawal.asset_code)],
-        ['Requested', new Date(withdrawal.created_at).toLocaleString()]
+        ['Requested', formatDateTime(withdrawal.created_at)]
     ];
     if (withdrawal.payout_submitted_at) {
-        rows.push(['Sent to provider', new Date(withdrawal.payout_submitted_at).toLocaleString()]);
+        rows.push(['Sent to provider', formatDateTime(withdrawal.payout_submitted_at)]);
     }
     if (withdrawal.paid_at) {
-        rows.push(['Confirmed', new Date(withdrawal.paid_at).toLocaleString()]);
+        rows.push(['Confirmed', formatDateTime(withdrawal.paid_at)]);
     }
     if (withdrawal.refunded_at) {
-        rows.push(['Returned to balance', new Date(withdrawal.refunded_at).toLocaleString()]);
+        rows.push(['Returned to balance', formatDateTime(withdrawal.refunded_at)]);
     }
     if (withdrawal.payout_status) {
-        rows.push(['Payout stage', String(withdrawal.payout_status).replace(/_/g, ' ').toLowerCase()]);
+        rows.push(['Payout stage', payoutStageLabel(withdrawal)]);
     }
-    const reason = withdrawal.failure_reason || withdrawal.payout_error;
+    const reason = withdrawalFailureText(withdrawal);
     if (reason) rows.push(['Reason', reason]);
     if (withdrawal.provider_reference) {
         rows.push(['Transaction reference', withdrawal.provider_reference]);

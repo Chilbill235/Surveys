@@ -1308,3 +1308,15 @@ const authController = {
 };
 
 module.exports = authController;
+
+/**
+ * The password hasher, exported for the smoke test.
+ *
+ * It was module-private, so `scripts/smoke-survey-flow.js` had no way to create an account it
+ * could then sign in with -- and its own answer, hashing a throwaway password a second way, is
+ * exactly the duplication that ends with a fixture hashed by an algorithm the server does not
+ * accept. Exporting the real one means the smoke test signs in through the same code path a real
+ * user does, so a change to the hashing or the stored format breaks the test rather than quietly
+ * making its fixture unloginable.
+ */
+module.exports.hashPassword = hashPassword;

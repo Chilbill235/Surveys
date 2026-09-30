@@ -209,31 +209,58 @@
                 Putting it here fixes both. It is the first thing below the balance, so it is
                 visible on a phone without scrolling at all, and the save button and its
                 status message are on screen at the same time as the field they belong to.
+
+                The second arrangement inside it is a grid of three things -- the picture, who
+                you are, and the controls -- and the placement rule is that a control sits next
+                to the thing it changes. The picture controls used to live in the far column,
+                a whole card-width away from the picture they replace, so the reader had to hold
+                "choose" and "this face" in their head across the gutter. They are now stacked
+                directly under the name, immediately beside the avatar, and the name field keeps
+                the right-hand column to itself because it is the part with a save button
+                attached to it.
             -->
             <div class="account-profile" id="profile-settings">
                 <div class="account-profile-identity">
-                    <img class="profile-avatar-preview account-profile-avatar" id="profile-avatar-preview" src="/brand.gif" alt="" width="72" height="72">
+                    <img class="profile-avatar-preview account-profile-avatar" id="profile-avatar-preview" src="/brand.gif" alt="" width="88" height="88">
                     <div class="account-profile-text">
                         <p class="eyebrow">Profile</p>
                         <h2 class="section-title" id="profile-heading">Your account</h2>
-                        <p class="body-text is-muted">The name and picture below appear in your account menu. Only you see them, and neither affects your sign-in or your balance.</p>
+                        <p class="body-text is-muted">Your name and picture appear in your account menu. Only you can see them, and neither affects your sign-in or your balance.</p>
+                    </div>
+                    <div class="profile-avatar-actions">
+                        <div class="profile-avatar-buttons">
+                            <label class="button button-ghost" for="profile-avatar-input">Choose picture</label>
+                            <input type="file" id="profile-avatar-input" accept="image/*" hidden>
+                            <button type="button" class="link-button" id="profile-avatar-remove" hidden>Remove picture</button>
+                        </div>
+                        <!--
+                            Shortened. It listed six formats and then three clauses of explanation,
+                            which is a paragraph sitting under a button at the exact moment someone
+                            has just clicked it and wants to know what happens next. The formats are
+                            still all named; what went is the restatement of what the surrounding
+                            copy already says.
+                        -->
+                        <p class="field-hint" id="profile-avatar-hint">PNG, JPEG, GIF, WebP, AVIF or BMP, up to 10&nbsp;MB. Cropped square before it is sent.</p>
                     </div>
                 </div>
 
                 <div class="profile-editor">
-                    <div class="profile-avatar-actions">
-                        <label class="button button-ghost" for="profile-avatar-input">Choose picture</label>
-                        <input type="file" id="profile-avatar-input" accept="image/*" hidden>
-                        <button type="button" class="link-button" id="profile-avatar-remove" hidden>Remove picture</button>
-                        <p class="field-hint" id="profile-avatar-hint">PNG, JPEG, GIF, WebP, AVIF, or BMP, up to 10&nbsp;MB. It is cropped square and shrunk before it is sent, and only you can see it.</p>
+                    <div class="field-row">
+                        <label class="form-label" for="profile-display-name">Display name</label>
+                        <!--
+                            The counter is `aria-hidden`. A live region that announced every
+                            keystroke would talk over the person typing, and the number is the
+                            same information the field's own limit already gives -- it is here to
+                            answer "how much room is left" at a glance, not to narrate.
+                        -->
+                        <span class="field-count" id="profile-name-count" aria-hidden="true">0 / 60</span>
                     </div>
-                    <label class="form-label" for="profile-display-name">Display name</label>
                     <input class="form-control" id="profile-display-name" type="text" maxlength="60" placeholder="Your name" autocomplete="nickname" aria-describedby="profile-display-name-hint">
-                    <p class="field-hint" id="profile-display-name-hint">Up to 60 characters. Shown in your account menu and at the top of this page.</p>
+                    <p class="field-hint" id="profile-display-name-hint">Shown in your account menu and at the top of this page.</p>
                     <div class="profile-actions">
                         <button class="button button-accent" id="profile-save" type="button" disabled>Save profile</button>
+                        <p class="account-setting-status" id="profile-status" role="status" aria-live="polite"></p>
                     </div>
-                    <p class="account-setting-status" id="profile-status" role="status" aria-live="polite"></p>
                 </div>
             </div>
 
@@ -425,18 +452,22 @@
         </section>
     </main>
 
-    <!--
+        <!--
         The footer, identical on every page.
 
-        One column, top to bottom, at every width. The previous layout put Product / Help /
-        Legal side by side as parallel columns on desktop, which reads fine on paper and badly
-        on a screen: someone looking for the Privacy Policy has to guess which of three columns
-        holds it and then check the other two headings to be sure. Stacked, the page has one
-        reading order that is the same on every device, and "the legal links are further down"
-        is an answer a visitor can act on without a strategy.
+        Grouped columns with the brand on the left. Three labelled lists side by side rather than
+        one tall stack: on a desktop the whole footer is one screen, so the reader sees what the
+        site has before scrolling past it, and a stack of twelve links with two headings between
+        them makes the reader travel the height of the page to find out nothing else is coming.
 
-        Every href resolves. That is checked, not assumed: a legal link that goes nowhere is
-        worse than a missing one, because it implies the document exists and cannot be read.
+        Group order is fixed and identical on every page -- Menu, Help, Legal -- because the one
+        real cost of columns is having to guess which one holds the page you want. A heading on
+        every group plus a fixed order makes the guess unnecessary.
+
+        Every href resolves. That is checked, not assumed: a legal link that goes nowhere is worse
+        than a missing one, because it implies the document exists and cannot be read. Only real
+        destinations are linked -- there is no Fairness or Advertise link here, because no such
+        page exists to link to.
     -->
     <footer class="site-footer">
         <div class="site-footer-brand">
@@ -448,23 +479,23 @@
             <p class="site-footer-copy">&copy; <span data-current-year>2026</span> RewardZone. All rights reserved.</p>
         </div>
 
-        <nav class="site-footer-group" aria-label="Product">
-            <h2 class="site-footer-heading">Product</h2>
+        <nav class="site-footer-group" aria-label="Menu">
+            <h2 class="site-footer-heading">Menu</h2>
             <a href="/">Home</a>
             <a href="/offers">Offers</a>
             <a href="/account">Your account</a>
-            <a href="/#home-faq">Frequently asked questions</a>
+            <a href="/login">Sign in</a>
         </nav>
 
         <nav class="site-footer-group" aria-label="Help">
             <h2 class="site-footer-heading">Help</h2>
-            <a href="/account">Sign in or create an account</a>
-            <a href="/reset-password">Reset your password</a>
+            <a href="/#home-faq">Frequently asked</a>
             <a href="#" data-helpdesk-trigger>Help desk</a>
             <a href="#" data-contact-trigger>Contact support</a>
+            <a href="/reset-password">Reset your password</a>
         </nav>
 
-        <nav class="site-footer-group" aria-label="Legal">
+        <nav class="site-footer-group site-footer-group-legal" aria-label="Legal">
             <h2 class="site-footer-heading">Legal</h2>
             <a href="/terms">Terms of service</a>
             <a href="/privacy">Privacy policy</a>

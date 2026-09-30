@@ -398,8 +398,8 @@ const expectations = [
     // The footer's link groups were laid out as a left-aligned wrapped flex row while the brand
     // and the copyright above them were centred. `.site-footer nav { display: flex }` beat
     // `.site-footer-group { display: grid }` on specificity -- a class plus a type beats a class
-    // -- so `justify-items: center` was silently inert. Both halves are pinned: the group has
-    // to be a grid, and it has to be centring itself.
+    // -- so `justify-items` was silently inert. Both halves are pinned: the group has to be a grid,
+    // and it has to set its own alignment.
     //
     // Asserted on `.site-footer .site-footer-group`, which is the selector that now has to win.
     // Asserting the bare class would keep passing while the stylesheet was wrong, because
@@ -407,8 +407,32 @@ const expectations = [
     // shipped broken is precisely that the winning rule was a different string. The cross-
     // examination below is what sees the `.site-footer nav` competitor; this is what proves the
     // fix landed.
+    //
+    // The alignment itself is `start`, not `center`. The footer is a map of the site now -- brand
+    // on the left, three labelled link columns beside it -- and a map has a top-left corner.
+    // Centring each group's links inside a column that is itself centred in the footer stacked
+    // them under a centred heading with no shared axis, which is what the columns replaced.
     ['phone', '.site-footer .site-footer-group', 'display', { 'phone 390 (modern)': 'grid', 'laptop 1280': 'grid' }],
-    ['phone', '.site-footer .site-footer-group', 'justify-items', { 'phone 390 (modern)': 'center', 'laptop 1280': 'center' }],
+    ['phone', '.site-footer .site-footer-group', 'justify-items', { 'phone 390 (modern)': 'start', 'laptop 1280': 'start' }],
+
+    // The footer is four tracks on a desktop, two groups side by side below it, and one column only
+    // below 360px. The phone expectation is two tracks, not one: a single column there is a stack
+    // of twelve full-width rows -- four screens of footer -- for a reader who wanted the cookie
+    // policy. The 360px floor is measured, not guessed: it is where "Frequently asked" stops
+    // fitting two lines in a column.
+    ['phone', '.site-footer', 'grid-template-columns', { 'phone 390 (modern)': 'repeat(2, minmax(0, 1fr))', 'laptop 1280': 'minmax(0, 1.6fr) repeat(3, minmax(0, 1fr))' }],
+
+    // Below 900px the brand takes its own row across the full width, and the legal group does the
+    // same at the bottom with its links in one wrapping row. Both facts are load-bearing: the
+    // brand has to span or it occupies the first cell of a two-column grid and pushes the groups
+    // down by its own height while looking like a fourth link list.
+    //
+    // Both stay `1 / -1` all the way down. At 560px and below the grid is a single column, where
+    // `1 / -1` and `auto` place the group identically -- so the legal group is asserted to span at
+    // the phone too, rather than asserted to `auto` and then quietly overridden by the phone
+    // block further down the stylesheet. A rule that never wins is not a rule.
+    ['tablet', '.site-footer-brand', 'grid-column', { 'phone 390 (modern)': '1 / -1', 'tablet 768': '1 / -1' }],
+    ['tablet', '.site-footer .site-footer-group-legal', 'grid-column', { 'phone 390 (modern)': '1 / -1', 'tablet 768': '1 / -1' }],
 
     // Three separate ways the account page pushed its content sideways on a 320px screen.
     //

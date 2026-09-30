@@ -51,6 +51,28 @@ function formatMoney(value) {
         : String(value ?? '');
 }
 
+/**
+ * A timestamp on a twelve-hour clock.
+ *
+ * A deposit receipt is the one page somebody reads while staring at a block explorer counting
+ * confirmations, so the clock has to be the clock they think in. `hour12` is set explicitly
+ * rather than inherited from the reader's locale, which would otherwise show this same deadline
+ * as "16:16" to one reader and "4:16 PM" to the next. The date stays in their own locale.
+ */
+function formatDateTime(value) {
+    if (!value) return '';
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return '';
+    return date.toLocaleString(undefined, {
+        month: 'short',
+        day: 'numeric',
+        year: 'numeric',
+        hour: 'numeric',
+        minute: '2-digit',
+        hour12: true
+    });
+}
+
 function statusLabel(status) {
     const known = {
         pending: 'Awaiting payment',
@@ -88,14 +110,14 @@ function renderFacts(deposit) {
     rows.push(['Status', statusLabel(deposit.status)]);
     rows.push(['Reference', `#${deposit.id}`]);
     if (deposit.deposit_address) rows.push(['Address', deposit.deposit_address]);
-    rows.push(['Created', new Date(deposit.created_at).toLocaleString()]);
+    rows.push(['Created', formatDateTime(deposit.created_at)]);
     // Only while the deposit can still be paid. Once it is settled the deadline is history, and
     // showing a timestamp in the past next to "credited" reads as a second problem.
     if (deposit.expires_at && !terminalStatuses.has(String(deposit.status || '').toLowerCase())) {
-        rows.push(['Pay by', new Date(deposit.expires_at).toLocaleString()]);
+        rows.push(['Pay by', formatDateTime(deposit.expires_at)]);
     }
     if (deposit.credited_at) {
-        rows.push(['Credited', new Date(deposit.credited_at).toLocaleString()]);
+        rows.push(['Credited', formatDateTime(deposit.credited_at)]);
     }
 
     const list = document.createElement('div');
