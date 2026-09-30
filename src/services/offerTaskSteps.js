@@ -22,10 +22,12 @@ const MAX_ACTION_LABEL_LENGTH = 120;
 /**
  * Loads the steps for one offer, in the order the page should show them.
  *
- * The URL is passed through as-is rather than validated here: it is shown to the participant
- * as a link to click, and the browser is what enforces it is a real URL. Validating it server
- * side would duplicate work the browser already does, and a step with no link -- "check your
- * email" -- is the common case and must not be rejected for having one.
+ * A step's URL is shown to the participant as a link to click, and it is checked for a
+ * usable scheme here rather than left to the browser. A browser does not refuse a
+ * `javascript:` href -- it runs it in this page's origin when the participant clicks -- so
+ * "the browser is what enforces it is a real URL" is not true of the one scheme that
+ * matters. The row is operator-supplied rather than visitor-supplied, but the column is
+ * free text.
  */
 async function loadOfferTaskSteps(offerId) {
     const id = Number(offerId);
@@ -45,9 +47,27 @@ async function loadOfferTaskSteps(offerId) {
             position: Number(row.position),
             prompt: String(row.prompt || '').slice(0, MAX_PROMPT_LENGTH),
             actionLabel: String(row.action_label || '').slice(0, MAX_ACTION_LABEL_LENGTH),
-            url: row.url ? String(row.url) : null
+            url: usableStepUrl(row.url)
         }))
         .filter((step) => step.prompt !== '' && step.actionLabel !== '');
+}
+
+/**
+ * A step's link, or null when it is absent or is not a plain web address.
+ *
+ * Null is a legitimate answer, not a rejection: "check your email" is a step with no
+ * link, and dropping the step over it would lose the instruction.
+ */
+function usableStepUrl(value) {
+    const raw = value ? String(value).trim() : '';
+    if (!raw) return null;
+    try {
+        const url = new URL(raw);
+        if (url.protocol !== 'http:' && url.protocol !== 'https:') return null;
+        return url.toString();
+    } catch {
+        return null;
+    }
 }
 
 /**

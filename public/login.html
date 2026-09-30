@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="theme-color" content="#131c4a" media="(prefers-color-scheme: dark)">
+    <meta name="theme-color" content="#2449d8" media="(prefers-color-scheme: light)">
+    <meta name="robots" content="noindex, nofollow">
+    <meta name="description" content="Sign in to your RewardZone account.">
+    <title>Sign in | RewardZone</title>
+    <link rel="stylesheet" href="/style.css">
+    <link rel="icon" href="/favicon.ico" sizes="any">
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+    <link rel="icon" href="/favicon-32.png" type="image/png">
+    <link rel="icon" href="/icon-192.png" type="image/png">
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+    <link rel="manifest" href="/site.webmanifest">
+    <script src="/session-gate.js" defer></script>
+    <script src="/app.js" defer></script>
+    <script src="/helpdesk.js" defer></script>
+    <script src="/clock.js" defer></script>
+<script src="/passkey-shared.js" defer></script>
+<script src="/passkeys.js" defer></script>
+</head>
+<!--
+    A page of its own, rather than the account page with a dialog on top of it.
+
+    That change is the whole point of this file. `/login` used to serve `account.html`, so
+    the sign-in dialog floated over the dashboard: the balance card, the transaction history
+    and the header controls were all behind it, visible around the edges and legible in the
+    gaps. Closing the dialog -- Escape, the close button, a click on the backdrop -- left the
+    visitor standing on a page for an account they were not signed in to, with every control
+    greyed out and no way to use any of them.
+
+    A visitor who must sign in should not be able to see the thing they are signing in to
+    reach, and should not be able to dismiss the only thing on the page. So there is no
+    dialog here, no close button, and no page content behind it: this *is* the sign-in
+    screen, full stop. `app.js` wires the form by id and works unchanged, because everything
+    it reaches for is optional.
+
+    The ids are the contract with `app.js` and must not be renamed without changing it:
+    `account-form`, `account-email`, `account-password`, `connect-submit`, `forgot-password-link`,
+    `account-message`, `verify-step` and the auth-mode tabs.
+-->
+<body class="login-page">
+    <div class="toast-region" id="toast-region" aria-live="polite"></div>
+
+    <main class="login-shell">
+        <a class="brand login-brand" href="/" aria-label="RewardZone home">
+            <img class="brand-mark" src="/brand.gif" alt="" width="48" height="48">
+            <span>reward<span class="brand-light">zone</span><span class="brand-tm" aria-hidden="true">&#8482;</span></span>
+        </a>
+
+        <form class="login-card" id="account-form">
+            <div class="login-heading">
+                <p class="eyebrow">Account</p>
+                <h1 id="account-title">Welcome back</h1>
+                <p class="body-text is-muted">Sign in to see your balance, complete offers, and move money.</p>
+            </div>
+
+            <div class="auth-mode" role="tablist" aria-label="Account access">
+                <button class="auth-mode-button is-active" type="button" role="tab" aria-selected="true" data-auth-mode="login">Sign in</button>
+                <button class="auth-mode-button" type="button" role="tab" aria-selected="false" data-auth-mode="register">Create account</button>
+            </div>
+
+            <label class="form-label" for="account-email">Email</label>
+            <input class="form-control" id="account-email" type="email" maxlength="254" autocomplete="email" required>
+
+            <label class="form-label" for="account-password" id="account-password-label">Password</label>
+            <input class="form-control" id="account-password" type="password" minlength="12" maxlength="128" autocomplete="current-password" required>
+            <p id="password-hint" class="field-hint" hidden>Use at least 12 characters.</p>
+
+            <p id="account-message" class="form-message" role="status"></p>
+            <button class="button button-accent button-wide button-lg" id="connect-submit" type="submit">Sign in</button>
+            <button class="link-button" id="forgot-password-link" type="button">Forgot password?</button>
+
+            <!--
+                Passkey sign-in, shown only when the browser actually has a WebAuthn
+                authenticator. The button is hidden by `passkeys.js` rather than rendered
+                disabled: a control that is permanently greyed out on a browser that cannot
+                use it is worse than no control, because it invites people to click through a
+                feature that will never work for them. `hidden` is the default here so a
+                browser with scripting disabled never shows a dead button.
+            -->
+            <div class="passkey-entry" id="passkey-entry" hidden>
+                <div class="passkey-divider"><span>or</span></div>
+                <button class="button button-ghost button-wide passkey-button" id="passkey-signin" type="button">
+                    <span class="passkey-glyph" aria-hidden="true"></span>
+                    <span id="passkey-signin-label">Sign in with a passkey</span>
+                </button>
+                <p class="passkey-note" id="passkey-note">Face ID, Touch ID, or your device screen lock.</p>
+            </div>
+
+            <div id="verify-step" class="verify-step" hidden>
+                <p class="verify-title">Confirm your email</p>
+                <p class="verify-copy">
+                    We sent a 6-digit code to <strong id="verify-email">your address</strong>.
+                    <span id="verify-expiry"></span>
+                </p>
+                <label class="visually-hidden" for="verify-code">6-digit confirmation code</label>
+                <input class="form-control verify-code" id="verify-code" type="text"
+                       inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}"
+                       maxlength="6" placeholder="000000" spellcheck="false">
+                <p id="verify-message" class="form-message" role="status"></p>
+                <button class="button button-accent button-wide" id="verify-submit" type="button">Confirm email</button>
+                <div class="verify-actions">
+                    <button class="link-button" id="verify-resend" type="button">Send a new code</button>
+                    <button class="link-button" id="verify-magic-link" type="button">Send me a magic link instead</button>
+                    <button class="link-button" id="verify-back" type="button">Use a different email</button>
+                </div>
+            </div>
+        </form>
+
+        <!--
+            The only way off this page, and it goes somewhere public. A signed-in visitor
+            never sees it: the gate forwards them to wherever they were headed before this
+            page rendered, so by the time anything is clickable they either have a session or
+            they are here with a "Sign in" heading and no dashboard to peek at.
+        -->
+        <p class="login-foot">
+            <a href="/">Back to the home page</a>
+        </p>
+    </main>
+</body>
+</html>

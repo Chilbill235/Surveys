@@ -88,6 +88,107 @@ test('a non-http link is dropped rather than rendered as a clickable target', ()
     assert.ok(!html.includes('>Go<'));
 });
 
+test('mailto is allowed for a reply link, and only as a bare address', () => {
+    // The contact form's only action is to reply to the person who wrote, and the footer
+    // tells them to. Without `mailto:` in the allow-list that link rendered as nothing at
+    // all, which is worse than not offering one.
+    assert.equal(safeUrl('mailto:someone@example.test'), 'mailto:someone@example.test');
+    assert.equal(safeUrl('mailto:someone@example.test?subject=Hi'), null, 'a pre-filled subject is not rendered');
+    assert.equal(safeUrl('mailto:a@b.test,c@d.test'), null, 'more than one recipient is not rendered');
+    assert.equal(safeUrl('mailto:not-an-address'), null);
+    assert.equal(safeUrl('mailto:someone@example.test/../x'), null);
+});
+
+test('a link block renders a real link in both bodies, not muted prose', () => {
+    const url = 'https://app.example.test/history';
+    const html = renderEmail({
+        heading: 'Withdrawal on its way',
+        blocks: [{ type: 'link', label: 'Open your withdrawal history:', url }]
+    });
+    const text = renderEmailText({
+        intro: 'We have sent your money.',
+        blocks: [{ type: 'link', label: 'Open your withdrawal history:', url }]
+    });
+
+    // Underlined, in the accent colour, and the URL is the anchor text. These three are the
+    // difference between a link and a line of text that happens to contain one: a footnote
+    // rendering the same URL in muted grey with no underline is what it replaced, because
+    // some clients strip the scheme from a link they do not recognise, leaving the host and
+    // path with nothing to make it clickable.
+    assert.match(html, /<a href="https:\/\/app\.example\.test\/history"[^>]*>/);
+    assert.match(html, /text-decoration:underline/);
+    assert.ok(html.includes(`>${url}<`), 'the URL is not the visible text of the link');
+    assert.ok(text.includes(url), 'the URL is missing from the text alternative');
+    assert.ok(text.includes('Open your withdrawal history:'), 'the label is missing from the text alternative');
+});
+
+test('a link block refuses a URL that is not http(s) or mailto', () => {
+    // A refused URL renders nothing at all -- not the label with no link, which would read
+    // as a broken page.
+    const html = renderEmail({
+        heading: 'Hi',
+        blocks: [{ type: 'link', label: 'Click here:', url: 'javascript:alert(1)' }]
+    });
+    assert.ok(!html.includes('javascript:'));
+    assert.ok(!html.includes('Click here:'), 'the label was rendered with no link behind it');
+});
+
+test('every message that sends a link also writes the URL out in full', async () => {
+    // The button is an image-and-border table cell, and gateways that strip images take it
+    // with them. So each message that carries a link must repeat the URL as text, and the
+    // text alternative is the version a text-only client can act on at all.
+    const sent = [];
+    const originalFetch = global.fetch;
+    global.fetch = async (url, init) => {
+        sent.push(JSON.parse(init.body));
+        return new Response('{"messageId":"1"}', { status: 201, headers: { 'Content-Type': 'application/json' } });
+    };
+    process.env.BREVO_API_KEY = 'test-key';
+    try {
+        const resetUrl = 'https://app.example.test/reset-password?token=t';
+        await sendPasswordResetEmail({ to: 'u@example.test', resetUrl });
+        const reset = sent.at(-1);
+        assert.ok(reset.htmlContent.includes('https://app.example.test/reset-password?token=t'),
+            'the reset URL is not in the HTML');
+        assert.ok(reset.textContent.includes(resetUrl), 'the reset URL is not in the text alternative');
+        // As a link, not as a footnote: the URL is the anchor text and it is underlined.
+        assert.match(reset.htmlContent, /<a href="https:\/\/app\.example\.test\/reset-password\?token=t"[^>]*text-decoration:underline/);
+
+        sent.length = 0;
+        await sendWithdrawalStartedEmail({
+            to: 'u@example.test',
+            amount: 25,
+            assetCode: 'usdt',
+            network: 'trc20',
+            destination: 'TXYZabc'
+        });
+        const started = sent.at(-1);
+        assert.ok(started.htmlContent.includes('https://app.example.test/history'),
+            'the history URL is not in the HTML');
+        assert.ok(started.textContent.includes('https://app.example.test/history'),
+            'the history URL is not in the text alternative');
+
+        sent.length = 0;
+        await sendDepositInstructionsEmail({
+            to: 'u@example.test',
+            amount: 20,
+            balance: 0,
+            method: 'USDT (TRC20)',
+            depositId: 77,
+            payAddress: 'TXYZabc',
+            payAmount: 19.5
+        });
+        const instructions = sent.at(-1);
+        assert.ok(instructions.htmlContent.includes('https://app.example.test/offers'),
+            'the deposit page URL is not in the HTML');
+        assert.ok(instructions.textContent.includes('https://app.example.test/offers'),
+            'the deposit page URL is not in the text alternative');
+    } finally {
+        global.fetch = originalFetch;
+        delete process.env.BREVO_API_KEY;
+    }
+});
+
 test('the verification code reaches both the HTML and the text body', () => {
     const { subject, text, html } = buildMessage({ code: '048172' });
 

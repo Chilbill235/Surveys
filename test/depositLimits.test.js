@@ -5,20 +5,27 @@ const path = require('node:path');
 const vm = require('node:vm');
 
 /**
- * The deposit form's coin picker, tested against the real source.
+ * The deposit form must not enforce the payment provider's minimum.
  *
- * This is the logic that decides which coin a depositor is shown first, and the logic behind
- * the "use a different coin" offer. Both exist for the same reason: this app advertises a
- * $1.00 minimum, and that is only true of some coins. NOWPayments genuinely refuses a Bitcoin
- * Cash deposit under about $18.79, and a few other pairs sit in the same range, so a user who
- * has picked a coin with a high floor is told the amount is too small and given no way to
- * discover that a $1 deposit was available the whole time.
+ * The bug this pins shut, and it had three separate parts in the browser:
  *
- * `public/app.js` is a browser script with no module boundary, so it cannot be imported. The
- * function body is lifted out of the file by brace matching and evaluated against stubs --
- * which tests the text that actually ships. Re-implementing the rule here instead would
- * create a second copy that passes while the real one breaks, which is the failure this whole
- * arrangement exists to prevent.
+ *   1. `syncDepositPresets` disabled every preset under the provider's floor. Measured on the
+ *      live account, the provider quotes ~$18.74 for every coin while the presets are $5/$10/
+ *      $25/$50 -- so a form where most one-tap options could not be pressed.
+ *   2. `settleDepositAmountToPayable` silently rewrote the amount box to the provider's floor
+ *      whenever it was not focused. The user typed $10 and the box said $18.74 with no
+ *      explanation, on every currency change and every time the dialog opened.
+ *   3. `updateDepositSwapOffer` put a "below the floor for this coin" banner above the button,
+ *      permanently, because the floor applied to every coin on this account.
+ *
+ * Together those made a deposit form that either would not submit or silently charged the user
+ * more than they entered. The provider is the only party that knows what it will accept, its
+ * figure moves between reads, and `paymentController` already translates its refusal into a
+ * sentence with a number in it -- so the form's job is to let the user press the button.
+ *
+ * `public/app.js` is a browser script with no module boundary, so it cannot be required. The
+ * function body is lifted out of the file by brace matching and evaluated against stubs, which
+ * tests the text that actually ships.
  */
 
 const source = fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8');
@@ -41,101 +48,170 @@ function extractFunction(name) {
     throw new Error(`unbalanced braces while extracting ${name}`);
 }
 
-/** Runs the real function against a stubbed document and deposit state. */
-function runCheapestCurrency({ options, selected, amount, appFloor = 1 }) {
-    const select = { value: selected };
+test('the provider minimum is not read anywhere in the deposit form', () => {
+    // Structural, because the failure mode is a re-added gate rather than a wrong number. Any
+    // helper named for a provider floor is the thing that comes back, so this asserts on the
+    // absence of the concept rather than on one particular comparison.
+    assert.doesNotMatch(
+        source,
+        /providerMinimumForSelectedCurrency/,
+        'a per-coin provider floor helper is being read by the deposit form again'
+    );
+    assert.doesNotMatch(
+        source,
+        /settleDepositAmountToPayable/,
+        'the amount box is being rewritten to the provider floor again'
+    );
+    assert.doesNotMatch(
+        source,
+        /cheapestCurrencyAccepting/,
+        'the "use a cheaper coin" offer is being rebuilt'
+    );
+});
+
+test('the amount box is never rewritten to a figure the user did not type', () => {
+    // The one function that still moves the box is `clampDepositAmountToRange`, and it is
+    // bounded by this app's own floor and ceiling, not by the provider's quote. Asserted by
+    // name because the silent-rewrite helper is gone entirely -- if it returns, it will be
+    // under one of these names or a new one, and the guard below still catches the new one.
+    assert.doesNotMatch(
+        extractFunction('minimumForSelectedCurrency'),
+        /minimums/,
+        'the box floor reads the provider minimums again'
+    );
+    assert.doesNotMatch(
+        extractFunction('maximumForSelectedCurrency'),
+        /minimums/,
+        'the box ceiling reads the provider minimums again'
+    );
+});
+
+test('every preset a user can see is a button they can press', () => {
+    // Executed, not pattern-matched: the defect was a disabled control, which a text assertion
+    // about the same function would pass right through. `minimumForSelectedCurrency` is stubbed
+    // at the cent guard the form actually applies for crypto, so the presets must all survive.
+    const buttons = [5, 10, 25, 50].map((value) => ({
+        dataset: { depositAmount: String(value) },
+        disabled: false,
+        classList: { toggle() {} },
+        setAttribute() {},
+        title: ''
+    }));
     const context = {
-        depositState: { options },
-        document: { getElementById: (id) => (id === 'deposit-currency' ? select : null) },
-        minimumForSelectedCurrency: () => appFloor,
-        // The extracted function takes the amount as a parameter, so the call is made with a
-        // value the sandbox can see. Passing it in as a context global rather than inlining it
-        // into the script text keeps `NaN` and `Infinity` as real values rather than literals
-        // re-parsed by the sandbox.
-        amount,
-        Math,
-        Number
+        document: {
+            getElementById: (id) => (id === 'deposit-amount' ? { value: '10' } : null),
+            querySelectorAll: () => buttons
+        },
+        depositState: { method: 'crypto' },
+        minimumForSelectedCurrency: () => 0.01,
+        maximumForSelectedCurrency: () => 5000,
+        formatBalance: (value) => `$${Number(value).toFixed(2)}`
     };
-    const factory = vm.createContext(context);
-    vm.runInContext(`${extractFunction('cheapestCurrencyAccepting')}\nthis.result = cheapestCurrencyAccepting(amount);`, factory);
-    return context.result;
-}
+    vm.runInContext(
+        `${extractFunction('syncDepositPresets')}\nsyncDepositPresets();`,
+        vm.createContext(context)
+    );
 
-test('the picker offers the coin the provider will accept the least of', () => {
-    // Bitcoin Cash genuinely refuses under about $18.79; the others are cheap to start. The
-    // app's $1.00 minimum is only reachable through one of the cheap ones, so the picker has to
-    // open on the cheap one rather than in whatever order the provider listed them.
-    const options = {
-        cryptoCurrencies: ['bch', 'btc', 'ltc'],
-        minimums: { bch: 18.79, btc: 18.8, ltc: 1.5 }
-    };
-    const cheapest = runCheapestCurrency({ options, selected: 'bch', amount: 5 });
-    assert.equal(cheapest.code, 'ltc');
-    assert.equal(cheapest.floor, 1.5);
-});
-
-test('the picker never suggests the coin that is already selected', () => {
-    // Suggesting the current coin produces a button that appears to do nothing, which reads as
-    // a broken control rather than as a no-op.
-    const options = { cryptoCurrencies: ['ltc', 'bch'], minimums: { ltc: 1.5, bch: 18.79 } };
-    const cheapest = runCheapestCurrency({ options, selected: 'ltc', amount: 5 });
-    assert.equal(cheapest, null, 'the already-selected cheapest coin was suggested back');
-});
-
-test('the picker suggests nothing when no coin will take the amount', () => {
-    // A $0.50 crypto deposit is impossible on every pair, and inventing a suggestion here would
-    // produce a button that leads straight to a provider refusal.
-    const options = { cryptoCurrencies: ['bch', 'btc'], minimums: { bch: 18.79, btc: 18.8 } };
-    assert.equal(runCheapestCurrency({ options, selected: 'btc', amount: 0.5 }), null);
-});
-
-test('a coin with no reported floor is treated as accepting the app minimum', () => {
-    // A missing figure is not a floor of infinity. The provider did not report one, and the
-    // only limit this app enforces itself is $1.00, so that is what the coin is treated as
-    // accepting -- otherwise an unreported coin is silently excluded from every suggestion.
-    const options = { cryptoCurrencies: ['bch', 'doge'], minimums: { bch: 18.79 } };
-    const cheapest = runCheapestCurrency({ options, selected: 'bch', amount: 1 });
-    assert.equal(cheapest.code, 'doge');
-    assert.equal(cheapest.floor, 1, 'it did not fall back to the app minimum');
-});
-
-test('a zero or unparseable floor is not treated as a real limit', () => {
-    // `0` and `null` are what an omitted or unconverted figure arrives as. Reading either as a
-    // real floor of zero would let a sub-minimum coin look like the cheapest option, which is
-    // how an unreported value becomes a wrong recommendation.
-    const options = {
-        cryptoCurrencies: ['bch', 'a', 'b'],
-        minimums: { bch: 18.79, a: 0, b: null }
-    };
-    const cheapest = runCheapestCurrency({ options, selected: 'bch', amount: 5 });
-    assert.equal(cheapest.code, 'a');
-    assert.equal(cheapest.floor, 1);
-});
-
-test('an amount of zero or nothing is not answered with a suggestion', () => {
-    const options = { cryptoCurrencies: ['bch', 'ltc'], minimums: { bch: 18.79, ltc: 1.5 } };
-    for (const amount of [0, -5, Number.NaN, Number.POSITIVE_INFINITY]) {
+    for (const button of buttons) {
         assert.equal(
-            runCheapestCurrency({ options, selected: 'bch', amount }),
-            null,
-            `amount ${amount} produced a suggestion`
+            button.disabled,
+            false,
+            `the $${button.dataset.depositAmount} preset cannot be pressed`
         );
     }
 });
 
-test('nothing is suggested before the options have loaded', () => {
-    // The offer is rendered on every keystroke, including before the first request resolves, so
-    // it has to cope with there being no options at all rather than throwing.
-    assert.equal(runCheapestCurrency({ options: null, selected: 'bch', amount: 5 }), null);
-    assert.equal(runCheapestCurrency({ options: {}, selected: 'bch', amount: 5 }), null);
+test('a preset outside this form\'s own bounds is still disabled', () => {
+    // The one gate that remains, so the test above is not passing because the check was
+    // deleted wholesale. A coin capped below $50 must grey out the $50 button.
+    const buttons = [5, 50].map((value) => ({
+        dataset: { depositAmount: String(value) },
+        disabled: false,
+        classList: { toggle() {} },
+        setAttribute() {},
+        title: ''
+    }));
+    const context = {
+        document: {
+            getElementById: (id) => (id === 'deposit-amount' ? { value: '5' } : null),
+            querySelectorAll: () => buttons
+        },
+        depositState: { method: 'crypto' },
+        minimumForSelectedCurrency: () => 0.01,
+        maximumForSelectedCurrency: () => 20,
+        formatBalance: (value) => `$${Number(value).toFixed(2)}`
+    };
+    vm.runInContext(
+        `${extractFunction('syncDepositPresets')}\nsyncDepositPresets();`,
+        vm.createContext(context)
+    );
+
+    assert.equal(buttons[0].disabled, false, '$5 is inside the ceiling and was disabled');
+    assert.equal(buttons[1].disabled, true, '$50 is above the $20 ceiling and was left enabled');
 });
 
-test('the default selection opens on the cheapest coin, which is the whole point of the rule', () => {
-    // The picker defaults are written inline in `loadDepositOptions`, so this asserts the
-    // contract the user actually experiences: opening the form on the provider's first-listed
-    // coin is what put an $18.79 minimum in front of everyone.
+test('the "below the floor" banner is gone from the markup and the stylesheet', () => {
+    // It could only ever have appeared on this account: the provider quotes ~$18.74 for every
+    // coin, so any amount under that showed a permanent warning above the submit button. The
+    // element and its two rules are removed rather than left behind hidden, because a rule with
+    // no element is a trap for the next person editing either file.
+    for (const file of ['index.html', 'history.html']) {
+        const html = fs.readFileSync(path.join(__dirname, '..', 'public', file), 'utf8');
+        assert.doesNotMatch(html, /deposit-swap-hint/, `#deposit-swap-hint is still in ${file}`);
+    }
+    const css = fs.readFileSync(path.join(__dirname, '..', 'public', 'style.css'), 'utf8');
+    assert.doesNotMatch(css, /\.swap-hint/, 'the .swap-hint rule is still in style.css');
+    assert.doesNotMatch(css, /\.swap-button/, 'the .swap-button rule is still in style.css');
+    assert.doesNotMatch(source, /updateDepositSwapOffer/, 'the no-op hiding function is still called');
+});
+
+test('the hint says this app sets no crypto minimum, rather than quoting one', () => {
+    // The number under the amount box is the one figure a user reads before deciding what to
+    // type. Quoting the provider's volatile floor there made a small deposit look acceptable
+    // and then fail -- the opposite of what the picker labels ("from $X") already imply.
+    const hint = { textContent: '', classList: { remove() {} } };
+    const context = {
+        document: { getElementById: (id) => (id === 'deposit-amount-hint' ? hint : null) },
+        depositState: { method: 'crypto', options: { maximumUsd: 5000 } },
+        minimumForSelectedCurrency: () => 0.01,
+        maximumForSelectedCurrency: () => 5000,
+        formatBalance: (value) => `$${Number(value).toFixed(2)}`,
+        validateDepositAmount: () => {}
+    };
+    vm.runInContext(
+        `${extractFunction('updateDepositAmountHint')}\nupdateDepositAmountHint();`,
+        vm.createContext(context)
+    );
+
+    assert.match(hint.textContent, /no minimum set by us/i);
+    assert.match(hint.textContent, /maximum \$5000\.00/i, `the maximum is missing from: ${hint.textContent}`);
+});
+
+test('a card deposit still states its real $1.00 floor', () => {
+    // The removal was scoped to crypto. $1 is a genuine card processing floor rather than a
+    // quoted guess, so dropping it would have been scope creep in the other direction.
+    const hint = { textContent: '', classList: { remove() {} } };
+    const context = {
+        document: { getElementById: (id) => (id === 'deposit-amount-hint' ? hint : null) },
+        depositState: { method: 'stripe', options: { maximumUsd: 5000, appMinimumUsd: 1 } },
+        minimumForSelectedCurrency: () => 1,
+        maximumForSelectedCurrency: () => 5000,
+        formatBalance: (value) => `$${Number(value).toFixed(2)}`,
+        validateDepositAmount: () => {}
+    };
+    vm.runInContext(
+        `${extractFunction('updateDepositAmountHint')}\nupdateDepositAmountHint();`,
+        vm.createContext(context)
+    );
+
+    assert.match(hint.textContent, /Minimum \$1\.00/);
+});
+
+test('the default coin selection opens on the cheapest one', () => {
+    // Not enforcement: the sort only chooses which coin is pre-selected, and a cheap coin is
+    // simply the friendlier default. Kept because it was a real improvement and there is no
+    // reason to lose it while removing the gates.
     const loadOptions = extractFunction('loadDepositOptions');
     assert.match(loadOptions, /sort\(/, 'the coin list is no longer sorted by floor');
     assert.match(loadOptions, /options\.minimums/, 'the sort no longer reads the provider floors');
-    assert.match(loadOptions, /cheapest/, 'the cheapest coin is no longer selected by default');
 });

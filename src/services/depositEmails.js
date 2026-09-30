@@ -2,6 +2,7 @@ const pool = require('../config/db');
 const { sendEmail, isEmailConfigured } = require('./mailer');
 const { renderEmail, renderEmailText } = require('./emailLayout');
 const { resolvePublicBaseUrl, isPubliclyReachable } = require('./publicBaseUrl');
+const { COLUMN, isMoneyEmailEnabled } = require('./emailPreferences');
 
 /**
  * The two messages a deposit produces: the instructions to pay, and the receipt once it lands.
@@ -52,6 +53,21 @@ function historyUrl() {
 function offersUrl() {
     const root = siteUrl();
     return root ? `${root}/offers` : null;
+}
+
+/**
+ * The deposit page and history links as `link` blocks.
+ *
+ * The button above them is an image-and-border table cell, and gateways that strip images
+ * take it with them -- which is why the URLs are also written out. A deposit-instructions
+ * message is the durable copy of a crypto address and an amount that cannot be reproduced
+ * later, so it has to survive the client it is read in.
+ */
+function depositLinkBlocks() {
+    return [
+        ...(offersUrl() ? [{ type: 'link', label: 'Open your deposit page:', url: offersUrl() }] : []),
+        ...(historyUrl() ? [{ type: 'link', label: 'Or your deposit history:', url: historyUrl() }] : [])
+    ];
 }
 
 /**
@@ -121,6 +137,22 @@ function recipient(email) {
     return address || null;
 }
 
+/**
+ * Adapts a `deposits` row to the field names `methodLabelFor` takes.
+ *
+ * The row is snake_case and the label helper's parameters are not, so passing the row
+ * straight through reads `assetCode` as undefined. A crypto receipt then named the method
+ * "Crypto" -- the one thing the message exists to say, since sending the wrong coin or the
+ * wrong chain is how the money is lost.
+ */
+function methodFor(deposit) {
+    return methodLabelFor({
+        provider: deposit.provider,
+        assetCode: deposit.asset_code,
+        network: deposit.network,
+    });
+}
+
 /** Sent when a crypto deposit is created, carrying everything needed to pay it. */
 async function sendDepositInstructionsEmail({
     to,
@@ -173,7 +205,8 @@ async function sendDepositInstructionsEmail({
             'Send only the coin shown, on the network shown. The same coin on a different chain is a different asset.',
             'Check the amount before sending. The provider refunds an underpayment, and the deposit is not credited until it is made whole.',
             'You do not need to keep this page open. These details are all that is needed to complete the payment.'
-        ] }
+        ] },
+        ...depositLinkBlocks()
     ];
 
     const history = historyUrl();
@@ -226,16 +259,22 @@ async function sendDepositConfirmedEmail({
 
     const offers = offersUrl();
     const history = historyUrl();
+    // Built once and passed to both renderers, rather than written out twice as inline
+    // arrays. A receipt is the document a user is most likely to come back to, so the two
+    // copies drifting apart here would show up as a message whose text version is missing
+    // the facts the HTML version has.
+    const blocks = [
+        { type: 'callout', tone: 'success', text: `${money || 'The deposit'} has been added to your balance.` },
+        { type: 'details', items },
+        ...(history ? [{ type: 'link', label: 'View your deposit history:', url: history }] : [])
+    ];
 
     return sendEmail({
         to: addressee,
         subject: `${money || 'Your deposit'} added to your balance`,
         text: renderEmailText({
             intro: `Your deposit of ${money || 'an unknown amount'} has arrived and has been added to your balance.`,
-            blocks: [
-                { type: 'callout', tone: 'success', text: `${money || 'The deposit'} has been added to your balance.` },
-                { type: 'details', items }
-            ],
+            blocks,
             action: offers ? { label: 'Complete an offer', url: offers } : null,
             footnote: 'Funds are available to withdraw immediately. If this deposit is not one you recognise, contact support.'
         }),
@@ -243,10 +282,7 @@ async function sendDepositConfirmedEmail({
             preheader: `${money || 'Your deposit'} has been added to your balance.`,
             heading: 'Deposit received',
             intro: `Your deposit of ${money || 'an unknown amount'} has arrived and is now part of your balance.`,
-            blocks: [
-                { type: 'callout', tone: 'success', text: `${money || 'The deposit'} has been added to your balance.` },
-                { type: 'details', items }
-            ],
+            blocks,
             action: offers ? { label: 'Complete an offer', url: offers } : null,
             footnote: 'Funds are available to withdraw immediately. If this deposit is not one you recognise, contact support.'
         })
@@ -285,6 +321,17 @@ async function sendDepositFailedEmail({ to, amount, method, reason, expired }) {
     if (method) items.push({ label: 'Method', value: method });
 
     const offers = offersUrl();
+    // One `blocks` for both renderers. The money line is the only part of this message that
+    // is about the user rather than the fault, and it is the part a user who thinks the
+    // platform took their money will look for first.
+    const blocks = [
+        { type: 'callout', tone: 'danger', text: detail },
+        { type: 'details', items },
+        { type: 'callout', tone: 'neutral', text:
+            'If you sent funds for this deposit, they were not credited to your account. Check your wallet or ' +
+            'contact support with the transaction hash and we will help you recover them.' },
+        ...(offers ? [{ type: 'link', label: 'Start a new deposit:', url: offers }] : [])
+    ];
 
     return sendEmail({
         to: addressee,
@@ -293,13 +340,7 @@ async function sendDepositFailedEmail({ to, amount, method, reason, expired }) {
         subject: `${money || 'Your'} deposit did not go through`,
         text: renderEmailText({
             intro: `Your deposit of ${money || 'an unknown amount'} could not be completed, so nothing was added to your balance.`,
-            blocks: [
-                { type: 'callout', tone: 'danger', text: detail },
-                { type: 'details', items },
-                { type: 'callout', tone: 'neutral', text:
-                    'If you sent funds for this deposit, they were not credited to your account. Check your wallet or ' +
-                    'contact support with the transaction hash and we will help you recover them.' }
-            ],
+            blocks,
             action: offers ? { label: 'Start a new deposit', url: offers } : null,
             footnote: 'If you did not attempt this deposit, no action is needed and nothing was taken from your account.'
         }),
@@ -307,13 +348,7 @@ async function sendDepositFailedEmail({ to, amount, method, reason, expired }) {
             preheader: `Your ${money || ''} deposit was not completed and nothing was credited.`.replace(/\s+/g, ' ').trim(),
             heading: 'Deposit did not complete',
             intro: `Your deposit of ${money || 'an unknown amount'} could not be completed, so nothing was added to your balance.`,
-            blocks: [
-                { type: 'callout', tone: 'danger', text: detail },
-                { type: 'details', items },
-                { type: 'callout', tone: 'neutral', text:
-                    'If you sent funds for this deposit, they were not credited to your account. Check your wallet or ' +
-                    'contact support with the transaction hash and we will help you recover them.' }
-            ],
+            blocks,
             action: offers ? { label: 'Start a new deposit', url: offers } : null,
             footnote: 'If you did not attempt this deposit, no action is needed and nothing was taken from your account.'
         })
@@ -327,17 +362,21 @@ async function sendDepositFailedEmail({ to, amount, method, reason, expired }) {
  * a handler needs to authenticate with -- so the address is read from the account row here
  * rather than threaded through from a controller. A user with no address on file gets no
  * message, which is the same outcome as having no mail provider configured.
+ *
+ * The opt-out rides along on the same row rather than costing a second query: every one of
+ * the three notification paths needs the address already, and a separate lookup per email
+ * would triple the reads on the deposit callback, which is the hottest path in the app.
  */
 async function loadRecipient(userId) {
     const result = await pool.query(
-        'SELECT email, balance FROM users WHERE id = $1',
+        `SELECT email, balance, ${COLUMN} FROM users WHERE id = $1`,
         [userId]
     );
     const row = result.rows[0];
     if (!row) return null;
     const email = recipient(row.email);
     if (!email) return null;
-    return { email, balance: row.balance };
+    return { email, balance: row.balance, moneyEmailsEnabled: isMoneyEmailEnabled(row[COLUMN]) };
 }
 
 /**
@@ -354,6 +393,10 @@ async function notifyDepositInstructions({ userId, depositId, assetCode, network
         if (!target) {
             console.error(`Deposit ${depositId}: no email address on file, instructions not sent.`);
             return { sent: false, reason: 'no-recipient' };
+        }
+        if (!target.moneyEmailsEnabled) {
+            console.log(`Deposit ${depositId}: user has money email switched off, instructions not sent.`);
+            return { sent: false, reason: 'opted-out' };
         }
         return await sendDepositInstructionsEmail({
             to: target.email,
@@ -384,7 +427,7 @@ async function notifyDepositCredited({ depositId }) {
     try {
         const result = await pool.query(
             `SELECT d.id, d.provider, d.asset_code, d.network, d.amount, d.provider_payment_id,
-                    u.email, u.balance
+                    u.email, u.balance, u.${COLUMN}
              FROM deposits d
              JOIN users u ON u.id = d.user_id
              WHERE d.id = $1`,
@@ -400,11 +443,15 @@ async function notifyDepositCredited({ depositId }) {
             console.error(`Deposit ${depositId}: no email address on file, receipt not sent.`);
             return { sent: false, reason: 'no-recipient' };
         }
+        if (!isMoneyEmailEnabled(deposit[COLUMN])) {
+            console.log(`Deposit ${depositId}: user has money email switched off, receipt not sent.`);
+            return { sent: false, reason: 'opted-out' };
+        }
         return await sendDepositConfirmedEmail({
             to: email,
             amount: deposit.amount,
             balance: deposit.balance,
-            method: methodLabelFor(deposit),
+            method: methodFor(deposit),
             reference: deposit.provider_payment_id || deposit.id
         });
     } catch (error) {
@@ -424,7 +471,7 @@ async function notifyDepositCredited({ depositId }) {
 async function notifyDepositFailed({ depositId, reason = null }) {
     try {
         const result = await pool.query(
-            `SELECT d.id, d.provider, d.asset_code, d.network, d.amount, d.status, u.email
+            `SELECT d.id, d.provider, d.asset_code, d.network, d.amount, d.status, u.email, u.${COLUMN}
              FROM deposits d
              JOIN users u ON u.id = d.user_id
              WHERE d.id = $1`,
@@ -440,10 +487,14 @@ async function notifyDepositFailed({ depositId, reason = null }) {
             console.error(`Deposit ${depositId}: no email address on file, failure notice not sent.`);
             return { sent: false, reason: 'no-recipient' };
         }
+        if (!isMoneyEmailEnabled(deposit[COLUMN])) {
+            console.log(`Deposit ${depositId}: user has money email switched off, failure notice not sent.`);
+            return { sent: false, reason: 'opted-out' };
+        }
         return await sendDepositFailedEmail({
             to: email,
             amount: deposit.amount,
-            method: methodLabelFor(deposit),
+            method: methodFor(deposit),
             reason,
             expired: String(deposit.status || '').toLowerCase() === 'expired'
         });

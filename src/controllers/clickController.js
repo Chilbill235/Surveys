@@ -2,6 +2,7 @@ const { v4: uuidv4 } = require('uuid');
 const pool = require('../config/db');
 const { resolvePublicBaseUrl } = require('../services/publicBaseUrl');
 const { isDemoModeEnabled } = require('../services/demoMode');
+const { normaliseAddress } = require('../middlewares/fraudDetection');
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -166,10 +167,15 @@ function sendError(res, isApi, status, message) {
  * complete it produces a row that can never resolve: the engage hop 404s, the reward never
  * posts back, and the click sits in the table looking like a real tracked click. Refusing
  * to record it is what stops that row existing.
+ *
+ * `is_active` is part of the same question. The catalog only ever lists active offers, so a
+ * deactivated one has been withdrawn from sale -- and an id is a small integer a caller can
+ * guess. Without this the offer disappears from the wall while remaining fully clickable and
+ * creditable, which is the opposite of what deactivating it is for.
  */
 async function loadOfferTrackingUrl(offerId) {
     const result = await pool.query(
-        'SELECT tracking_url, is_demo FROM offers WHERE id = $1',
+        'SELECT tracking_url, is_demo FROM offers WHERE id = $1 AND is_active IS TRUE',
         [offerId]
     );
     if (result.rows.length === 0) return { status: 'not_found' };
@@ -232,7 +238,12 @@ async function createTrackedClick(req, res, redirectImmediately) {
         }
 
         const userId = req.user?.id ?? null;
-        const ipAddress = req.ip || req.socket?.remoteAddress || null;
+        // Normalised before it is stored, because the fraud middleware counts recent clicks
+        // by the normalised form. The same client can reach a dual-stack host as
+        // `::ffff:1.2.3.4` on one connection and `1.2.3.4` on the next, so an un-normalised
+        // row was invisible to the velocity count that refused the eleventh click -- the limit
+        // was real for the count and not for the record.
+        const ipAddress = normaliseAddress(req.ip || req.socket?.remoteAddress);
         const userAgent = req.get('user-agent') || null;
 
         await pool.query(
@@ -246,6 +257,13 @@ async function createTrackedClick(req, res, redirectImmediately) {
         }
         return res.json({ redirectUrl: engageUrl });
     } catch (error) {
+        // `offers.id` is an integer, so a non-numeric offer id in the URL is a malformed id
+        // rather than a missing row, and PostgreSQL says so by raising `22P02` on the
+        // comparison. Answering 404 is the same answer a wrong id gets, and keeps a
+        // mistyped URL from reading as a server fault.
+        if (error && error.code === '22P02') {
+            return sendError(res, isApi, 404, 'Offer not found.');
+        }
         // The offer id is in the log line, not only in the message the user
         // sees. A bare `Tracking Error: <message>` used to be the only record
         // of the failure, and it named neither the offer nor the click.

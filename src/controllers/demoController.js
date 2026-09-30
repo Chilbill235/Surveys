@@ -8,21 +8,36 @@
  * redirect built from a URL parameter is a way to make this page's "return to RewardZone"
  * link land somewhere else wearing its name.
  */
+const COMPLETION_FALLBACK = '/offers';
+
+/**
+ * The origin the candidate is resolved against before it is judged.
+ *
+ * It is never returned to anyone: only a *path* derived from it is, and only when the
+ * resolution stayed on this origin.
+ */
+const COMPLETION_PLACEHOLDER_ORIGIN = 'http://localhost';
+
 function resolveCompletionUrl(offer) {
-    const fallback = '/offers';
     const candidate = String(offer?.completion_url || '').trim();
-    if (!candidate) return fallback;
+    if (!candidate) return COMPLETION_FALLBACK;
+    if (!candidate.startsWith('/')) return COMPLETION_FALLBACK;
     try {
-        const url = new URL(candidate, 'http://localhost');
-        if (url.protocol !== 'http:' && url.protocol !== 'https:') return fallback;
-        if (url.username || url.password) return fallback;
-        // Only a same-origin path is allowed. A fully-qualified URL here would be an open
-        // redirect, which is exactly what the fallback exists to avoid.
-        if (candidate.startsWith('//') || /^https?:\/\//i.test(candidate)) return fallback;
-        if (!candidate.startsWith('/')) return fallback;
-        return candidate;
+        const url = new URL(candidate, COMPLETION_PLACEHOLDER_ORIGIN);
+        // The origin comparison is the whole check, and it has to be made on the *resolved*
+        // URL rather than on the text. A prefix test is not enough: `/\evil.example` and
+        // `/\/evil.example` both start with a single slash, and WHATWG URL parsing treats a
+        // backslash as a separator, so the page's `location.href` assignment turns them into
+        // `//evil.example` -- an off-site redirect wearing this page's "return to RewardZone"
+        // name. Resolving first catches every one of those spellings at once, along with
+        // `//host` and any fully-qualified `https://` value.
+        if (url.origin !== COMPLETION_PLACEHOLDER_ORIGIN) return COMPLETION_FALLBACK;
+        if (url.username || url.password) return COMPLETION_FALLBACK;
+        // Re-serialised rather than echoed, so a path that survived resolution cannot carry
+        // anything the parser read as part of the authority.
+        return `${url.pathname}${url.search}${url.hash}`;
     } catch {
-        return fallback;
+        return COMPLETION_FALLBACK;
     }
 }
 
@@ -97,7 +112,10 @@ const demoController = {
             client = await pool.connect();
             await client.query('BEGIN');
             const click = await client.query(
-                `SELECT clicks.user_id, offers.is_demo, offers.offer_type, offers.payout,
+                // `title`, not `name`: the column is `offers.title`. The other demo queries in this file select
+                // `offers.title`, and it is what the catalog renders, so a reward row naming the
+                // offer matches what the user saw on the card they completed.
+                `SELECT clicks.user_id, offers.id, offers.title, offers.is_demo, offers.offer_type, offers.payout,
                         offers.pays_real_money, offers.completion_url
                  FROM clicks
                  JOIN offers ON offers.id = clicks.offer_id
@@ -113,6 +131,11 @@ const demoController = {
             const offer = click.rows[0];
             // Loaded once here and used for both the check and the stored payload, so what is
             // validated and what is recorded cannot be two different definitions.
+            //
+            // `offer.id` is selected because the step list is keyed by it. Without the column
+            // in this SELECT the lookup below was handed `undefined`, returned no steps, and
+            // every non-survey demo offer answered "Tick every step before submitting."
+            // forever -- a task that could be rendered but never completed.
             const questions = offer.offer_type === 'survey' ? await loadSurveyQuestions() : null;
             const steps = offer.offer_type !== 'survey' ? await loadOfferTaskSteps(offer.id) : null;
             if (offer.offer_type === 'survey') {
@@ -184,14 +207,28 @@ const demoController = {
                     'UPDATE users SET balance = balance + $1 WHERE id = $2 RETURNING balance',
                     [payout, req.user.id]
                 );
+                // Read back from the RETURNING clause rather than assumed, so a user row that
+                // vanished between the session check and this write fails the transaction
+                // instead of a ledger entry with no balance behind it.
+                if (updatedUser.rowCount !== 1) {
+                    throw new Error('Could not credit the completing user.');
+                }
                 // A real-money test completion is a real balance move, so it is written to the
                 // cash ledger without the demo flag. The flag is what keeps "balance equals the
                 // sum of my cash ledger" a query; marking this row demo would break that
                 // invariant for a payout the operator has actually sent.
+                //
+                // `transaction_type` is `conversion`, matching the non-cash branch below and
+                // `postbackController`: the type names what happened to the balance, and a
+                // credited offer reward is a conversion whether or not the money is real.
+                // `is_demo` is already the flag that says which. Filing it as `adjustment`
+                // put it in no tab at all -- the All list labelled it "Balance adjustment"
+                // for a manual correction, and the Rewards tab, whose empty state promises
+                // that completing an offer posts the reward, stayed empty.
                 await client.query(
                     `INSERT INTO balance_transactions
                         (user_id, amount, transaction_type, source_id, description, is_demo)
-                     VALUES ($1, $2, 'adjustment', $3, 'Test offer reward', FALSE)`,
+                     VALUES ($1, $2, 'conversion', $3, 'Test offer reward', FALSE)`,
                     [req.user.id, payout, `demo:${clickId}`]
                 );
                 await client.query('COMMIT');
@@ -208,16 +245,30 @@ const demoController = {
                 'UPDATE users SET demo_balance = demo_balance + $1 WHERE id = $2 RETURNING demo_balance',
                 [payout, req.user.id]
             );
+            if (updatedUser.rowCount !== 1) {
+                throw new Error('Could not credit the completing user.');
+            }
             // This row lands in the same table as the cash ledger even though it moves
             // `demo_balance` and never touches `balance`, so it is flagged rather than
             // identified by its description: the flag is what makes "balance equals the
             // sum of my cash ledger" a query, and the description is free text an operator
             // can edit.
+            //
+            // `transaction_type` is `conversion`, not `adjustment`, and that is the whole
+            // reason a completed demo offer shows up where the user expects it. `conversion`
+            // is what `postbackController` writes for a real offer reward, and it is what the
+            // history page's Rewards filter selects on. `adjustment` is an operator fixing a
+            // balance by hand, so a demo reward filed as one landed under no tab at all: the
+            // All list showed it under an icon and a title for a manual correction, and
+            // Rewards -- the tab whose empty state literally reads "Complete an offer and the
+            // reward posts straight to your balance" -- stayed empty forever. The type names
+            // what happened to the balance, and a credited reward is a conversion whether or not
+            // the money is real; `is_demo` is already the flag that says which it is.
             await client.query(
                 `INSERT INTO balance_transactions
                     (user_id, amount, transaction_type, source_id, description, is_demo)
-                 VALUES ($1, $2, 'adjustment', $3, 'Non-cash demo reward', TRUE)`,
-                [req.user.id, payout, `demo:${clickId}`]
+                 VALUES ($1, $2, 'conversion', $3, $4, TRUE)`,
+                [req.user.id, payout, `demo:${clickId}`, `Non-cash demo reward - ${offer.title}`]
             );
 
             await client.query('COMMIT');

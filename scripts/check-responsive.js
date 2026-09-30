@@ -161,6 +161,91 @@ function matchesFeatureList(text, environment) {
 
 // ------------------------------------------------------------------ cascade
 
+/**
+ * The classes a selector is written in, used to decide whether another rule could be talking
+ * about the same element.
+ *
+ * The element being described is not in this file, so "does this selector match it" cannot be
+ * answered exactly. What can be answered is the weaker and sufficient question: does the other
+ * rule name one of the same classes? That is what makes a competing rule visible at all.
+ */
+function classesIn(selector) {
+    const withoutStrings = selector.replace(/"[^"]*"/g, '""');
+    return (withoutStrings.match(/\.[\w-]+/g) || []).map((c) => c.slice(1));
+}
+
+/** The element names in a selector -- `nav`, `footer`, `button`. */
+function typesIn(selector) {
+    const withoutStrings = selector.replace(/"[^"]*"/g, '""');
+    return (withoutStrings.match(/(^|[\s>+~])([a-z][\w-]*)/g) || [])
+        .map((m) => m.replace(/[\s>+~]/g, ''));
+}
+
+/**
+ * Rules that set `property` on what may be the same element, at a specificity equal to or
+ * higher than `target`, and say something different.
+ *
+ * This is the check that would have caught the footer's `display` being flex. `.site-footer-group
+ * { display: grid }` was correct, asserted, and passing -- because `resolve()` only ever looks at
+ * rules whose selector string *equals* the one asked about. `.site-footer nav { display: flex }`
+ * was never consulted: it is a different string, it outranks it on specificity (a class plus a
+ * type beats a class), and it wins in every browser on every page with that footer. The
+ * assertion could not see it, so the check reported the stylesheet was correct while the
+ * stylesheet was not.
+ *
+ * The class test is deliberately narrow. A competing rule has to describe the same element, so
+ * it has to name every class the target names -- not merely share one. Two rules that mention
+ * `.dialog-panel` but where one is scoped to a contact dialog and the other is not are not
+ * rivals; they are a base rule and a deliberate override of it, and that is how a stylesheet is
+ * supposed to be written. What disqualifies a candidate is claiming to be a rule about the same
+ * thing while naming a different subset of the target's classes.
+ *
+ * That leaves exactly the footer shape: `.site-footer nav` names no class the target names, so
+ * it is not caught here either. So the class relationship is checked in the other direction
+ * too: a rule that mentions a *type* selector the target's element also has -- `nav` -- while
+ * naming none of the target's classes, is the ancestor-or-sibling rule that can silently
+ * outrank it. That is the specific form the mistake took, and the comment on the footer rule
+ * records why it is easy to fall into.
+ */
+function competingRules(rules, selector, property, environment, target) {
+    const classes = classesIn(selector);
+    const types = typesIn(selector);
+    const found = [];
+    for (const rule of rules) {
+        if (rule.selector === selector) continue;
+        if (!rule.media.every((condition) => matchesCondition(condition, environment))) continue;
+        if (rule.specificity < target.specificity) continue;
+
+        const competitorClasses = classesIn(rule.selector);
+        const competitorTypes = typesIn(rule.selector);
+        const scoped = /[\s>+~]/.test(rule.selector.replace(/::?[a-z-]+(\([^)]*\))?/g, '').trim());
+
+        // A single compound selector naming exactly the target's classes is the same element
+        // written twice -- the only way two such rules can both apply is if one is stale.
+        if (!scoped && competitorClasses.length > 0
+            && classes.length === competitorClasses.length
+            && classes.every((c) => competitorClasses.includes(c))) {
+            found.push(rule);
+            continue;
+        }
+
+        // A rule that names no class at all but does name an element type the target's element
+        // also has. This is the footer shape: `.site-footer nav` reaches every nav inside the
+        // footer, so it reaches `.site-footer-group` too, and a class plus a type outranks a
+        // class. Nothing about the two selectors looks related unless you already know the
+        // element is both.
+        if (competitorClasses.length === 0 && competitorTypes.some((t) => types.includes(t))) {
+            found.push(rule);
+        }
+    }
+    return found.filter((rule) => {
+        const declaration = rule.declarations.find((d) => d.property === property);
+        return declaration && declaration.value !== target.value;
+    }).map((rule) => `${rule.selector} (specificity ${rule.specificity} vs ${target.specificity})`);
+}
+
+let competitionProblems = 0;
+
 /** Returns the winning declarations for `selector` in `environment`. */
 function resolve(rules, selector, environment) {
     const winners = new Map();
@@ -180,6 +265,7 @@ function resolve(rules, selector, environment) {
                     value: declaration.value,
                     important: declaration.important,
                     specificity: rule.specificity,
+                    selector: rule.selector,
                     order: rule.order,
                     media: rule.media
                 });
@@ -236,7 +322,107 @@ const expectations = [
         'laptop 1280': '28px'
     }],
     ['phone', '.dialog-panel::before', 'display', { 'phone 390 (modern)': 'block', 'laptop 1280': undefined }],
-    ['phone', '.topbar', 'flex-direction', { 'phone 390 (modern)': 'row', 'laptop 1280': undefined }],
+    // The header is a three-column grid, and these four are the invariants that make the phone
+    // layout work: the clock and wordmark share the left cell, the navigation owns a true
+    // centre, the account tools sit at the end of the right one, and the live indicator gets
+    // its own row so a long "Connection lost" cannot widen the centre column and push the
+    // navigation off centre. The previous version of this asserted `flex-direction: row` on
+    // `.topbar`, which the flex layout needed and the grid ignores -- it would have kept
+    // passing after the header stopped being a flex row at all, which is the kind of check
+    // that outlives the thing it was written for.
+    // The header is a three-column grid above 720px and `auto minmax(0, 1fr) auto` below it.
+    //
+    // `1fr auto 1fr` forces the two side cells to be EQUAL, so on a 390px screen a 114px nav
+    // pushed both sides down to 122px while the 150px wordmark inside the left one still
+    // wanted 150px -- and the wordmark overlapped the navigation by 26px at 320px and 5px at
+    // 414px. There was 114px of unused width in the row the whole time; it was locked into the
+    // wrong column.
+    //
+    // The phone side is content-sized with the clock in its own cell. `minmax(0, 1fr)` rather
+    // than `1fr` on the middle column so the clock can shrink rather than push the account
+    // controls past the right edge, which is the failure a bare `1fr` allows here.
+    //
+    // The nav leaves the header below 720px, not 480px. It had no cell of its own, so it fell
+    // to auto-placement in a row that now had one free cell fewer and landed in column 2 --
+    // the clock's column -- clearing it by 0px at 520px. Asserted separately below, since the
+    // one thing that genuinely changes across the breakpoint is where the nav is.
+    ['phone', '.topbar', 'grid-template-columns', { 'phone 390 (modern)': 'auto minmax(0, 1fr) auto', 'laptop 1280': '1fr auto 1fr' }],
+    ['phone', '.topbar', 'grid-template-rows', { 'phone 390 (modern)': 'auto auto', 'laptop 1280': 'auto auto' }],
+    ['phone', '.topbar > .account-tools', 'grid-column', { 'phone 390 (modern)': '3', 'laptop 1280': '3' }],
+    ['phone', '.topbar > .live-indicator', 'grid-row', { 'phone 390 (modern)': '2', 'laptop 1280': '2' }],
+
+    // The navigation sat 8px left of true centre on every width and every page that has both a
+    // nav and an account cluster. `justify-self: center` centres the *margin box*, and the nav
+    // carried a `margin-right: 16px` left over from when the header was a flex row and this was
+    // the last thing before the buttons. Half of it went back as a visible offset. It looked
+    // centred, which is what made it survive: nothing overflows, nothing clips, and only a
+    // measurement against the header's own midpoint shows it.
+    ['phone', '.header-nav', 'margin-right', { 'phone 390 (modern)': undefined, 'laptop 1280': undefined }],
+
+    // The clock and the wordmark are flex siblings in `.topbar-lead`, and that container had no
+    // `gap` at all: measured 0px between "09:12:55 Wed, Sep 30, 2026" and "rewardzone" at 721,
+    // 768, 820 and 900px. A `padding-left` on the clock had been standing in for the separation
+    // and only ever separated it from the edge of the cell, never from its own sibling.
+    //
+    // Below 720px the wrapper dissolves so the clock can be given its own cell, which means the
+    // gap stops being load-bearing exactly where it used to be: the two are no longer siblings.
+    // The desktop value is asserted as `flex` rather than left undefined because that is what
+    // the base rule says, and asserting nothing there would let the rule change unnoticed.
+    ['phone', '.topbar-lead', 'gap', { 'laptop 1280': '16px' }],
+    ['phone', '.topbar-lead', 'display', { 'phone 390 (modern)': 'contents', 'laptop 1280': 'flex' }],
+    ['phone', '.topbar > .brand', 'grid-column', { 'phone 390 (modern)': '1', 'laptop 1280': undefined }],
+
+    // The clock stacks on a phone, which is what buys it the width to exist there at all:
+    // one line was 162px and the wordmark plus the account menu left less than that at 320px,
+    // stacked is 86px. `justify-self: end` is what puts it at the right-hand end of the header
+    // rather than merely in the middle column.
+    ['phone', '.topbar-clock', 'flex-direction', { 'phone 390 (modern)': 'column', 'laptop 1280': undefined }],
+    ['phone', '.topbar-clock', 'justify-self', { 'phone 390 (modern)': 'end', 'laptop 1280': undefined }],
+
+    // The date is the clock's first thing to give up on a narrow *desktop*, and the last on a
+    // phone, where it has a cell to itself. 1080px is the cutoff, so it is present at 1280 and
+    // gone by 768 -- but restored below 720px, because the navigation that needed the room is
+    // gone there too.
+    ['phone', '.topbar-clock-date', 'display', { 'laptop 1280': undefined, 'tablet 768': 'none', 'phone 390 (modern)': 'block' }],
+
+    // The nav is gone across the whole phone band, not just the narrow end of it. This is the
+    // assertion that catches the auto-placement bug: with the clock in column 2 and the nav
+    // present, the nav lands in that same cell, clearing the clock by 0px at 520px.
+    ['phone', '.topbar > nav', 'display', { 'phone 390 (modern)': 'none', 'tablet 768': undefined, 'laptop 1280': undefined }],
+
+    // A hidden live indicator must take no room. `.live-indicator { display: inline-flex }` beat
+    // the `hidden` attribute's UA rule, so a dead 17px band sat under the header on every page
+    // in every session state.
+    ['phone', '.live-indicator[hidden]', 'display', { 'phone 390 (modern)': 'none', 'laptop 1280': 'none' }],
+
+    // The footer's link groups were laid out as a left-aligned wrapped flex row while the brand
+    // and the copyright above them were centred. `.site-footer nav { display: flex }` beat
+    // `.site-footer-group { display: grid }` on specificity -- a class plus a type beats a class
+    // -- so `justify-items: center` was silently inert. Both halves are pinned: the group has
+    // to be a grid, and it has to be centring itself.
+    //
+    // Asserted on `.site-footer .site-footer-group`, which is the selector that now has to win.
+    // Asserting the bare class would keep passing while the stylesheet was wrong, because
+    // `resolve()` reads only rules whose selector string matches exactly -- and the reason this
+    // shipped broken is precisely that the winning rule was a different string. The cross-
+    // examination below is what sees the `.site-footer nav` competitor; this is what proves the
+    // fix landed.
+    ['phone', '.site-footer .site-footer-group', 'display', { 'phone 390 (modern)': 'grid', 'laptop 1280': 'grid' }],
+    ['phone', '.site-footer .site-footer-group', 'justify-items', { 'phone 390 (modern)': 'center', 'laptop 1280': 'center' }],
+
+    // Three separate ways the account page pushed its content sideways on a 320px screen.
+    //
+    // A grid column with no explicit template is an implicit `auto` column, which sizes to its
+    // content's max-content width. Every settings card then became as wide as the longest
+    // unbreakable string inside it and the page scrolled 46px sideways.
+    ['phone', '.account-settings-grid', 'grid-template-columns', { 'phone 390 (modern)': 'minmax(0, 1fr)', 'laptop 1280': 'minmax(0, 1fr)' }],
+    // `.account-balance-block` is a column flex with `align-items: center`, so its items are
+    // sized to their own content. A `nowrap` greeting holding a long display name therefore
+    // built a box wider than the card, and the `overflow: hidden` had nothing to clip against.
+    ['phone', '.account-greeting', 'max-width', { 'phone 390 (modern)': '100%', 'laptop 1280': '100%' }],
+    // "Copy account reference" measured 171px and the card is 272px at 320, so the pair needed
+    // 352px and could not share a line at any width the phone actually has.
+    ['phone', '.profile-actions', 'flex-wrap', { 'phone 390 (modern)': 'wrap', 'laptop 1280': 'wrap' }],
     ['phone', '.catalog-toolbar', 'position', { 'laptop 1280': 'sticky', 'phone 390 (modern)': 'static' }],
     ['phone', '.balance-block', 'text-align', { 'phone 390 (modern)': 'right', 'laptop 1280': undefined }],
     ['phone', '.home-stats', 'grid-template-columns', { 'phone 390 (modern)': 'minmax(0, 1fr)', 'tablet 768': 'repeat(2, minmax(0, 1fr))' }],
@@ -293,8 +479,28 @@ for (const [label, selector, property, expectationsForViewports] of expectations
             `@${viewportName.padEnd(36)} = ${JSON.stringify(actualValue)}` +
             (matches ? '' : ` (expected ${JSON.stringify(expected)}) [${mediaLabel}]`)
         );
+
+        // Only cross-examine where there is a declaration to cross-examine. `undefined` means
+        // nothing applies, and a competing rule setting the same property would have been the
+        // reason the expected value is absent -- which the assertion above already reports.
+        if (actual && actualValue === expected) {
+            const competitors = competingRules(rules, selector, property, environment, actual);
+            if (competitors.length) {
+                competitionProblems += 1;
+                console.log(
+                    `FAIL  ${label.padEnd(6)} ${selector.padEnd(18)} ${property.padEnd(22)} ` +
+                    `@${viewportName.padEnd(36)} shadowed by ${competitors.join('; ')}`
+                );
+            }
+        }
     }
 }
 
-console.log(problems === 0 ? '\nCASCADE CHECKS PASSED' : `\n${problems} CASCADE PROBLEM(S)`);
-process.exit(problems === 0 ? 0 : 1);
+if (competitionProblems === 0) {
+    console.log('\nNo asserted value is outranked by a rule naming the same class.');
+}
+
+console.log(problems === 0 && competitionProblems === 0
+    ? '\nCASCADE CHECKS PASSED'
+    : `\n${problems + competitionProblems} CASCADE PROBLEM(S)`);
+process.exit(problems === 0 && competitionProblems === 0 ? 0 : 1);

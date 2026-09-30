@@ -1,6 +1,28 @@
 /* Home page: a short catalog preview plus the summary figures in the stat strip. */
 
 /**
+ * Minimal toast implementation for the home page, which does not load app.js.
+ * Reuses the same `.toast-region` element so the styling is identical. */
+function showHomeToast(title, message, tone = 'info') {
+    const region = document.getElementById('toast-region');
+    if (!region) return;
+    const toast = document.createElement('div');
+    toast.className = `toast is-${tone}`;
+    toast.setAttribute('role', 'status');
+    toast.setAttribute('aria-live', 'polite');
+    toast.innerHTML = `
+        <div class="toast-body">
+            <div class="toast-title">${title}</div>
+            <div class="toast-message">${message}</div>
+        </div>
+        <button class="toast-close" type="button" aria-label="Dismiss notification">&times;</button>
+    `;
+    toast.querySelector('.toast-close').addEventListener('click', () => toast.remove());
+    region.appendChild(toast);
+    setTimeout(() => toast.remove(), 4500);
+}
+
+/**
  * How many offers the preview shows. The full catalog is one click away, and a
  * preview that shows everything is just a slower-loading version of that page.
  */
@@ -121,6 +143,7 @@ async function loadHomeOffers() {
             clearSkeletons(grid);
             if (count) count.textContent = 'Loading timed out';
             showError('The offer list took too long to load.');
+            showHomeToast('Catalog unavailable', 'The offer list took too long to load.', 'warning');
             setStat('stat-offers', '--');
             setStat('stat-best', '--');
             setStat('stat-surveys', '--');
@@ -134,6 +157,7 @@ async function loadHomeOffers() {
         clearSkeletons(grid);
         if (count) count.textContent = 'Offer catalog unavailable';
         showError(LOAD_ERROR_MESSAGE);
+        showHomeToast('Catalog unavailable', LOAD_ERROR_MESSAGE, 'error');
         setStat('stat-offers', '--');
         setStat('stat-best', '--');
         setStat('stat-surveys', '--');

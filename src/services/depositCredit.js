@@ -64,10 +64,12 @@ function isPaymentFullyPaid(payload) {
         return false;
     }
 
-    // Only enough slack to absorb binary floating point representation error, which is the
-    // one case where a provider that paid the exact quoted amount can still report a hair
-    // under. Anything beyond that is a real shortfall and must not be credited.
-    const tolerance = Math.max(1e-12, payAmount * 1e-9);
+    // The slack is purely relative, with no absolute floor. Binary floating point error is
+    // itself relative, so a relative tolerance is exactly as generous for a large amount as
+    // for a small one; an absolute epsilon on top of it is not slack at all on a quoted amount
+    // smaller than the epsilon, where it turns "nothing arrived" into a pass. The tolerance is
+    // therefore the product alone, and anything beyond it is a real shortfall.
+    const tolerance = payAmount * 1e-9;
     return actuallyPaid + tolerance >= payAmount;
 }
 

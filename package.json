@@ -9,9 +9,13 @@
     "migrate": "node scripts/migrate.js",
     "reconcile": "node scripts/reconcile-deposits.js",
     "audit:balance": "node scripts/audit-balance.js",
+    "audit:sql": "node scripts/audit-sql.js",
     "withdrawals": "node scripts/withdrawals.js",
     "smoke": "node scripts/smoke-routes.js",
     "smoke:survey": "node scripts/smoke-survey-flow.js",
+    "smoke:ui": "node scripts/smoke-ui.js",
+    "smoke:passkeys": "node scripts/smoke-passkeys.js",
+    "audit:pages": "node scripts/audit-pages.js",
     "vercel-build": "node scripts/vercel-build.js",
     "seed:demo": "node scripts/seed-demo-offers.js",
     "check:frontend": "node scripts/check-frontend.js",
@@ -19,9 +23,10 @@
     "check:contrast": "node scripts/check-contrast.js",
     "check:a11y": "node scripts/check-a11y.js",
     "icons": "node scripts/generate-icons.js && node scripts/inject-icons.js",
-    "check": "npm run check:frontend && npm run check:responsive && npm run check:contrast && npm run check:a11y"
+    "check": "node scripts/run-checks.js"
   },
   "dependencies": {
+    "@simplewebauthn/server": "^14.0.3",
     "@vercel/analytics": "^2.0.1",
     "axios": "^1.6.0",
     "cors": "^2.8.5",

@@ -20,15 +20,38 @@ on Vercel and reached at a real public URL instead of localhost.
 5. Register the provider callbacks at the public origin:
    - Stripe webhook: `https://<your-domain>/api/payments/stripe/webhook` for
      `checkout.session.completed` and `checkout.session.async_payment_succeeded`.
+     The `whsec_...` value Stripe shows when you create the endpoint is what belongs in
+     `STRIPE_WEBHOOK_SECRET`. It is *not* the API key: the key creates the Checkout session
+     and the signing secret verifies the callback that credits it, and the app needs both.
    - NOWPayments IPN: the app sends `https://<your-domain>/api/payments/nowpayments/ipn`
      as `ipn_callback_url`.
+
+   Card deposits stay hidden until both Stripe variables hold real values. The example
+   environment ships readable stand-ins (`whsec_your_stripe_webhook_secret_here`), and a
+   stand-in is a non-empty string, so a plain "is it set?" check passes on it: the app
+   offers cards, takes the payment, and then cannot verify the webhook that would credit
+   the balance. Values that are obviously templates are therefore treated as missing, at
+   startup, in the deposit options, in the webhook, and in reconciliation. See
+   `src/services/credentials.js`.
 6. Add a `CRON_SECRET` variable. `vercel.json` schedules a job that re-checks pending
    deposits against the provider and credits any the provider reports as finished, so one
    lost webhook cannot strand funds. The schedule is daily, which every plan allows; a
    sub-daily schedule (`0 */6 * * *`) is rejected outright on Hobby and fails the deploy.
 
-`TRUST_PROXY` defaults to `true` on Vercel so per-IP rate limiting sees the real
-client address from `X-Forwarded-For`.
+`TRUST_PROXY` sets how many proxy hops Express trusts when it resolves `req.ip`, and it
+defaults to `1`. The count matters because every per-IP limiter in the app -- login,
+registration, password reset, verification resend, the magic link -- is keyed on `req.ip`.
+
+`true` would be the wrong default. It tells Express to trust the whole `X-Forwarded-For`
+chain, which makes `req.ip` the **leftmost** entry: the one the client wrote. Vercel's edge
+appends to that header rather than replacing it, so a spoofed header survives to the app and
+every rate limit in the app becomes free to bypass. `1` takes the **rightmost** entry, the one
+the edge appended, which is the address the edge actually saw. A Vercel deployment has exactly
+one proxy in front of the function, so `1` gives the real client address.
+
+Set `TRUST_PROXY` to the hop count your own chain actually has, or `false` to disable it
+entirely. Setting it too low is the opposite failure: every visitor collapses into the proxy's
+address and they share one rate-limit bucket.
 
 ### How requests are routed
 
@@ -39,9 +62,63 @@ tracking hop are served by the function, not by static files.
 | --- | --- |
 | `/api/**` | the function (`api/index.js` -> `src/app.js`) |
 | `/style.css`, `/*.js`, `/*.html` | Vercel's static files, served before any rewrite |
-| `/`, `/offers`, `/reset-password`, `/receipt/deposit/:id`, `/demo` | the function, which picks the right page |
+| `/` | the function, which serves the marketing home page |
+| `/offers` | the function, which serves the offer catalog |
+| `/account` | the function, which serves the account page |
+| `/login` | the function, which serves `login.html` — the sign-in page in its own right, not the account page behind a dialog |
+| `/reset-password`, `/receipt/deposit/:id`, `/demo`, `/terms`, `/privacy` | the function, which picks the right page |
+| `/index.html` | 301 to `/offers` — it is a real file in `public/`, so without this the catalog is served at two URLs |
+| `/history`, `/history.html` | 301 to `/account`, so an old bookmark or a static-file URL still lands somewhere real |
 | **`/offer/engage`** | the function — this is the redirect to the advertiser |
 | everything else | the function, which answers 404 |
+
+`/` and `/offers` are different pages on purpose: `/` is the marketing page, and `/offers` is
+the catalog that `app.js` drives. They were briefly the same file, which made the marketing
+copy and the catalog contend for one URL.
+
+Ten HTML pages are served this way (`home`, `index`, `account`, `login`, `history`, `demo`,
+`deposit-receipt`, `reset-password`, `terms`, `privacy`) and `check:frontend` and
+`check:a11y` both read every one of them. Coverage originally covered only four, which is
+how three classes with no CSS rule reached `index.html` while the check still reported a
+clean bill of health.
+
+### The sign-in gate
+
+`/offers`, `/account` and `/receipt/deposit/:id` require a session. A visitor without one is
+sent to `/login?next=<where they were>` and returned there after signing in. Two decisions
+behind that, both of which were the other way round at first:
+
+**`/login` is its own page, not the account page with a dialog on it.** It was, and the
+dashboard was visible around the edges of the dialog, legible in the gaps, and still there
+if the dialog was dismissed — Escape, the close button, a click on the backdrop. A visitor
+who must sign in could see the thing they were signing in to reach, and could stay on it
+with every control greyed out. `login.html` is the sign-in screen and nothing else: no
+header, no balance, no catalog, and no close control, because there is nothing behind it to
+close. The account page keeps its dialog for the case that is genuinely a choice rather than
+a dead end — clicking "Connect account" in the header of a page that *is* reachable signed
+out, where the account page is legitimately on screen.
+
+**The gate runs on the client, and that is a consequence of where the session lives.** It
+is a token in `sessionStorage`, so the server has nothing to check until the first API call;
+a server-side redirect would be a redirect-to-login on every page load, for signed-in users
+too. The API is still the authority — a 401 anywhere calls `handleUnauthorized`, which
+signs the visitor out and sends them to `/login` with the same return path. The client-side
+gate exists so the decision happens before the page paints rather than after.
+
+Marking a page private is one attribute: `data-requires-session="true"` on its `<body>`.
+`public/session-gate.js` is loaded before the page's own scripts on every page that could
+use it, so the decision is made before anything renders. `scripts/smoke-ui.js` asserts the
+whole behaviour in a real browser — the redirect, the return path, that Escape and a
+backdrop click change nothing, that the sign-in page contains no balance or catalog
+element, and that a visitor with a session is not sent to sign in.
+
+The `next` parameter is read from the query string, so it is only honoured when it is a
+path on this site: a leading `/`, and not `//` or `/\`, because those resolve against
+another origin after a sign-in.
+
+`history.html` is no longer routed: `/history` redirects to `/account`, which is where the
+same markup is served from. The file is still checked, because it is what `/history` used to
+serve and a stale copy of a page is how a fix lands on one file and not the other.
 
 The rewrite is `/((?!api/).*)` -> `/api/index.js`. It must **not** point at `index.html`.
 
@@ -73,9 +150,22 @@ with `contentSecurityPolicy: false`, and with `frameguard: false`:
   the only control that means what it says.
 - `script-src 'self'` is accurate: every page loads an external script and there are no
   inline scripts, inline event handlers, or `eval` anywhere in `public/`. `check:frontend`
-  fails the build if that stops being true.
-- `style-src 'self' 'unsafe-inline'` is required because the deposit QR and the staggered
-  card animation set CSS custom properties through CSSOM.
+  fails the build if that stops being true. The one inline `<script>` on the home page is
+  `type="application/ld+json"`, which is not a JavaScript MIME type and so is not an inline
+  script as far as the directive is concerned.
+- `style-src 'self' 'unsafe-inline'` is required for exactly one reason: the `<style>` block
+  inside the home page's `<noscript>`, which hides the offer list for a visitor without
+  JavaScript. With scripting disabled that content is parsed as ordinary DOM, so the `<style>`
+  element is subject to `style-src` like any other, and it is blocked without
+  `'unsafe-inline'`.
+
+  It is **not** required for the CSSOM writes the deposit QR and the staggered card animation
+  use to set custom properties. `element.style.setProperty` is not an inline style attribute
+  and is permitted under `style-src 'self'`. The previous version of this file claimed the
+  opposite, which is worth correcting precisely because the wrong reason is worse than no
+  reason: it invites someone to delete the `<noscript>` block, remove `'unsafe-inline'` to
+  tighten the policy, and break the no-JavaScript path -- while the CSSOM code would have
+  kept working either way, giving no signal that the change was load-bearing.
 
 
 ## Environment variables
@@ -85,14 +175,20 @@ with `contentSecurityPolicy: false`, and with `frameguard: false`:
 | `DATABASE_URL` | yes | PostgreSQL connection string (Neon, Supabase, RDS, ...). |
 | `DATABASE_CA_CERT` | recommended | Provider CA in PEM form (`\n` escapes allowed). Enables certificate verification. |
 | `DATABASE_SSL` | optional | `disable` turns TLS off. Defaults to TLS on with no verification unless a CA is set. |
+| `DATABASE_POOL_MAX` | optional | Connection pool ceiling. Clamped to a hard maximum, because `2000` would otherwise have every serverless instance exhaust the provider's own connection limit. |
+| `PGSSLMODE` | optional | Read as a fallback for `DATABASE_SSL`, using libpq's names. |
+| `STRICT_DATABASE_URL` | optional | `true` makes an unreachable database fatal at startup instead of a logged warning. Off by default: a process that cannot reach its database is not useful, but one that will not start is worse — it answers no request at all. |
 | `JWT_SECRET` | yes | Long random value that signs session tokens. |
 | `APP_BASE_URL` | yes | Public HTTPS origin. Used for provider callbacks and reset links. |
 | `POSTBACK_SECRET` | production | Shared secret for advertiser postbacks. |
 | `PROXYCHECK_KEY` | optional | VPN/proxy fraud checks on click tracking. |
 | `PROXYCHECK_REQUIRED` | optional | `true` refuses clicks while a proxy check cannot run. Default `false`: the click is tracked and the gap logged. |
+| `FRAUD_VELOCITY_THRESHOLD`, `FRAUD_VELOCITY_WINDOW_SECONDS` | optional | How many clicks one address may record in a window before it is treated as automated. |
+| `FIXIE_URL` | optional | Residential proxy used for provider calls. Empty means calls go out directly. |
+| `OFFERS_TEST_REAL` | optional | `true` lets a demo offer marked `pays_real_money` move a **real** balance instead of `demo_balance`. Off by default: a deployment that never sets it cannot move cash through the demo flow. |
 | `OFFERS_INCLUDE_DEMO` | optional | `true` enables the demo offers, the `/demo` page, and the demo reward flow. Unset means enabled outside production only. |
 | `CRON_SECRET` | recommended | Protects scheduled deposit reconciliation. |
-| `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET` | for cards | Enables Stripe Checkout deposits. |
+| `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET` | for cards | Enables Stripe Checkout deposits. Both are required; either one alone leaves no working card path. Template values count as unset. |
 | `NOWPAYMENTS_API_KEY`, `NOWPAYMENTS_IPN_SECRET` | for crypto | Enables crypto deposits. |
 | `NOWPAYMENTS_API_BASE_URL` | optional | Defaults to `https://api.nowpayments.io`. |
 | `NOWPAYMENTS_FIXED_RATE`, `NOWPAYMENTS_FEE_PAID_BY_USER` | optional | `POST /v1/payment` options. Default `false`. |
@@ -100,11 +196,14 @@ with `contentSecurityPolicy: false`, and with `frameguard: false`:
 | `NOWPAYMENTS_2FA_SECRET` | for crypto payouts | Base32 TOTP secret. Without it a batch is created but never verified, so the payout is never sent. |
 | `NOWPAYMENTS_AUTO_PAYOUTS` | optional | `true` sends eligible **crypto** withdrawals automatically. Unset means off. See [Automatic crypto payouts](#automatic-crypto-payouts). |
 | `BREVO_API_KEY`, `EMAIL_FROM` | for signup and reset email | Default provider. Brevo needs no domain of your own. `EMAIL_FROM` must be a sender registered in Brevo. |
+| `CONTACT_EMAIL` | optional | Where the contact form delivers. Falls back to `EMAIL_FROM`. |
+| `EMAIL_VERIFICATION_PEPPER` | recommended | Peppers stored email-verification code hashes. Falls back to `JWT_SECRET`. Set it explicitly so rotating `JWT_SECRET` does not invalidate every outstanding code. |
+| `WITHDRAWAL_VERIFICATION_PEPPER` | recommended | As above for withdrawal codes. Deliberately a *different* pepper, so a hash lifted from one table cannot be replayed against the other. Falls back to `JWT_SECRET`. |
 | `RESEND_API_KEY` | optional | Only if `EMAIL_PROVIDER=resend`, and only once you have verified a custom domain — Resend will not send to anyone but the account owner until then. |
 | `EMAIL_PROVIDER` | optional | `brevo` (default) or `resend`. Inferred from whichever key is set if unset. |
 | `EMAIL_FROM_NAME` | optional | Display name on outgoing mail. Defaults to `RewardZone`. |
 | `CORS_ORIGIN` | optional | Comma-separated extra browser origins. |
-| `TRUST_PROXY` | optional | Defaults to `true` on Vercel; set `false` to disable. |
+| `TRUST_PROXY` | optional | Proxy hop count used to resolve `req.ip`. Defaults to `1`; set `false` to disable. See "Trust proxy" above — `true` is not safe here. |
 | `TRACKING_CLICK_PARAM` | optional | Click ID parameter sent to advertisers (default `aff_sub`). |
 | `TEST_DATABASE_URL` | optional | Only used by the live integration test suite. |
 
@@ -420,6 +519,95 @@ The same `405` handling covers the user-facing withdrawal API, so
 `POST /api/user/withdrawals` is also accepted as an alias for the create action, which was
 otherwise spelled `/withdraw` while its list was `/withdrawals`.
 
+## Email
+
+Every money-moving event sends a message, and the six of them are:
+
+| Message | Sent when | Service |
+| --- | --- | --- |
+| Deposit instructions | the address and amount are issued | `depositEmails` |
+| Deposit received | the balance is credited | `depositEmails` |
+| Deposit did not complete | the payment fails or expires | `depositEmails` |
+| Withdrawal on its way | a payout batch is released | `payoutEmails` |
+| Withdrawal sent | the payout confirms on-chain | `payoutEmails` |
+| Withdrawal returned | the provider refuses, and the money is refunded | `payoutEmails` |
+
+Plus the three that are **not** switchable: email confirmation, password reset, and the
+six-digit code that authorises a withdrawal. Each one is a step the user has to complete, so
+suppressing it does not quiet the app — it locks the account out of itself. Nothing in the
+code path that sends those three reads the preference.
+
+### The money-email switch
+
+`GET` and `PATCH /api/user/email-preferences` carry one boolean, `moneyEmailsEnabled`,
+stored in `users.money_emails_enabled` (migration `022`). The response also names which
+messages are gated and which are not, so the account page describes the real policy rather
+than a copy of it that can drift.
+
+Three things about the send path are deliberate:
+
+- **Reads fail open.** If the preference cannot be read, the message is sent. The send path
+  runs on webhooks and cron nobody is watching, so a suppressed message leaves no trace,
+  while an unwanted one is visible and fixable.
+- **A missing value means "on".** A column that was not selected, a row that predates the
+  migration, and `NULL` all read as enabled. "We do not know" must never mean "do not send".
+- **The body must state a boolean.** `PATCH` refuses `"false"`, `0`, `null`, and `{}` rather
+  than treating any of them as an opt-out. A preference the user did not clearly express is
+  not a preference, and the failure is invisible because the response would report the
+  stored value as though the request had been understood.
+
+`isMoneyEmailEnabled` is the only place that reads the column, and it normalises the shapes a
+different driver or a hand-edited column can produce (`'f'`, `'false'`, `'0'`) — a naive
+`if (value)` reads the string `"false"` as `true` and silently ignores the opt-out.
+
+### Display name and profile picture
+
+`GET` and `PATCH /api/user/profile` carry `displayName` and `avatarData`, stored in
+`users.display_name` and `users.avatar_data` (migration `023`). The account page edits both
+in the Profile settings card, and the picture replaces the brand mark in the header and the
+name in the header-adjacent area of the balance card.
+
+Both fields are **presentation only**. Nothing reads them to decide what a user may do, so a
+rename cannot touch a ledger row, a deposit, or a session — which is why `display_name` does
+not need to be unique and why neither is resolved against another account. That is what makes
+it safe to let a user type freely into one.
+
+`PATCH` is partial: a body naming only `displayName` writes only that column. A fixed
+two-column `UPDATE` would blank the picture on every name change, and the client cannot avoid
+that — it does not know the current value of the field it is not sending, and reading it
+first is a race between two open tabs. A field present and `null` (or empty) clears it.
+
+Validation lives in `src/services/profile.js` and runs **on the server**. The browser applies
+the same rules, but the browser is the untrusted side of the connection and the stored value
+is what gets rendered next to a balance:
+
+- **Display name** — trimmed, whitespace runs collapsed to single spaces (so a pasted
+  non-breaking space does not render identically to another user's plain space), max 60
+  characters measured *after* normalisation, and control characters refused rather than
+  stripped. Stripping would store something different from what was typed, and the user
+  would be shown a name they did not enter. Tab, newline, and carriage return are folded to
+  spaces first, because a name pasted with a line break in it is a paste artefact, not an
+  attempt to smuggle a control character. Lone surrogates are refused because `Buffer.from`
+  would silently store U+FFFD in place of the character the user typed.
+- **Profile picture** — a `data:image/<type>;base64,` URL, restricted to PNG, JPEG, GIF, and
+  WebP. `svg+xml` is excluded because SVG is a document format that can carry script. The
+  declared media type is a claim by the sender and nothing checks it, so the decoded bytes are
+  verified against the declared signature (structurally for WebP, which is a RIFF container
+  and shares its first four bytes with WAV). The size is checked **twice** — encoded length
+  first, before any decode, so a multi-megabyte upload is refused without being turned into
+  bytes; then decoded length, capped at 16 KB.
+
+`avatar_data` holds the image bytes as a data URL rather than a path, because this service
+deploys to Vercel where the filesystem is ephemeral and per-invocation (a file written during
+a request is gone by the next one), and no object storage is configured. The trade-off is a
+`users` row that grows, which the 16 KB cap and the 32 KB JSON body limit bound. A product
+needing full-resolution uploads should move the image to object storage and keep only a URL
+here; the column shape does not need to change.
+
+The client centre-crops the picked file to 128×128 and re-encodes it before sending, which is
+what keeps a typical upload inside both the 16 KB avatar cap and the 32 KB request limit
+without asking the user to resize anything themselves.
+
 ## Reconciling the books
 
 `npm run audit:balance` compares every balance against the cash ledger and reports eight
@@ -511,9 +699,12 @@ silently overrode earlier mobile ones.
 
 Two constraints the front end is built around:
 
-- **The Content-Security-Policy is `style-src 'self'`.** Inline `style` attributes are
-  blocked, so per-element custom properties are set through CSSOM
-  (`element.style.setProperty`), which CSP permits. The build reads no inline styles.
+- **No inline `style` attributes.** `style-src` is `'self' 'unsafe-inline'` (see
+  "The Content-Security-Policy" above for why), so a `style` attribute in markup would not be
+  *blocked* -- but none is wanted anyway. Per-element custom properties are set through CSSOM
+  (`element.style.setProperty`), and `check:frontend` fails the build if an inline style
+  attribute appears, so the day `'unsafe-inline'` is dropped for the `<noscript>` block nothing
+  has to change to keep working.
 - **`[hidden]` is forced with `!important`.** Any component that set `display` in a class
   rule was ignoring the `hidden` attribute, because an author rule beats the user-agent
   `[hidden] { display: none }`. That is why the password label stayed visible during a
@@ -602,15 +793,107 @@ give it a free one (`PORT=3311 npm run smoke`).
 demo mode off, then on, then off again mid-flow to prove the last case returns the user to
 the catalog instead of dead-ending. That middle case is the bug that was reported.
 
+`npm run smoke:ui` drives the real pages in a real Chrome or Edge and asserts the controls
+are not inert. It needs the server running (`npm start`) and no account, no seeded offers and
+no money: it runs signed out, which is the only state that needs nothing set up.
+
+It exists because no static check can catch a button that is reachable, correctly styled, and
+has nothing behind it. The account page shipped that way — two permanently greyed-out
+buttons, a balance frozen at `--`, and a Connect button that went nowhere — and every other
+check passed. Only clicking proves otherwise. It asserts that each page loads with no
+uncaught error and no broken script, that the console is clean for our own origin, and then
+the two things only a browser can see:
+
+- **The sign-in gate.** That `/offers`, `/account` and `/receipt/deposit/1` each send a
+  signed-out visitor to `/login` carrying the page they came from; that the sign-in page is a
+  document rather than a dialog, with no close control, no header and no balance or catalog
+  element behind it; that Escape and a click on the backdrop change nothing; that Back does
+  not walk onto a private page; and that a visitor with a session is not sent to sign in.
+  These are the assertions that would have caught `/login` being the account page with a
+  modal on top — a check that passed for the wrong reason until the page was made real.
+- **The signed-in dashboard.** That the Deposit and Withdraw controls exist and are enabled
+  with a session, that the session button says what its next click will do, and that the
+  animated brand mark appears as the account avatar. The API is answered locally for this
+  rather than against the server: the only token available is a fake one, the real API answers
+  401, and a 401 is a sign-out — so without the stub the dashboard redirects away before it can
+  be observed.
+
+Errors logged by a third-party embed are attributed by origin and reported as notes, not
+failures. The donation widget currently logs one — `account-api.nowpayments.io` answers 404
+for its settings call — which is that provider's problem and is already covered by the
+visible fallback text on the page.
+
 ## Static checks
 
 `npm run check` needs no database and no browser, and covers the two classes of front
-end bug that only show up after a change has already landed:
+end bug that only show up after a change has already landed. It runs all four checks and
+reports every failure, rather than stopping at the first one — the chain used to be `&&`, so a
+`check:frontend` failure meant the contrast check never ran and a contrast regression stayed
+hidden until the front end was clean. The exit code is still non-zero if anything failed, so
+it remains a usable CI gate.
 
-- `check:frontend` — every element id the scripts reach for exists in the page that
-  loads them, no duplicate ids, every `<label for>` and `aria-labelledby` target
-  resolves, every class used in markup or built in script has a CSS rule, and no
-  inline `style` attribute slipped in (the CSP would block it in production).
+- `check:frontend` — every element id the scripts reach for exists in the page that loads
+  them, no duplicate ids, every `<label for>` and `aria-labelledby` target resolves, every
+  class used in markup or built in script has a CSS rule, no inline `style` attribute slipped
+  in (the CSP would block it in production), and every `data-contact-trigger` is backed by a
+  `#contact-dialog` on the same page.
+
+  The contact-trigger rule is there because of a real dead link. The handler calls
+  `preventDefault()` before it looks for the dialog, so a page carrying the trigger without
+  the dialog has a link that navigates nowhere and opens nothing — `privacy.html` shipped
+  with `contact.js` loaded, the footer link present, and no dialog to drive it.
+
+  All nine pages are checked. A script that more than one page loads is not asserted against
+  any single page — `app.js` runs on the catalog and both account pages and reaches the
+  catalog through optional lookups precisely because those pages have no catalog — so instead
+  every id it asks for must exist on at least one of its host pages. That still catches a
+  renamed or typo'd id that exists nowhere, which is what the check is for.
+
+- Every button in the markup is reachable from a script, and every `data-contact-trigger` is
+  backed by a `#contact-dialog` on the same page.
+
+  The button rule is the one that would have caught the dead account page. It reports a
+  control that is `disabled` in the markup and that no script enables or listens to, and a
+  `type="button"` control that no script listens to. Both fail silently: no console error, no
+  failed request, nothing for any other check to notice. `account.html` shipped its primary
+  Deposit and Withdraw buttons exactly that way — the script wired only `deposit-button` and
+  `withdraw-button`, which are the header and action-bar controls on the catalog — so the
+  whole account page was inert while every check reported clean.
+
+  Controls wired through a data attribute are recognised as wired. The bottom action bar is
+  wired by `data-mirror` and one delegated listener that forwards the click, so judging those
+  by id alone would fire on the site's main mobile navigation and teach everyone to ignore
+  this check. An id the script treats as optional is listed as a NOTE rather than a failure,
+  so a guarded `if (element)` lookup is not "fixed" by deleting the guard.
+
+## Auditing the SQL
+
+`npm run audit:sql` needs a live database, which is why it is not in `npm run check`. It reads
+every SQL string out of `src`, `scripts` and `test`, resolves the table aliases each statement
+declares, and reports any column name that matches no column of the table it is used with.
+
+It exists because a stubbed pool cannot tell you a column is imaginary. `UPDATE users SET
+money_emails_enabled = $1, updated_at = NOW()` shipped that way: `users` has no `updated_at`
+— `created_at` is its only timestamp, and `deposits` and `withdrawals` do have one, which is
+where the assumption came from. Every test passed, because none of them parsed the statement,
+and the only place it ran was a real request against a real database. The preference saved
+nothing and reported no error.
+
+Statements that interpolate a JS value are counted and reported rather than guessed at, since
+a column list is not knowable from the string; the two that use one in this codebase are
+covered by `test/autoPayouts.test.js` and the migration that introduced the column. The
+registry test (`test/methodRegistry.test.js`) is the other half of the same idea on the HTTP
+side: it asserts that every API path the app serves is registered with its verbs, so a wrong
+verb is a 405 naming the right one instead of a 401 or a 404 that reads as "this does not
+exist".
+
+`audit:sql` catches a column that was never created. It cannot catch a column that exists but
+was never added to the database this deployment is pointed at, so `server.js` also compares
+`schema_migrations` against the migration files this build ships and warns at startup when
+the database is behind, naming the files and the `npm run migrate` that fixes them. It warns
+rather than refuses to boot, because a pending migration only breaks the routes that use the
+new columns — refusing to start would take down the ones that work.
+
 - `check:responsive` — parses `public/style.css` and asserts the declaration each
   viewport range actually resolves to, which is how a mobile rule being silently
   overridden by a later desktop rule gets caught without a browser.

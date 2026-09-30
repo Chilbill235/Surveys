@@ -1,3 +1,4 @@
+const { notificationRows } = require('./helpers/notificationRows');
 const assert = require('node:assert/strict');
 const { createHmac, randomUUID } = require('node:crypto');
 const { after, before, test } = require('node:test');
@@ -189,6 +190,12 @@ test('payment provider options and deposit creation fail honestly when providers
             insertStatements += 1;
             return { rows: [{ id: 1 }] };
         }
+        // Answers the reads the money-email notifications add to a query; see
+        // test/helpers/notificationRows.js. Without this the notification throws inside
+        // its own try/catch, the receipt is silently never sent, and this test still
+        // passes -- which is the failure mode the strict stub exists to prevent.
+        const notification = notificationRows(query);
+        if (notification) return notification;
         throw new Error(`Unexpected test query: ${query}`);
     };
 
@@ -203,16 +210,30 @@ test('payment provider options and deposit creation fail honestly when providers
         assert.deepEqual(options.cryptoCurrencies, []);
         assert.equal(options.minimumUsd, 1);
 
+        // A sub-cent amount is still refused, and it is the only lower bound a crypto deposit
+        // has. There is deliberately no $1.00 floor any more: enforcing a quoted provider minimum
+        // in the app is what made small crypto deposits impossible to create, and the provider is
+        // the party that actually decides. The limits are grouped and carry cents so they read
+        // the same way as the amounts the form shows -- "$5000" next to a form that says
+        // "$5,000.00" leaves the user deciding which of the two is the real ceiling.
         const belowMinimum = await fetch(`${origin}/api/user/deposits`, {
+            method: 'POST',
+            headers: { ...headers, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ amount: 0.005, method: 'crypto', currency: 'btc' })
+        });
+        assert.equal(belowMinimum.status, 400);
+        assert.match((await belowMinimum.json()).error, /between \$0\.01 and \$5,000\.00\./);
+
+        // A $0.99 crypto deposit now passes amount parsing and fails later, on the real reason:
+        // the provider is not configured. Before, it was turned away at the door with a
+        // minimum error, so a user could not tell whether the amount was wrong or the site was.
+        const smallButValid = await fetch(`${origin}/api/user/deposits`, {
             method: 'POST',
             headers: { ...headers, 'Content-Type': 'application/json' },
             body: JSON.stringify({ amount: 0.99, method: 'crypto', currency: 'btc' })
         });
-        assert.equal(belowMinimum.status, 400);
-        // The limits are grouped and carry cents so they read the same way as the amounts
-        // the form shows. "$5000" next to a form that says "$5,000.00" leaves the user
-        // deciding which of the two is the real ceiling.
-        assert.match((await belowMinimum.json()).error, /between \$1\.00 and \$5,000\.00\./);
+        assert.equal(smallButValid.status, 503);
+        assert.match((await smallButValid.json()).error, /NOWPayments/);
 
         const depositResponse = await fetch(`${origin}/api/user/deposits`, {
             method: 'POST',
@@ -267,6 +288,119 @@ test('provider webhooks reject unsigned or unconfigured callbacks', async () => 
         else process.env.STRIPE_WEBHOOK_SECRET = priorStripeWebhook;
         if (priorNowIpn === undefined) delete process.env.NOWPAYMENTS_IPN_SECRET;
         else process.env.NOWPAYMENTS_IPN_SECRET = priorNowIpn;
+    }
+});
+
+test('a completed password reset returns a session, so the visitor lands on their account', async () => {
+    const priorEnvironment = process.env.NODE_ENV;
+    const priorSecret = process.env.JWT_SECRET;
+    const originalConnect = pool.connect;
+    const userId = 5150;
+    const token = 'a'.repeat(64);
+    process.env.NODE_ENV = 'test';
+    process.env.JWT_SECRET = 'password-reset-session-test-secret';
+
+    // The reset runs in one transaction: look the token up, bump the password and the token
+    // version, delete the token, and hand back the row the new session has to be signed from.
+    // The version matters -- a session signed at the pre-reset version is one of the sessions
+    // the reset just revoked, and would be refused on its first request.
+    const userRow = { id: userId, email: 'reset@example.test', balance: '12.50', demo_balance: '0', token_version: 4 };
+    pool.connect = async () => ({
+        query: async (query) => {
+            if (/FROM password_reset_tokens/i.test(query)) return { rows: [{ user_id: userId }] };
+            if (/UPDATE users/i.test(query)) {
+                assert.match(query, /RETURNING/i, 'the new row must come back out of the transaction');
+                return { rows: [userRow] };
+            }
+            return { rows: [] };
+        },
+        release: () => {}
+    });
+
+    // `pool.query` as well as `pool.connect`, and the reason is worth stating: `pg`
+    // implements `Pool#query` by checking a client out with `this.connect()`. Overriding
+    // only `connect` therefore does not isolate the test -- it breaks the one query that
+    // does reach the real database (the IP rate limiter in front of the route), and
+    // because that stub answers an unrecognised statement with empty rows, the limiter
+    // never resolves and the request hangs until the test times out. Both surfaces are
+    // stubbed so nothing here can reach the configured database.
+    const originalQuery = pool.query;
+    pool.query = async (query) => {
+        if (/auth_rate_limits/i.test(query)) {
+            return { rows: [{ attempt_count: 1, window_started_at: new Date().toISOString() }] };
+        }
+        throw new Error(`Unexpected test query: ${String(query).slice(0, 80)}`);
+    };
+
+    try {
+        const response = await fetch(`${origin}/api/auth/reset-password`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ token, password: 'a-long-enough-password' })
+        });
+        assert.equal(response.status, 200);
+        const payload = await response.json();
+
+        assert.ok(payload.token, 'the reset must return a session token');
+        assert.equal(payload.user.email, 'reset@example.test');
+        assert.equal(payload.user.balance, '12.50');
+        // The claim is what `requireAuth` compares against the stored version.
+        const claims = jwt.verify(payload.token, process.env.JWT_SECRET, { issuer: 'offer-network-api' });
+        assert.equal(claims.sub, String(userId));
+        assert.equal(claims.ver, 4, 'the session must be signed at the post-reset version');
+        assert.ok(payload.signedOutEverywhere);
+    } finally {
+        pool.connect = originalConnect;
+        pool.query = originalQuery;
+        if (priorEnvironment === undefined) delete process.env.NODE_ENV;
+        else process.env.NODE_ENV = priorEnvironment;
+        if (priorSecret === undefined) delete process.env.JWT_SECRET;
+        else process.env.JWT_SECRET = priorSecret;
+    }
+});
+
+test('a reset with a spent or unknown token still refuses, and issues no session', async () => {
+    const priorEnvironment = process.env.NODE_ENV;
+    const priorSecret = process.env.JWT_SECRET;
+    const originalConnect = pool.connect;
+    process.env.NODE_ENV = 'test';
+    process.env.JWT_SECRET = 'password-reset-session-test-secret';
+
+    pool.connect = async () => ({
+        query: async (query) => {
+            if (/^(BEGIN|COMMIT|ROLLBACK)$/i.test(query.trim())) return { rows: [] };
+            if (/FROM password_reset_tokens/i.test(query)) return { rows: [] };
+            // Any write here would mean a session was minted for a reset that did not
+            // happen, so the query names itself and fails the test loudly.
+            throw new Error(`Unexpected test query: ${String(query).slice(0, 80)}`);
+        },
+        release: () => {}
+    });
+    const originalQuery = pool.query;
+    pool.query = async (query) => {
+        if (/auth_rate_limits/i.test(query)) {
+            return { rows: [{ attempt_count: 1, window_started_at: new Date().toISOString() }] };
+        }
+        throw new Error(`Unexpected test query: ${String(query).slice(0, 80)}`);
+    };
+
+    try {
+        const response = await fetch(`${origin}/api/auth/reset-password`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ token: 'b'.repeat(64), password: 'a-long-enough-password' })
+        });
+        assert.equal(response.status, 400);
+        const payload = await response.json();
+        // No session for a reset that did not happen, or a bad link would be a way in.
+        assert.equal(payload.token, undefined);
+    } finally {
+        pool.connect = originalConnect;
+        pool.query = originalQuery;
+        if (priorEnvironment === undefined) delete process.env.NODE_ENV;
+        else process.env.NODE_ENV = priorEnvironment;
+        if (priorSecret === undefined) delete process.env.JWT_SECRET;
+        else process.env.JWT_SECRET = priorSecret;
     }
 });
 
@@ -646,7 +780,10 @@ test('Stripe webhook validates signatures from the untouched raw request body', 
     const priorStripeSecret = process.env.STRIPE_SECRET_KEY;
     const priorStripeWebhook = process.env.STRIPE_WEBHOOK_SECRET;
     const secret = 'whsec_test_signature_secret';
-    process.env.STRIPE_SECRET_KEY = 'sk_test_webhook_verification';
+    // A realistic key shape. The app refuses a `STRIPE_SECRET_KEY` that is not `sk_...` with
+    // an alphanumeric body, because a publishable key or a placeholder there fails as an
+    // opaque "Invalid API Key" on the first customer deposit.
+    process.env.STRIPE_SECRET_KEY = 'sk_test_4eC39HqLyjWDarjtT1zdp7dc';
     process.env.STRIPE_WEBHOOK_SECRET = secret;
     const payload = JSON.stringify({
         id: 'evt_test_ignored',
@@ -668,6 +805,90 @@ test('Stripe webhook validates signatures from the untouched raw request body', 
         else process.env.STRIPE_SECRET_KEY = priorStripeSecret;
         if (priorStripeWebhook === undefined) delete process.env.STRIPE_WEBHOOK_SECRET;
         else process.env.STRIPE_WEBHOOK_SECRET = priorStripeWebhook;
+    }
+});
+
+test('placeholder Stripe credentials are treated as absent everywhere a real one is required', async () => {
+    const priorEnvironment = process.env.NODE_ENV;
+    const priorSecret = process.env.JWT_SECRET;
+    const priorStripeSecret = process.env.STRIPE_SECRET_KEY;
+    const priorStripeWebhook = process.env.STRIPE_WEBHOOK_SECRET;
+    const priorNowApi = process.env.NOWPAYMENTS_API_KEY;
+    const priorNowIpn = process.env.NOWPAYMENTS_IPN_SECRET;
+    const originalQuery = pool.query;
+    const userId = 4343;
+    let insertStatements = 0;
+    process.env.NODE_ENV = 'test';
+    process.env.JWT_SECRET = 'stripe-placeholder-test-secret';
+    // The exact values the example environment file ships. A non-empty string is a perfectly
+    // good credential as far as a truthy check is concerned, which is why these used to be
+    // accepted: cards were offered, the payment was taken, and the webhook that should have
+    // credited it could never verify a signature.
+    process.env.STRIPE_SECRET_KEY = 'sk_your_stripe_secret_key_here';
+    process.env.STRIPE_WEBHOOK_SECRET = 'whsec_your_stripe_webhook_secret_here';
+    delete process.env.NOWPAYMENTS_API_KEY;
+    delete process.env.NOWPAYMENTS_IPN_SECRET;
+
+    pool.query = async (query) => {
+        if (query.includes('SELECT token_version')) {
+            return { rows: [{ token_version: 0, is_banned: false }] };
+        }
+        if (/INSERT INTO auth_rate_limits/i.test(query)) {
+            return { rows: [{ attempt_count: 1, window_started_at: new Date().toISOString() }] };
+        }
+        if (/INSERT INTO deposits/i.test(query)) {
+            insertStatements += 1;
+            return { rows: [{ id: 1, amount: '10.00' }] };
+        }
+        const notification = notificationRows(query);
+        if (notification) return notification;
+        throw new Error(`Unexpected test query: ${query}`);
+    };
+
+    try {
+        const headers = { Authorization: `Bearer ${signUserToken(userId)}` };
+
+        const options = await (await fetch(`${origin}/api/user/payment-options`, { headers })).json();
+        assert.equal(options.stripeAvailable, false, 'card deposits must not be offered on a placeholder key');
+
+        // The money question: no session, and no orphaned pending row for an operator to
+        // reconcile by hand. The refusal happens before the INSERT.
+        const depositResponse = await fetch(`${origin}/api/user/deposits`, {
+            method: 'POST',
+            headers: { ...headers, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ amount: 10, method: 'stripe' })
+        });
+        assert.equal(depositResponse.status, 503);
+        assert.match((await depositResponse.json()).error, /Card deposits are unavailable/);
+        assert.equal(insertStatements, 0);
+
+        // The webhook half, told apart in the response. A bare "not configured" sent an
+        // operator to the dashboard for a secret they had already pasted in; naming the
+        // variable and saying the value is still a template is the actionable answer.
+        const webhookResponse = await fetch(`${origin}/api/payments/stripe/webhook`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ type: 'checkout.session.completed' })
+        });
+        assert.equal(webhookResponse.status, 503);
+        const webhookBody = await webhookResponse.text();
+        assert.match(webhookBody, /STRIPE_SECRET_KEY/);
+        assert.match(webhookBody, /STRIPE_WEBHOOK_SECRET/);
+        assert.match(webhookBody, /placeholder/i);
+    } finally {
+        pool.query = originalQuery;
+        if (priorEnvironment === undefined) delete process.env.NODE_ENV;
+        else process.env.NODE_ENV = priorEnvironment;
+        if (priorSecret === undefined) delete process.env.JWT_SECRET;
+        else process.env.JWT_SECRET = priorSecret;
+        if (priorStripeSecret === undefined) delete process.env.STRIPE_SECRET_KEY;
+        else process.env.STRIPE_SECRET_KEY = priorStripeSecret;
+        if (priorStripeWebhook === undefined) delete process.env.STRIPE_WEBHOOK_SECRET;
+        else process.env.STRIPE_WEBHOOK_SECRET = priorStripeWebhook;
+        if (priorNowApi === undefined) delete process.env.NOWPAYMENTS_API_KEY;
+        else process.env.NOWPAYMENTS_API_KEY = priorNowApi;
+        if (priorNowIpn === undefined) delete process.env.NOWPAYMENTS_IPN_SECRET;
+        else process.env.NOWPAYMENTS_IPN_SECRET = priorNowIpn;
     }
 });
 
@@ -727,6 +948,12 @@ test('NOWPayments deposit addresses persist and signed confirmations credit once
         storedDeposit.status = 'pending';
         return { rows: [{ id: depositId, amount: storedDeposit.amount, status: 'pending' }] };
         }
+        // The cleanup write that runs when creation fails after the row exists. The controller
+        // catches and logs a failure here, so an unstubbed query leaves a pending row behind
+        // in a test that reports green.
+        if (/UPDATE deposits SET status = 'failed'/i.test(normalized)) {
+            return { rows: [], rowCount: 1 };
+        }
         if (/SELECT id, user_id, amount, currency_code, status, credited_at, provider_payment_id\s+FROM deposits/i.test(normalized)) {
             return { rows: [{
                 id: storedDeposit.id,
@@ -770,6 +997,12 @@ test('NOWPayments deposit addresses persist and signed confirmations credit once
             storedDeposit.status = String(values[0]);
             return { rows: [], rowCount: 1 };
         }
+        // Answers the reads the money-email notifications add to a query; see
+        // test/helpers/notificationRows.js. Without this the notification throws inside
+        // its own try/catch, the receipt is silently never sent, and this test still
+        // passes -- which is the failure mode the strict stub exists to prevent.
+        const notification = notificationRows(normalized);
+        if (notification) return notification;
         throw new Error(`Unexpected test query: ${normalized}`);
     }
 
@@ -994,6 +1227,18 @@ test('deposit amounts a user would type are accepted, sub-cent precision is not'
         if (/UPDATE deposits SET provider_payment_id = \$1, deposit_address = \$2/i.test(query)) {
             return { rows: [], rowCount: 1 };
         }
+        // The cleanup write that runs when deposit creation fails after the row exists. Same
+        // class of gap as the notification reads: it is caught and logged by the controller,
+        // so an unstubbed query leaves a pending deposit row behind in a test that passes.
+        if (/UPDATE deposits SET status = 'failed'/i.test(query)) {
+            return { rows: [], rowCount: 1 };
+        }
+        // Answers the reads the money-email notifications add to a query; see
+        // test/helpers/notificationRows.js. Without this the notification throws inside
+        // its own try/catch, the receipt is silently never sent, and this test still
+        // passes -- which is the failure mode the strict stub exists to prevent.
+        const notification = notificationRows(query);
+        if (notification) return notification;
         throw new Error(`Unexpected test query: ${query}`);
     };
 
@@ -1010,9 +1255,10 @@ test('deposit amounts a user would type are accepted, sub-cent precision is not'
             });
         }
         if (target.startsWith('https://api.nowpayments.io/v1/min-amount')) {
-            // Reported as the app's own $1 floor, so this test keeps exercising amount
-            // parsing rather than the provider's minimum.
-            return new Response(JSON.stringify({ min_amount: 1 }), {
+        // Reported as a floor this app does not enforce, so this test keeps exercising amount
+        // parsing rather than the provider's minimum. Nothing refuses a sub-$1 crypto deposit
+        // now -- the provider is asked and decides -- so `0.99` below is expected to succeed.
+        return new Response(JSON.stringify({ min_amount: 1 }), {
                 status: 200, headers: { 'Content-Type': 'application/json' }
             });
         }
@@ -1041,7 +1287,11 @@ test('deposit amounts a user would type are accepted, sub-cent precision is not'
                 assert.equal(response.status, 400, `expected ${label} to be rejected, got ${response.status}`);
             }
         }
-        assert.deepEqual(accepted, ['1.1', '1.15', '2.29']);
+        // `0.99` is here because a crypto deposit no longer has a $1.00 floor of its own. It used
+        // to be rejected by this app before the provider was ever asked, which is exactly the
+        // behaviour that made small crypto deposits impossible to create. `1.005` is still
+        // rejected as sub-cent precision, which is a parsing rule rather than a minimum.
+        assert.deepEqual(accepted, ['1.1', '1.15', '2.29', '0.99']);
      } finally {
         undici.fetch = originalFetch;
         pool.query = originalQuery;
@@ -1118,6 +1368,12 @@ test('a non-finished NOWPayments status never credits, and a malformed signature
         if (/SELECT u\.email[\s\S]*FROM withdrawals w/i.test(normalized)) {
             return { rows: [{ email: 'payout@example.com' }] };
         }
+        // Answers the reads the money-email notifications add to a query; see
+        // test/helpers/notificationRows.js. Without this the notification throws inside
+        // its own try/catch, the receipt is silently never sent, and this test still
+        // passes -- which is the failure mode the strict stub exists to prevent.
+        const notification = notificationRows(normalized);
+        if (notification) return notification;
         throw new Error(`Unexpected test query: ${normalized}`);
     }
 
@@ -1295,6 +1551,12 @@ test('deposit options come from the merchant coin list and the provider minimums
         // below-the-provider-floor case. Unstubbed it surfaces as a thrown error and the
         // response becomes a 502, which hides the behaviour under test.
         if (/UPDATE deposits SET status = 'failed'/i.test(query)) return { rows: [], rowCount: 1 };
+        // Answers the reads the money-email notifications add to a query; see
+        // test/helpers/notificationRows.js. Without this the notification throws inside
+        // its own try/catch, the receipt is silently never sent, and this test still
+        // passes -- which is the failure mode the strict stub exists to prevent.
+        const notification = notificationRows(query);
+        if (notification) return notification;
         throw new Error(`Unexpected test query: ${query}`);
     };
 
@@ -1410,15 +1672,15 @@ test('deposit options come from the merchant coin list and the provider minimums
         assert.equal(aboveCoinCeiling.status, 400);
         assert.match((await aboveCoinCeiling.json()).error, /maximum deposit in BTC is \$900\.00/);
 
-        // A deposit the provider's own floor rules out is NOT blocked by the app. The app
-        // advertises a $1.00 minimum and honours it; the provider's floor is a volatile,
-        // pair-specific figure, and refusing on a cached read of it meant the advertised $1
-        // was unsubmittable for a whole class of coins. Instead the request reaches
-        // `createPayment`, the provider refuses, and its own words come back -- which is the
-        // only thing that tells the user the number that will actually work.
+        // A deposit the provider's own floor rules out is NOT blocked by the app, which imposes
+        // no crypto minimum of its own. A quoted floor is a volatile, pair-specific figure, and
+        // refusing on a cached read of it is what made small deposits unsubmittable. The request
+        // reaches `createPayment` and the provider decides.
         //
-        // This is the opposite of what this assertion used to require, and deliberately so: it
-        // previously expected the app to refuse the amount itself against its cached floor.
+        // What comes back is the translated message, not the provider's raw string. Both reasons
+        // the raw string is unusable: "Minimum amount is 0.0002 BTC" names an amount in a
+        // currency the user did not type, and it says nothing about what to do. The translation
+        // states the floor in dollars, echoes what was entered, and gives a way forward.
         const belowProviderFloor = await fetch(`${origin}/api/user/deposits`, {
             method: 'POST',
             headers: { ...headers, 'Content-Type': 'application/json' },
@@ -1430,10 +1692,12 @@ test('deposit options come from the merchant coin list and the provider minimums
             `expected the provider's refusal to pass through as 400, got ${belowProviderFloor.status}: ` +
             `${JSON.stringify(await belowProviderFloor.clone().text())}. Provider paths: ${requestedPaths.join(' | ')}`
         );
-        // The provider's own message, not a generic one. This is the whole point of letting the
-        // provider answer: it names the real floor in real units.
         const floorRefusal = (await belowProviderFloor.json()).error;
-        assert.match(floorRefusal, /Minimum amount is 0\.0002 BTC/i);
+        assert.match(floorRefusal, /BTC deposits start at \$18\.80/);
+        assert.match(floorRefusal, /below the \$5\.00 you entered/);
+        assert.match(floorRefusal, /choose a coin with a lower minimum/i);
+        // The provider's own unit-bearing wording must not reach the user.
+        assert.doesNotMatch(floorRefusal, /0\.0002 BTC/);
         // And the app did reach the provider, rather than deciding on its own.
         assert.ok(
             requestedPaths.some((path) => path.includes('/v1/payment')),
@@ -1516,6 +1780,12 @@ test('reconciliation credits a card deposit whose Stripe webhook was lost', asyn
             orphanCleanupRan = true;
             return { rows: [] };
         }
+        // Answers the reads the money-email notifications add to a query; see
+        // test/helpers/notificationRows.js. Without this the notification throws inside
+        // its own try/catch, the receipt is silently never sent, and this test still
+        // passes -- which is the failure mode the strict stub exists to prevent.
+        const notification = notificationRows(normalized);
+        if (notification) return notification;
         throw new Error(`Unexpected test query: ${normalized}`);
     }
 
@@ -1765,6 +2035,12 @@ test('click creation returns the configured absolute aff_sub URL and redirects t
         if (query.includes('SELECT offers.tracking_url')) {
             return { rows: [{ tracking_url: 'https://partner.example/click?campaign=42', is_demo: false }] };
         }
+        // Answers the reads the money-email notifications add to a query; see
+        // test/helpers/notificationRows.js. Without this the notification throws inside
+        // its own try/catch, the receipt is silently never sent, and this test still
+        // passes -- which is the failure mode the strict stub exists to prevent.
+        const notification = notificationRows(query);
+        if (notification) return notification;
         throw new Error(`Unexpected test query: ${query}`);
     };
 
@@ -2466,7 +2742,11 @@ test('every page the app serves is reachable under the deployed routing', () => 
     // the rewrite silently becomes the SPA shell in production, so it is asserted here
     // rather than discovered from a 404 in production.
     const deployed = require('../vercel.json');
-    const pagePaths = ['/', '/offers', '/reset-password', '/demo'];
+    // `/login` is in this list because the sign-in gate redirects to it by name, and it is a
+    // page of its own rather than a dialog over `account.html`. A rewrite that stopped
+    // covering it would send every signed-out visitor to a 404 instead of a sign-in form, and
+    // in local development the route would make that invisible.
+    const pagePaths = ['/', '/offers', '/account', '/login', '/reset-password', '/demo'];
     // `/receipt/deposit/:id` is a pattern, so it is checked as the shape the rewrite must cover.
     const patterns = [/^\/receipt\/deposit\/:id$/, /^\/offer\/engage$/, /^\/click\/:offerId$/];
 

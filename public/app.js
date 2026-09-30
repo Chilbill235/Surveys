@@ -11,6 +11,97 @@
  */
 
 const accountTokenKey = 'offerNetworkSessionToken';
+/**
+ * The signed-in address, kept beside the token and cleared with it.
+ *
+ * `contact.js` reads this to pre-fill the support form. It lives in `sessionStorage` rather
+ * than `localStorage` because it is a property of the current session: an address left in
+ * local storage outlives the sign-out, so a shared machine would offer the previous user's
+ * address to whoever opened the contact form next, and a reply would go to them.
+ */
+const accountEmailKey = 'rewardZoneEmail';
+
+/**
+ * The session token, or `null` if there is not a usable one.
+ *
+ * Every read of `accountTokenKey` goes through here, and that is not tidiness -- it is the
+ * fix for a bug that filled the server log with rejections nobody could act on.
+ *
+ * `completeSignIn` used to store `data.token` with no check. `sessionStorage.setItem(key,
+ * undefined)` does not fail and does not store `undefined`; it stores the four-letter string
+ * `"undefined"`. So any sign-in response that was not the shape the code expected -- a proxy
+ * that answered 200 with an error body, an API field renamed, a partial response -- quietly
+ * put a non-token in the session slot. From then on the page believed it was signed in and
+ * every authenticated request sent `Authorization: Bearer undefined`, which the server
+ * correctly rejected and logged as `jwt malformed` -- including on the live-sync poll, so
+ * every few seconds, for as long as the tab was open, and again on the next page load.
+ *
+ * Two things have to be true for this to stop, and both are here:
+ *
+ *   1. A value that is not a token is never stored in the first place. `completeSignIn`
+ *      validates before it writes.
+ *   2. A value that is already in storage from an older build, or that got in some other way,
+ *      is not trusted on the way out. This function treats anything that is not three
+ *      base64url segments as "not signed in".
+ *
+ * The second is the one that matters for people already affected. Without it they would have
+ * to clear site data by hand to stop the log filling up, because the poisoned value is
+ * indistinguishable from a real one to every other line of code.
+ *
+ * The shape test is deliberately structural rather than a full parse: three non-empty
+ * base64url segments joined by dots is what a JWT is, and the signature is verified on the
+ * server. This is a check that stops garbage being sent, not a security boundary -- a caller
+ * with a forged token still gets nowhere.
+ */
+function getSessionToken() {
+    let raw = null;
+    try {
+        raw = sessionStorage.getItem(accountTokenKey);
+    } catch {
+        // Storage disabled or blocked. Not being able to read a session means not being
+        // signed in, which is the correct answer rather than a reason to send a guess.
+        return null;
+    }
+    return getSessionTokenFrom(raw);
+}
+
+/**
+ * Whether `value` is shaped like a JWT: three non-empty base64url segments.
+ *
+ * Split out so the check applied to a token on its way into storage and the check applied to
+ * one on its way out are the same test, defined once. Two copies of this is one more place
+ * for the two to disagree, and the disagreement is the bug.
+ *
+ * This filters garbage; it is not a security boundary. It answers "is this worth sending".
+ * Whether the token is genuine is decided by its signature, on the server.
+ */
+function getSessionTokenFrom(value) {
+    if (typeof value !== 'string' || value.length < 20) return null;
+    const parts = value.split('.');
+    if (parts.length !== 3) return null;
+    return parts.every((part) => /^[A-Za-z0-9_-]+$/.test(part)) ? value : null;
+}
+
+/**
+ * The `Authorization` header for an authenticated request, or nothing at all.
+ *
+ * This exists so that no call site can accidentally send `Bearer null`. Interpolating a token
+ * getter that can return `null` into a header string is the obvious thing to do, and it
+ * produces exactly the bug the getter was added to stop: the string "null" is a perfectly good
+ * bearer value as far as the server is concerned, and it logs a `jwt malformed` rejection for
+ * every request.
+ *
+ * Returning `{}` instead of a header is the correct outcome when there is no session: the
+ * request goes out anonymous, the route treats it as anonymous, and nothing is logged. Most of
+ * these routes are already guarded by an explicit token check, so this is the second line --
+ * but the second line is the one that is always on.
+ *
+ * Spread it: `headers: { ...authHeaders(), 'Content-Type': 'application/json' }`.
+ */
+function authHeaders() {
+    const token = getSessionToken();
+    return token ? { Authorization: `Bearer ${token}` } : {};
+}
 
 const offerState = { all: [], search: '', sort: 'featured', type: 'all' };
 const depositState = { options: null, method: 'crypto' };
@@ -104,14 +195,45 @@ const NOTIFICATION_CATEGORY_ICONS = {
     magic: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M8 2v4l2 2 2-2V2h-4zM6 14h6V6H6v8zM6 14a2 2 0 1 1-4 0 2 2 0 0 1 4 0z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>'
 };
 
+/**
+ * The most toasts on screen at once.
+ *
+ * Three, because that is what fits between the header and the fold on a laptop without
+ * covering the content, and because the app can fire several at once on one action -- a
+ * completion pushes a success, a balance update, and a history entry. Uncapped, a slow
+ * connection turned that into a column of cards down the right-hand side of the page with
+ * the newest at the bottom, below the fold, so the message that mattered was the one the
+ * user could not see.
+ */
+const MAX_VISIBLE_TOASTS = 3;
+
+/**
+ * A brief notice, anchored top-right on desktop and above the action bar on a phone.
+ *
+ * Three behaviours here that are not obvious from the call sites:
+ *
+ * - An error stays until it is dismissed. Every toast had a 4.5 second life, including the
+ *   ones saying a deposit failed or a withdrawal was refused. A message about money that
+ *   disappears before it is read is not a message, and the user's response to it -- the
+ *   thing they were supposed to do next -- was gone with it.
+ * - Hovering or focusing the toast stops the countdown. A toast that removes itself while
+ *   the pointer is on it, or while a screen reader is inside it, is WCAG 2.2.1 timing that
+ *   cannot be adjusted -- and the fix is to pause rather than to extend, which also means
+ *   the remaining time is still there when the pointer leaves.
+ * - The oldest is dropped when there are more than `MAX_VISIBLE_TOASTS`. Dropped, not
+ *   queued: a queued toast fires minutes later about something that has been resolved.
+ */
 function showToast(title, message, { tone = 'info', duration = 4500 } = {}) {
     if (!toastRegion) return;
     const id = ++toastCount;
+    const persistent = tone === 'error';
     const toast = document.createElement('div');
     toast.className = `toast is-${tone}`;
     toast.dataset.id = id;
     toast.setAttribute('role', 'status');
     toast.setAttribute('aria-live', 'polite');
+    // The animation reads this custom property, and so does the pause below -- which is why
+    // the duration has to live on the element rather than only in the timeout.
     toast.style.setProperty('--toast-duration', `${duration / 1000}s`);
     toast.innerHTML = `
         <span class="toast-icon" aria-hidden="true">${TOAST_ICONS[tone] || TOAST_ICONS.info}</span>
@@ -123,16 +245,60 @@ function showToast(title, message, { tone = 'info', duration = 4500 } = {}) {
     `;
     toast.querySelector('.toast-close').addEventListener('click', () => dismissToast(id));
 
-    const existing = toastRegion.querySelector(`.toast[data-id="${id - 1}"]`);
-    if (existing) {
-        existing.style.marginTop = '0';
-    }
-
     toastRegion.appendChild(toast);
 
-    if (duration > 0) {
-        setTimeout(() => dismissToast(id), duration);
+    // Trimmed after appending, so the count includes the one just shown and the toast that
+    // goes is always the oldest rather than the newest.
+    const visible = [...toastRegion.querySelectorAll('.toast:not(.is-leaving)')];
+    for (const stale of visible.slice(0, Math.max(0, visible.length - MAX_VISIBLE_TOASTS))) {
+        dismissToast(Number(stale.dataset.id));
     }
+
+    if (persistent) {
+        // No timeout. The close button is the only way out, which is the point.
+        return id;
+    }
+
+    let remaining = duration;
+    let elapsed = 0;
+    let startedAt = Date.now();
+    let timer = null;
+
+    const stopCountdown = () => {
+        if (timer === null) return;
+        clearTimeout(timer);
+        timer = null;
+        elapsed += Date.now() - startedAt;
+    };
+    const startCountdown = () => {
+        if (timer !== null || remaining <= 0) return;
+        startedAt = Date.now();
+        timer = setTimeout(() => {
+            timer = null;
+            dismissToast(id);
+        }, remaining);
+    };
+
+    for (const event of ['mouseenter', 'focusin']) toast.addEventListener(event, stopCountdown);
+    for (const event of ['mouseleave', 'focusout']) toast.addEventListener(event, startCountdown);
+
+    // The visible bar is driven by the same remaining time as the timeout, so the bar does
+    // not keep draining while the toast is being read.
+    const syncBar = () => {
+        const left = Math.max(0, remaining - (timer === null ? 0 : Date.now() - startedAt));
+        toast.style.setProperty('--toast-progress', `${Math.max(0, left / duration)}`);
+    };
+    const barTimer = setInterval(syncBar, 100);
+
+    startCountdown();
+    // Cleared when the toast goes, whether by its own timeout or by being dismissed early.
+    const originalRemove = toast.remove.bind(toast);
+    toast.remove = () => {
+        clearInterval(barTimer);
+        stopCountdown();
+        originalRemove();
+    };
+
     return id;
 }
 
@@ -206,7 +372,7 @@ function pushNotification({ title, message, tone = 'info', href = null, category
     });
     saveNotifications(notificationStore);
     renderNotificationBell();
-    if (!notificationDropdown.hidden) {
+    if (notificationDropdown && !notificationDropdown.hidden) {
         renderNotificationList();
     }
 }
@@ -225,10 +391,17 @@ function markAllNotificationsRead() {
     renderNotificationBell();
 }
 
+function clearAllNotifications() {
+    notificationStore = [];
+    saveNotifications(notificationStore);
+    if (notificationDropdown && !notificationDropdown.hidden) renderNotificationList();
+    renderNotificationBell();
+}
+
 function dismissNotification(id) {
     notificationStore = notificationStore.filter((n) => n.id !== id);
     saveNotifications(notificationStore);
-    if (!notificationDropdown.hidden) renderNotificationList();
+    if (notificationDropdown && !notificationDropdown.hidden) renderNotificationList();
     renderNotificationBell();
 }
 
@@ -236,6 +409,19 @@ function renderNotificationBell() {
     const bell = document.getElementById('notification-bell');
     const count = document.getElementById('notification-count');
     if (!bell || !count) return;
+
+    // The bell is a session control: it ships `hidden`, and `syncAccountControls` reveals it
+    // once there is a session to show notifications for. This function runs after every change to
+    // the store -- which is after `initNotifications`, which is after `syncAccountControls` -- and
+    // it used to set `hidden = false` on both of its branches, so the last word belonged to it and
+    // a signed-out visitor was given a bell over an empty list. On a page whose header shows the
+    // bell that is a control with nothing behind it; on the pages with an action bar the header
+    // copy is `display: none` on a phone but not on a desktop, so it showed there too.
+    if (!getSessionToken()) {
+        bell.hidden = true;
+        count.hidden = true;
+        return;
+    }
 
     const countValue = unreadCount();
     if (countValue > 0) {
@@ -245,6 +431,15 @@ function renderNotificationBell() {
     } else {
         bell.hidden = false;
         count.hidden = true;
+    }
+
+    // The action-bar bell carries its own badge element, and it was never written to. On a
+    // phone the header bell is `display: none`, so this badge is the only unread count the
+    // visitor could ever have seen -- and it stayed at its initial value of `0` and hidden.
+    const mobileCount = document.getElementById('notification-count-mobile');
+    if (mobileCount) {
+        mobileCount.textContent = String(countValue > 99 ? '99+' : countValue);
+        mobileCount.hidden = countValue === 0;
     }
 }
 
@@ -263,7 +458,7 @@ function renderNotificationList() {
     for (const item of recent) {
         const el = document.createElement('div');
         el.className = `notification-item is-${item.tone} ${item.read ? '' : 'unread'}`;
-        const iconSvg = NOTIFICATION_CATEGORY_ICONS[item.category] || TOAST_ICONS[item.tone];
+        const iconSvg = NOTIFICATION_CATEGORY_ICONS[item.category] || TOAST_ICONS[item.tone] || TOAST_ICONS.info;
         el.innerHTML = `
             <span class="notification-item-icon" aria-hidden="true">${iconSvg}</span>
             <div class="notification-item-content">
@@ -274,7 +469,8 @@ function renderNotificationList() {
             <button type="button" class="notification-item-close" aria-label="Dismiss">&times;</button>
         `;
 
-        el.querySelector('.notification-item-close').addEventListener('click', () => dismissNotification(item.id));
+        const closeButton = el.querySelector('.notification-item-close');
+        if (closeButton) closeButton.addEventListener('click', () => dismissNotification(item.id));
         el.addEventListener('click', (event) => {
             if (event.target.closest('.notification-item-close')) return;
             if (!item.read) markNotificationRead(item.id);
@@ -295,13 +491,33 @@ function formatTimeAgo(ts) {
 }
 
 const notificationDropdown = document.getElementById('notification-dropdown');
-const notificationBell = document.getElementById('notification-bell');
+
+/**
+ * There are two bells for one dropdown: the header bell, and the action-bar bell that the
+ * stylesheet swaps in on narrow screens (`#notification-bell` becomes `display: none` and
+ * `#notification-bell-mobile` becomes `display: flex`).
+ *
+ * Only the header bell was ever wired. The action-bar bell kept the `hidden` attribute from
+ * the markup, had no click handler, and had its badge element never written to -- so on a
+ * phone the visitor had no notification bell at all, and no unread count. Because the
+ * header bell is still in the DOM (merely not displayed), the shared code below kept working
+ * and nothing errored: the dropdown could be toggled, just never by anyone on a phone.
+ *
+ * Both are collected into one list so every state change applies to whichever one is
+ * actually visible.
+ */
+const notificationBells = [
+    document.getElementById('notification-bell'),
+    document.getElementById('notification-bell-mobile')
+].filter(Boolean);
 
 function toggleNotificationDropdown() {
-    if (!notificationDropdown || !notificationBell) return;
+    if (!notificationDropdown || notificationBells.length === 0) return;
     const isOpen = !notificationDropdown.hidden;
     notificationDropdown.hidden = isOpen;
-    notificationBell.setAttribute('aria-expanded', String(!isOpen));
+    for (const bell of notificationBells) {
+        bell.setAttribute('aria-expanded', String(!isOpen));
+    }
     if (!isOpen) {
         renderNotificationList();
         markAllNotificationsRead();
@@ -309,29 +525,40 @@ function toggleNotificationDropdown() {
 }
 
 function closeNotificationDropdown() {
-    if (!notificationDropdown || !notificationBell) return;
+    if (!notificationDropdown || notificationBells.length === 0) return;
     notificationDropdown.hidden = true;
-    notificationBell.setAttribute('aria-expanded', 'false');
+    for (const bell of notificationBells) {
+        bell.setAttribute('aria-expanded', 'false');
+    }
 }
 
 function initNotifications() {
     renderNotificationBell();
-    notificationBell?.addEventListener('click', (event) => {
-        event.stopPropagation();
-        toggleNotificationDropdown();
-    });
+    for (const bell of notificationBells) {
+        bell.addEventListener('click', (event) => {
+            event.stopPropagation();
+            toggleNotificationDropdown();
+        });
+    }
 
     document.addEventListener('click', (event) => {
-        if (notificationDropdown && !notificationDropdown.hidden &&
-            !notificationDropdown.contains(event.target) &&
-            event.target !== notificationBell) {
-            closeNotificationDropdown();
-        }
+        if (!notificationDropdown || notificationDropdown.hidden) return;
+        if (notificationDropdown.contains(event.target)) return;
+        // A click on either bell is the toggle's own click, already stopped above. Without
+        // this the outside-click handler would immediately close the dropdown the bell had
+        // just opened, which reads as a bell that does nothing.
+        if (notificationBells.some((bell) => bell === event.target || bell.contains(event.target))) return;
+        closeNotificationDropdown();
     });
 
     document.getElementById('notification-mark-all')?.addEventListener('click', (event) => {
         event.stopPropagation();
         markAllNotificationsRead();
+    });
+
+    document.getElementById('notification-clear-all')?.addEventListener('click', (event) => {
+        event.stopPropagation();
+        clearAllNotifications();
     });
 }
 
@@ -389,10 +616,43 @@ function notifySessionExpired() {
  * paid when the page loaded must not fire "your money has been sent" on every
  * poll.
  */
-const withdrawalStatesSeen = new Set();
-function markWithdrawalSeen(id, status) {
-    withdrawalStatesSeen.add(`${id}:${status}`);
+const WITHDRAWAL_SEEN_KEY = 'offerNetworkWithdrawalStatesSeen';
+const WITHDRAWAL_SEEN_LIMIT = 100;
+
+/** Session storage throws rather than returning null when it is disabled or full. */
+function readWithdrawalStatesSeen() {
+    try {
+        const raw = window.sessionStorage.getItem(WITHDRAWAL_SEEN_KEY);
+        const parsed = raw ? JSON.parse(raw) : [];
+        return new Set(Array.isArray(parsed) ? parsed.map(String) : []);
+    } catch {
+        return new Set();
+    }
 }
+
+const withdrawalStatesSeen = readWithdrawalStatesSeen();
+
+function persistWithdrawalStatesSeen() {
+    try {
+        const arr = [...withdrawalStatesSeen];
+        if (arr.length > WITHDRAWAL_SEEN_LIMIT) {
+            arr.splice(0, arr.length - WITHDRAWAL_SEEN_LIMIT);
+        }
+        window.sessionStorage.setItem(WITHDRAWAL_SEEN_KEY, JSON.stringify(arr));
+    } catch {
+        // Storage full or unavailable. In-memory set still suppresses repeats for the
+        // rest of this page's life, so a repeat after a reload is a tolerable outcome
+        // versus an exception thrown out of a status poll.
+    }
+}
+
+function markWithdrawalSeen(id, status) {
+    const key = `${id}:${status}`;
+    if (withdrawalStatesSeen.has(key)) return;
+    withdrawalStatesSeen.add(key);
+    persistWithdrawalStatesSeen();
+}
+
 function withdrawalStateSeen(id, status) {
     return withdrawalStatesSeen.has(`${id}:${status}`);
 }
@@ -400,10 +660,85 @@ function withdrawalStateSeen(id, status) {
 // exists so an edit after the code arrived is caught in the form instead of at the server.
 const withdrawState = { options: null, method: 'paypal', asset: '', network: '', codeFor: null };
 const accountState = { balance: NaN };
+/**
+ * Whether this user wants deposit and withdrawal email, and whether we have actually asked.
+ *
+ * `loaded` is separate from `enabled` because the switch is rendered before the session is
+ * known. A page that painted "off" while loading would be claiming the user had switched
+ * their receipts off, and a page that painted "on" would be claiming a setting it had not
+ * read -- which for a user who genuinely did switch it off is the more annoying of the two,
+ * because the switch would jump under their cursor.
+ */
+const emailPrefState = { enabled: true, loaded: false, saving: false };
 
+/**
+ * The display name and profile picture, and whether the form is showing unsaved edits.
+ *
+ * `saved` is kept alongside the working values because the save button is enabled by
+ * "has something changed", and answering that question from the values alone means
+ * re-deriving the server's normalisation on every keystroke. Holding what the server last
+ * confirmed is the only way to know the difference between "the user typed something" and
+ * "the user typed something different from what is stored".
+ *
+ * `avatarData` holds a data URL rather than a `File`. The file is read and drawn onto a
+ * canvas immediately, so the object URL is never retained: a blob URL left alive keeps the
+ * whole picked file in memory for the life of the page, and the downscaled result is a few
+ * kilobytes. The size that actually gets submitted is produced here, which is why it fits
+ * the server's 16 KB cap and the request body's 32 KB one without the user being told to
+ * resize anything themselves.
+ */
+const profileState = {
+    displayName: '',
+    avatarData: null,
+    // Read from the server alongside everything else rather than from `sessionStorage`. The
+    // stored copy is a claim made at sign-in time: it survives a password change that should
+    // have changed the account, and on a shared device it belongs to whoever used the tab
+    // last. The header and the account menu both name the person, so both need a value that
+    // is a fact about the present.
+    email: '',
+    // The numeric account id, used only for the support reference. It identifies the
+    // account to a human and grants nothing, which is why it is safe to put on the clipboard.
+    accountId: null,
+    saved: { displayName: '', avatarData: null },
+    loaded: false,
+    saving: false,
+    dirty: false
+};
 
-let depositStatusTimer;
-let depositHistorySignature = '';
+/**
+ * The pixel size the picked picture is drawn at before it is sent.
+ *
+ * 128 is chosen against the largest place the avatar is rendered -- a 64 px preview in the
+ * settings card -- with headroom for a high-density display, at which point a 128 px source
+ * is still 2x. Beyond that the extra pixels are invisible while every one of them is bytes
+ * in a JSON body and a row in the database.
+ */
+const PROFILE_AVATAR_SIZE = 128;
+
+/**
+ * The largest source file a person may pick, in bytes. 10 MB.
+ *
+ * This is deliberately far larger than what is stored, and the two numbers answer different
+ * questions. The source limit is about what people actually have: a modern phone photo from a
+ * 12 MP camera is routinely 4-6 MB as a HEIC or a high-quality JPEG, and a screenshot or a
+ * scan can pass 10 MB. Capping the *picked file* at 16 KB, which is what the stored size is
+ * capped at, rejected essentially every real photograph -- the user got "that file is too
+ * large" for a picture that was never too large for anything, only too large after we had
+ * already shrunk it for them.
+ *
+ * The stored cap stays small and that is the one that matters. By the time anything is sent,
+ * the image has been centre-cropped to PROFILE_AVATAR_SIZE and re-encoded as PNG, which is a
+ * few kilobytes regardless of what went in. So the upload is a few KB, the request body limit
+ * of 32 KB still holds, and the database row stays small. A 10 MB input costs one local decode
+ * and nothing downstream.
+ *
+ * The check is here rather than on the input's `accept` attribute or the server because
+ * neither can catch it at the right moment. `accept` is a filter hint the browser is free to
+ * ignore, and the server would have to buffer 10 MB to produce a message about a file the
+ * browser could have described without reading a byte of it.
+ */
+const PROFILE_AVATAR_MAX_SOURCE_BYTES = 10 * 1024 * 1024;
+
 
 /**
  * The deposit the instructions panel is currently showing, and its status line.
@@ -432,12 +767,107 @@ const statusLabels = {
     cancelled: 'Cancelled', processing: 'Processing'
 };
 
-document.addEventListener('DOMContentLoaded', () => {
-    document.getElementById('account-button').addEventListener('click', handleAccountButton);
-    document.getElementById('deposit-button').addEventListener('click', openDeposits);
-    document.getElementById('withdraw-button').addEventListener('click', openWithdrawal);
-    document.getElementById('account-form').addEventListener('submit', connectAccount);
-    document.getElementById('withdraw-form').addEventListener('submit', submitWithdrawal);
+/**
+ * True while a magic link is being exchanged for a session.
+ *
+ * The link is the sign-in, so the sign-in form must not be put in front of it: a dialog
+ * opening over a page that is about to become a signed-in session asks the person to do
+ * something they have already done by clicking the link in their email.
+ */
+let magicLinkPending = false;
+
+/**
+ * Everything below this line is page wiring, and none of it runs for a visitor the gate
+ * refused.
+ *
+ * `session-gate.js` is loaded before this file, so by the time this statement executes the
+ * decision has already been made and the redirect is in flight. Registering the listener
+ * anyway would mean the offers catalog, the balance poll, and the notification badge all
+ * start behind a page the visitor is already leaving -- a burst of requests that come back
+ * 401 and each raise a "session expired" toast on the way out. The API is still the
+ * authority; this only avoids doing work for someone who cannot use the results.
+ */
+const mayUseThisPage = window.RewardZoneSession ? window.RewardZoneSession.enforce() : true;
+
+// The sign-in page has no page content behind it, so there is nothing to hide and no dialog
+// to dismiss. This only covers the Back button: history can hold a gated page from before
+// the session existed, and walking back onto one would put the visitor on a private page
+// without a session.
+if (window.RewardZoneSession) window.RewardZoneSession.watchForPrivateHistory();
+
+if (mayUseThisPage) document.addEventListener('DOMContentLoaded', () => {
+    document.getElementById('account-button')?.addEventListener('click', handleAccountButton);
+
+    // The money pair lives in the account page's balance card, which is the page you come to in
+    // order to move money -- it is the only money control on screen there. The offers page has
+    // none in its card on purpose: the header's account menu carries "Add funds" and "Withdraw"
+    // on every page, and that page's narrow action bar mirrors them. The home page has no card
+    // and no bar, so the menu is its only path, which is why the menu keeps them.
+    //
+    // All of them are optional, because each page carries only the ones it owns, and all of
+    // them ship `disabled` in the markup: a listener is not optional for them, or
+    // `syncAccountControls()` would enable a control that looks live and does nothing.
+    document.getElementById('account-deposit-btn')?.addEventListener('click', openDeposits);
+    document.getElementById('account-withdraw-btn')?.addEventListener('click', openWithdrawal);
+    document.getElementById('account-password-btn')?.addEventListener('click', openPasswordReset);
+    // The menu's own items. Each closes the menu first, so the panel is never left hanging
+    // over whatever the item just opened.
+    document.getElementById('account-menu-deposit')?.addEventListener('click', () => {
+        closeAccountMenu();
+        openDeposits();
+    });
+    document.getElementById('account-menu-withdraw')?.addEventListener('click', () => {
+        closeAccountMenu();
+        openWithdrawal();
+    });
+    document.getElementById('account-menu-signout')?.addEventListener('click', () => {
+        closeAccountMenu();
+        signOut({ leave: true });
+    });
+    // The two in-page links scroll rather than navigate, so closing the menu has to wait for
+    // the scroll to start or the anchor jump is cancelled by the panel being removed.
+    for (const id of ['account-menu-profile', 'account-menu-history']) {
+        document.getElementById(id)?.addEventListener('click', () => {
+            setTimeout(closeAccountMenu, 0);
+        });
+    }
+    document.getElementById('account-export-btn')?.addEventListener('click', exportTransactions);
+    document.getElementById('account-copy-ref-btn')?.addEventListener('click', copyAccountReference);
+    document.getElementById('account-revoke-sessions-btn')?.addEventListener('click', revokeAllSessions);
+    document.getElementById('profile-save')?.addEventListener('click', saveProfile);
+    document.getElementById('profile-display-name')?.addEventListener('input', (event) => {
+        profileState.displayName = event.target.value;
+        updateProfileDirty();
+    });
+    document.getElementById('profile-avatar-input')?.addEventListener('change', async (event) => {
+        const file = event.target.files && event.target.files[0];
+        // Reset immediately, so picking the same file twice in a row fires `change` again.
+        // Without this the second pick of an already-selected file is silently ignored,
+        // which reads to the user as the picker being broken.
+        event.target.value = '';
+        if (!file) return;
+        try {
+            profileState.avatarData = await readPickedAvatar(file);
+            updateProfileDirty();
+        } catch (error) {
+            const status = document.getElementById('profile-status');
+            if (status) {
+                status.textContent = error.message || 'That file could not be used.';
+                status.classList.add('is-error');
+            }
+        }
+    });
+    document.getElementById('profile-avatar-remove')?.addEventListener('click', () => {
+        // Clears the working value only. The stored one is replaced when Save is pressed,
+        // so a mis-click is not destructive -- the same contract as the name field.
+        profileState.avatarData = null;
+        updateProfileDirty();
+    });
+    document.getElementById('money-emails-toggle')?.addEventListener('change', (event) => {
+        saveEmailPreference(event.target.checked);
+    });
+    document.getElementById('account-form')?.addEventListener('submit', connectAccount);
+    document.getElementById('withdraw-form')?.addEventListener('submit', submitWithdrawal);
     document.getElementById('withdraw-code-send')?.addEventListener('click', sendWithdrawalCode);
     document.getElementById('withdraw-code-resend')?.addEventListener('click', sendWithdrawalCode);
     document.getElementById('withdraw-code')?.addEventListener('input', (event) => {
@@ -445,7 +875,7 @@ document.addEventListener('DOMContentLoaded', () => {
         // difference between a code that works and one of five attempts spent.
         event.target.value = event.target.value.replace(/\D/g, '').slice(0, 6);
     });
-    document.getElementById('deposit-form').addEventListener('submit', createDeposit);
+    document.getElementById('deposit-form')?.addEventListener('submit', createDeposit);
 
     document.querySelectorAll('[data-deposit-method]').forEach((button) => {
         button.addEventListener('click', () => {
@@ -457,24 +887,26 @@ document.addEventListener('DOMContentLoaded', () => {
     document.querySelectorAll('[data-deposit-amount]').forEach((button) => {
         button.addEventListener('click', () => {
             const amount = document.getElementById('deposit-amount');
+            if (!amount) return;
             amount.value = button.dataset.depositAmount;
             syncDepositPresets();
             amount.focus();
         });
     });
-    document.getElementById('deposit-amount').addEventListener('input', () => {
+    document.getElementById('deposit-amount')?.addEventListener('input', () => {
         syncDepositPresets();
         // Re-checked on every keystroke so the "provider will refuse this" state appears and
         // clears as the amount crosses the floor, rather than only after a failed submit.
         validateDepositAmount();
     });
-    document.getElementById('deposit-max').addEventListener('click', setMaximumDepositAmount);
-    document.getElementById('deposit-currency').addEventListener('change', () => {
+    document.getElementById('deposit-max')?.addEventListener('click', setMaximumDepositAmount);
+    document.getElementById('deposit-currency')?.addEventListener('change', () => {
         clearDepositMessage();
         // The provider's minimum and maximum are both per currency pair, so switching coins
         // can change the range that will be accepted. Leaving the previous coin's limits in
         // place either blocks a valid amount or lets an invalid one through to the server.
         const amount = document.getElementById('deposit-amount');
+        if (!amount) return;
         amount.min = String(minimumForSelectedCurrency());
         amount.max = String(maximumForSelectedCurrency());
         // The bounds alone are not enough: the value already typed may now be outside them.
@@ -484,7 +916,7 @@ document.addEventListener('DOMContentLoaded', () => {
         syncDepositPresets();
     });
 
-    document.getElementById('withdraw-asset-options').addEventListener('change', (event) => {
+    document.getElementById('withdraw-asset-options')?.addEventListener('change', (event) => {
         if (event.target.name === 'withdrawAsset') {
             withdrawState.asset = event.target.value;
             withdrawState.network = '';
@@ -492,13 +924,13 @@ document.addEventListener('DOMContentLoaded', () => {
             updateWithdrawFields();
         }
     });
-    document.getElementById('withdraw-network').addEventListener('change', (event) => {
+    document.getElementById('withdraw-network')?.addEventListener('change', (event) => {
         withdrawState.network = event.target.value;
         updateWithdrawFields();
     });
-    document.getElementById('withdraw-amount').addEventListener('input', updateWithdrawSummary);
-    document.getElementById('withdraw-address').addEventListener('input', updateWithdrawSummary);
-    document.getElementById('withdraw-max').addEventListener('click', () => {
+    document.getElementById('withdraw-amount')?.addEventListener('input', updateWithdrawSummary);
+    document.getElementById('withdraw-address')?.addEventListener('input', updateWithdrawSummary);
+    document.getElementById('withdraw-max')?.addEventListener('click', () => {
         // "Withdraw all" means the whole balance, but only up to the provider's own cap:
         // offering $5,000 to someone holding $40,000 produces a request that is refused.
         const options = withdrawState.options;
@@ -506,41 +938,42 @@ document.addEventListener('DOMContentLoaded', () => {
         if (!Number.isFinite(balance)) return;
         const ceiling = Number.isFinite(options?.maximumUsd) ? Math.min(balance, options.maximumUsd) : balance;
         const amount = document.getElementById('withdraw-amount');
+        if (!amount) return;
         amount.value = ceiling.toFixed(2);
         updateWithdrawSummary();
         amount.focus();
     });
-    document.getElementById('withdraw-address').addEventListener('input', clearWithdrawMessage);
+    document.getElementById('withdraw-address')?.addEventListener('input', clearWithdrawMessage);
 
     document.querySelectorAll('[data-auth-mode]').forEach((button) => {
         button.addEventListener('click', () => setAuthMode(button.dataset.authMode));
     });
-    document.getElementById('forgot-password-link').addEventListener('click', () => {
+    document.getElementById('forgot-password-link')?.addEventListener('click', () => {
         setFormMessage('account-message', '');
         setAuthMode('forgot');
     });
 
     // Email confirmation. The code box submits on Enter, so the flow is one keypress from
     // pasting the six digits rather than a hunt for the button.
-    document.getElementById('verify-submit').addEventListener('click', submitVerification);
-    document.getElementById('verify-resend').addEventListener('click', resendVerificationCode);
-    document.getElementById('verify-code').addEventListener('keydown', (event) => {
+    document.getElementById('verify-submit')?.addEventListener('click', submitVerification);
+    document.getElementById('verify-resend')?.addEventListener('click', resendVerificationCode);
+    document.getElementById('verify-code')?.addEventListener('keydown', (event) => {
         if (event.key === 'Enter') {
             event.preventDefault();
             submitVerification();
         }
     });
-    document.getElementById('verify-code').addEventListener('input', (event) => {
+    document.getElementById('verify-code')?.addEventListener('input', (event) => {
         // Digits only, even if the code was pasted with a space or a hyphen in it. The field
         // is `maxlength=6`, so stripping rather than truncating is what makes a pasted
         // "123 456" work instead of silently becoming "123 45".
         const cleaned = event.target.value.replace(/\D/g, '').slice(0, 6);
         if (cleaned !== event.target.value) event.target.value = cleaned;
     });
-    document.getElementById('verify-back').addEventListener('click', () => {
+    document.getElementById('verify-back')?.addEventListener('click', () => {
         hideVerifyStep();
         setAuthMode('login');
-        document.getElementById('account-email').focus();
+        document.getElementById('account-email')?.focus();
     });
     document.getElementById('verify-magic-link')?.addEventListener('click', sendMagicLink);
 
@@ -548,11 +981,31 @@ document.addEventListener('DOMContentLoaded', () => {
     // and exchange it for a session silently.
     checkMagicLinkReturn();
 
-    document.getElementById('offer-search').addEventListener('input', (event) => {
+    // The sign-in page needs nothing here: the form is the page, and focusing the email
+    // field is the useful default. A magic link is the exception -- it signs in on its own,
+    // and focusing a password box over the top of it asks someone who is already signed in
+    // to sign in again.
+    if (!getSessionToken() && !magicLinkPending) {
+        if (window.RewardZoneSession?.isLoginPath()) {
+            setAuthMode('login');
+            document.getElementById('account-email')?.focus();
+        } else {
+            // The dialog on a page that is legitimately reachable signed out -- the header's
+            // "Connect account" button.
+            const accountDialog = document.getElementById('account-dialog');
+            if (accountDialog && !accountDialog.open) {
+                setFormMessage('account-message', '');
+                setAuthMode('login');
+                accountDialog.showModal();
+            }
+        }
+    }
+
+    document.getElementById('offer-search')?.addEventListener('input', (event) => {
         offerState.search = event.target.value.trim().toLowerCase();
         renderOffers();
     });
-    document.getElementById('offer-sort').addEventListener('change', (event) => {
+    document.getElementById('offer-sort')?.addEventListener('change', (event) => {
         offerState.sort = event.target.value;
         renderOffers();
     });
@@ -570,23 +1023,33 @@ document.addEventListener('DOMContentLoaded', () => {
             renderOffers();
         });
     });
-    // The narrow-screen action bar duplicates the header controls, because the header has
-    // to stay one row on a phone and the primary actions belong under the thumb. Each bar
-    // button forwards to its header counterpart, so the behaviour, the disabled state, and
-    // the sign-in label all have exactly one implementation.
+    // The narrow-screen action bar duplicates some of the header controls, because the header
+    // has to stay one row on a phone and the primary actions belong under the thumb. Each bar
+    // button forwards to its header counterpart, so the behaviour, the disabled state, and the
+    // sign-in label all have exactly one implementation.
     //
     // This was registered inside the sign-in handler rather than here, which meant the
-    // three buttons in the bottom bar did nothing at all until the visitor had signed in
+    // buttons in the bottom bar did nothing at all until the visitor had signed in
     // once -- and then registered a fresh listener on every subsequent sign-in. It is
     // page-level wiring: it runs once, and the per-button state is `syncAccountControls`'s
     // job, which is already called on load, on sign-in, and on sign-out.
+    //
+    // The Account item that used to be here is gone. It mirrored `account-button`, which is
+    // `display: none` while signed in, and a hidden button still fires its handler on
+    // `.click()` -- so the item could sign the user out with nothing on screen saying that is
+    // what it does. The profile button and its menu are in the header on every width and
+    // already carry identity, transactions, money and sign out, so nothing was lost with it.
     document.querySelectorAll('[data-mirror]').forEach((barButton) => {
         const target = document.getElementById(barButton.dataset.mirror);
-        if (target) barButton.addEventListener('click', () => target.click());
+        if (!target) return;
+        barButton.addEventListener('click', () => target.click());
     });
 
     document.querySelectorAll('[data-close]').forEach((button) => {
-        button.addEventListener('click', () => document.getElementById(button.dataset.close).close());
+        button.addEventListener('click', () => {
+            const dialog = document.getElementById(button.dataset.close);
+            if (dialog) dialog.close();
+        });
     });
 
     // Any dialog dismisses on a backdrop click or Escape. Native <dialog> handles
@@ -597,24 +1060,22 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     });
 
-    document.getElementById('deposit-dialog').addEventListener('close', () => {
-        window.clearInterval(depositStatusTimer);
-        depositStatusTimer = undefined;
-        depositHistorySignature = '';
-    });    document.getElementById('withdraw-dialog').addEventListener('close', () => {
+    document.getElementById('withdraw-dialog')?.addEventListener('close', () => {
         setFormMessage('withdraw-message', '');
     });
 
-    document.getElementById('deposit-success-close').addEventListener('click', () => {
-        document.getElementById('deposit-success-dialog').close();
+    document.getElementById('deposit-success-close')?.addEventListener('click', () => {
+        document.getElementById('deposit-success-dialog')?.close();
     });
 
     syncAccountControls();
+    initAccountMenu();
     syncDepositPresets();
     updateDepositFields();
     updateWithdrawFields();
     refreshBalance();
     initNotifications();
+    openMoneyActionFromHash();
     // The notice is shown once the catalog has finished loading, not before. `loadOffers`
     // owns `page-message` for the duration of its request -- it clears the box on the way
     // in and writes an error into it on the way out -- so setting a notice beforehand would
@@ -627,14 +1088,18 @@ document.addEventListener('DOMContentLoaded', () => {
     // The page keeps itself current from here on. Seeded with the deposits that are already
     // credited so the first sync does not re-announce a payment that happened before the
     // page loaded, then started: the initial history read is what tells us which those are.
-    if (sessionStorage.getItem(accountTokenKey)) {
+    if (getSessionToken()) {
         loadDepositHistory().finally(() => {
             startLiveSync();
             paintLiveIndicator();
         });
+        loadEmailPreference();
+        loadProfile();
     } else {
         startLiveSync();
         paintLiveIndicator();
+        renderEmailPreference();
+        renderProfileEditor();
     }
 
     document.addEventListener('visibilitychange', () => {
@@ -654,7 +1119,7 @@ function startLiveSync() {
     window.clearTimeout(liveState.timer);
     liveState.timer = undefined;
     liveState.consecutiveFailures = 0;
-    if (!sessionStorage.getItem(accountTokenKey)) {
+    if (!getSessionToken()) {
         paintLiveIndicator();
         return;
     }
@@ -738,7 +1203,7 @@ function scheduleLiveSync() {
  * it is worth continuing (a form, a confirmation) can branch on it.
  */
 async function syncNow() {
-    const token = sessionStorage.getItem(accountTokenKey);
+    const token = getSessionToken();
     if (!token || liveState.busy) return false;
     if (document.hidden) {
         // Nothing is rendered while hidden, so there is no reason to spend the request.
@@ -802,15 +1267,28 @@ function applyLiveUpdate(payload) {
     liveState.creditedDepositTotal = 0;
     liveState.refundedWithdrawalTotal = 0;
 
-    if (typeof payload.balance === 'string' && payload.balance !== accountState.balance) {
-        // `applyBalance` is the one place that writes the header and keeps the withdrawal
-        // ceiling in step, so the live path routes through it rather than repeating it. A
-        // live update that painted the header but left the withdrawal form capped at the
-        // old balance would let someone request more than they have.
-        applyBalance(payload.balance, payload.demoBalance ?? '0');
-        if (isDialogOpen('withdraw-dialog')) {
-            updateWithdrawFields();
-            updateWithdrawAmountHint();
+    if (typeof payload.balance === 'string' || payload.balance === null) {
+        const nextBalanceNum = payload.balance === null ? 0 : Number(payload.balance);
+        const nextDemoNum = payload.demoBalance === null || payload.demoBalance === undefined
+            ? 0
+            : Number(payload.demoBalance);
+        const balanceChanged = nextBalanceNum !== accountState.balance;
+        const demoChanged = typeof payload.demoBalance === 'string' &&
+            nextDemoNum !== liveState.lastKnownDemoBalance;
+        if (balanceChanged || demoChanged) {
+            // `applyBalance` is the one place that writes the header and keeps the withdrawal
+            // ceiling in step, so the live path routes through it rather than repeating it. A
+            // live update that painted the header but left the withdrawal form capped at the
+            // old balance would let someone request more than they have.
+            //
+            // `balance` can be `null` when the user has only demo funds -- the header still
+            // needs to repaint, so `null` is coerced to `0` for display but is not treated as a
+            // reward transition.
+            applyBalance(payload.balance ?? '0', payload.demoBalance ?? '0');
+            if (isDialogOpen('withdraw-dialog')) {
+                updateWithdrawFields();
+                updateWithdrawAmountHint();
+            }
         }
     }
 
@@ -875,9 +1353,13 @@ function applyLiveUpdate(payload) {
     // A reward from a completed offer or survey arrives as a plain balance increase with
     // no deposit or withdrawal row to explain it. Detect that by comparing the delta
     // against the credits and refunds already announced in this update.
-    if (hadBalance && typeof payload.balance === 'string') {
+    //
+    // `balance` can be `null` (demo-only accounts), in which case the numeric value used
+    // for the delta is 0 -- the important thing is that the demo balance delta below is
+    // still evaluated.
+    if (hadBalance && (typeof payload.balance === 'string' || payload.balance === null)) {
         const prevBalance = liveState.lastKnownBalance;
-        const newBalance = Number(payload.balance);
+        const newBalance = payload.balance === null ? 0 : Number(payload.balance);
         const delta = newBalance - prevBalance;
         const accounted = liveState.creditedDepositTotal + liveState.refundedWithdrawalTotal;
 
@@ -905,8 +1387,10 @@ function applyLiveUpdate(payload) {
     }
 
     // Update the tracked previous balances for the next comparison.
-    if (typeof payload.balance === 'string') {
-        liveState.lastKnownBalance = Number(payload.balance);
+    // `balance` can be `null` for demo-only accounts; coerce to 0 so the delta math
+    // above stays correct on the next poll.
+    if (typeof payload.balance === 'string' || payload.balance === null) {
+        liveState.lastKnownBalance = payload.balance === null ? 0 : Number(payload.balance);
     }
     if (typeof payload.demoBalance === 'string') {
         liveState.lastKnownDemoBalance = Number(payload.demoBalance);
@@ -967,9 +1451,15 @@ function isDialogOpen(id) {
  * logged-out visitor has nothing to sync.
  */
 function paintLiveIndicator() {
+    // The freshness line below the balance reads the same state and is painted from the same
+    // tick, so the two can never disagree about whether the connection is up. It is not
+    // conditional on the header indicator existing: a page can have the balance card and no
+    // header indicator, and in that case this is what keeps the card honest.
+    paintBalanceFreshness();
+
     const indicator = document.getElementById('live-indicator');
     if (!indicator) return;
-    const token = sessionStorage.getItem(accountTokenKey);
+    const token = getSessionToken();
     if (!token) {
         indicator.hidden = true;
         return;
@@ -987,6 +1477,134 @@ function paintLiveIndicator() {
         return;
     }
     indicator.textContent = waiting ? 'Waiting for payment...' : 'Live';
+}
+
+/* ------------------------------------------------- how fresh is the balance figure */
+
+/**
+ * How long the highlight on a changed balance lasts, and why.
+ *
+ * Long enough to see on a second glance, short enough that it is not decoration. Longer than
+ * about a second and a balance that ticks every few seconds leaves the card permanently lit,
+ * which stops meaning anything; much shorter and it is missed entirely, which leaves the class
+ * looking like a bug rather than a signal.
+ */
+const BALANCE_FLASH_MS = 1500;
+
+/** The account page's freshness line. Null on every page that has no balance card. */
+const freshnessEl = document.getElementById('account-freshness');
+const freshnessTextEl = document.getElementById('account-freshness-text');
+
+let freshnessTimer = null;
+let balanceFlashTimer = null;
+/** When the figure last changed, or 0 if it never has. */
+let balanceChangedAt = 0;
+/**
+ * How the freshness line was last worded, so the age is only rewritten when the wording
+ * actually differs. Rewriting the text node on every tick is what turns a polite live region
+ * into one that announces itself once a second.
+ */
+let freshnessWord = '';
+
+/**
+ * Says the balance changed, in the only place that knows: `applyBalance`.
+ *
+ * Not in the DOM observer or the live-sync poller, because both of those would report a change
+ * that was not one -- the first paint, a re-render that rewrites the same figure, and a poll
+ * that returned identical numbers are all writes to the element and none of them are news. This
+ * compares the number, so "changed" means changed.
+ *
+ * Direction matters for the message: a rise is a reward landing, and saying so is the whole
+ * point of a balance that updates itself. A fall is a withdrawal the visitor just made, which
+ * they know about and do not need announced.
+ */
+function noteBalanceChange(previous, next) {
+    if (!Number.isFinite(previous) || !Number.isFinite(next) || previous === next) return;
+    balanceChangedAt = Date.now();
+
+    const figure = document.getElementById('account-balance-main');
+    if (figure) {
+        figure.classList.remove('is-updated');
+        // Re-adding without a reflow in between does not restart a CSS animation, and this
+        // class is the only thing the highlight runs off.
+        void figure.offsetWidth;
+        figure.classList.add('is-updated');
+        window.clearTimeout(balanceFlashTimer);
+        balanceFlashTimer = setTimeout(() => figure.classList.remove('is-updated'), BALANCE_FLASH_MS);
+    }
+
+    // Wording, not a celebration. Which of the two it is, though, is worth saying: a rise is a
+    // reward landing, which is the moment the card exists to report, and a fall is a withdrawal
+    // the visitor just made and already knows about. The highlight is the alarm either way.
+    freshnessWord = next > previous ? 'Reward received - balance updated' : 'Balance updated';
+    paintBalanceFreshness(true);
+}
+
+/**
+ * Paints "updated just now", or why it cannot say that.
+ *
+ * Four states, and the last is the one that matters:
+ *
+ *   no session      nothing to be fresh about, so the line is hidden
+ *   never changed   the first figure has loaded but nothing has moved since
+ *   failing         the connection is down and this number is the last known one, said
+ *                   plainly, because a stale figure that looks live is worse than no figure
+ *   aged            how long ago the number moved
+ *
+ * The wording is deliberately coarse. A precise "Updated 13s ago" would change every second,
+ * and this line is inside an `aria-live="polite"` region: rewriting its text node on every
+ * tick makes a screen reader say the same sentence over and over, which is worse than saying
+ * less. Three wordings cover the first minute -- "just now", "less than a minute", then one
+ * per minute -- so the region is written at most a few times a minute.
+ *
+ * Nothing is written at all when the wording is unchanged, which is the other half of that:
+ * this runs off the live-sync timer, and that timer ticks several times a minute.
+ */
+function paintBalanceFreshness(force = false) {
+    if (!freshnessEl || !freshnessTextEl) return;
+    if (!getSessionToken()) {
+        freshnessEl.hidden = true;
+        return;
+    }
+    freshnessEl.hidden = false;
+
+    const failing = liveState.consecutiveFailures > 0;
+    const waiting = liveState.awaitingDeposit;
+    const seconds = balanceChangedAt ? Math.round((Date.now() - balanceChangedAt) / 1000) : null;
+
+    let wording;
+    let tone;
+    if (failing) {
+        tone = 'is-stale';
+        wording = seconds === null
+            ? 'Connection lost - balance may be out of date'
+            : `Connection lost - last update ${seconds < 60 ? `${seconds}s ago` : `${Math.round(seconds / 60)} min ago`}`;
+    } else if (waiting) {
+        tone = 'is-waiting';
+        wording = 'Waiting for a payment to arrive';
+    } else if (seconds === null) {
+        tone = '';
+        wording = 'Checking your balance';
+    } else if (seconds < 15) {
+        tone = 'is-fresh';
+        wording = 'Updated just now';
+    } else if (seconds < 60) {
+        tone = 'is-fresh';
+        wording = 'Updated less than a minute ago';
+    } else {
+        const minutes = Math.round(seconds / 60);
+        tone = minutes < 5 ? '' : 'is-stale';
+        wording = `Updated ${minutes} min ago`;
+    }
+
+    // The first paint after a change has to land even if the previous wording was identical,
+    // which is what `force` is for. Everything else waits for the words to differ.
+    if (wording === freshnessWord && !force) return;
+    freshnessWord = wording;
+    freshnessTextEl.textContent = wording;
+    freshnessEl.classList.toggle('is-fresh', tone === 'is-fresh');
+    freshnessEl.classList.toggle('is-waiting', tone === 'is-waiting');
+    freshnessEl.classList.toggle('is-stale', tone === 'is-stale');
 }
 
 /* ---------------------------------------------------------------- helpers */
@@ -1037,8 +1655,8 @@ function setHint(id, text, isError) {
 }
 
 /** Ends a session: invalidates the server-side token, then clears the local copy. */
-function signOut() {
-    const token = sessionStorage.getItem(accountTokenKey);
+function signOut({ leave = false } = {}) {
+    const token = getSessionToken();
     if (token) {
         // Fire-and-forget: the local token is cleared immediately below, so a
         // server call that is still in flight when the tab closes does not delay
@@ -1051,13 +1669,70 @@ function signOut() {
         }).catch(() => {});
     }
     sessionStorage.removeItem(accountTokenKey);
+    // With the token. The address belongs to the session that just ended, and leaving it
+    // would pre-fill the support form for whoever signs in next on this tab.
+    sessionStorage.removeItem(accountEmailKey);
+    // The switch belongs to the session that just ended. Left painted at whatever it was, it
+    // would show the previous user's setting to whoever signs in next on this tab.
+    emailPrefState.enabled = true;
+    emailPrefState.loaded = false;
+    emailPrefState.saving = false;
+    // The profile belongs to the session that just ended, and it is the sharper case of the
+    // same problem: a name and a picture left painted belong to someone who is no longer
+    // signed in, and the next person to use this tab would be looking at their own account
+    // page with the previous user's name on it.
+    profileState.displayName = '';
+    profileState.avatarData = null;
+    profileState.email = '';
+    profileState.accountId = null;
+    profileState.saved = { displayName: '', avatarData: null };
+    profileState.loaded = false;
+    profileState.saving = false;
+    profileState.dirty = false;
+    const profileNameInput = document.getElementById('profile-display-name');
+    if (profileNameInput) profileNameInput.value = '';
     syncAccountControls();
+    renderEmailPreference();
+    renderProfileEditor();
+
+    // Signing out of a page that requires a session leaves the visitor somewhere they can
+    // no longer do anything: the controls have just gone grey and the gate would refuse them
+    // on the next reload. So a deliberate sign-out leaves the private area, rather than
+    // stranding them on it. `handleUnauthorized` passes `leave: false` because it sends them
+    // to sign in itself, which is the better answer for an expired session.
+    if (leave && document.body?.dataset.requiresSession === 'true' && window.RewardZoneSession) {
+        window.location.replace('/');
+    }
 }
 
+/**
+ * What happens when the server says the token is no longer good.
+ *
+ * The token is checked only by the API, so an expired or revoked session is discovered
+ * here rather than at page load. Signing out alone left the visitor on a page whose
+ * controls had just gone grey, with a toast that said "session expired" and nothing to do
+ * about it -- so they were sent to sign in, and returned to the page they were on. The
+ * toast is kept because it says *why*, which a bare sign-in form does not.
+ *
+ * Returns true when the error was a 401, so callers can skip their own failure handling:
+ * a re-authentication prompt is not something to also render as "Could not load your
+ * history".
+ */
 function handleUnauthorized(error) {
     if (error.status !== 401) return false;
     signOut();
     notifySessionExpired();
+    // On the account page the sign-in dialog is already here, so it opens in place --
+    // navigating to the login URL would load a second copy of this same page to show a form
+    // the visitor can already see. Everywhere else the page is one the gate cannot vouch
+    // for, and the return path carries the visitor back.
+    if (document.getElementById('account-dialog')) {
+        setAuthMode('login');
+        const dialog = document.getElementById('account-dialog');
+        if (dialog && !dialog.open) dialog.showModal();
+    } else if (window.RewardZoneSession) {
+        window.RewardZoneSession.goToLogin(window.RewardZoneSession.currentReturnPath());
+    }
     return true;
 }
 
@@ -1109,6 +1784,7 @@ async function loadOffers() {
     const skeletons = document.getElementById('loading-skeletons');
     const grid = document.getElementById('offer-grid');
     const message = document.getElementById('page-message');
+    if (!skeletons || !grid || !message) return;
     skeletons.hidden = false;
     grid.setAttribute('aria-busy', 'true');
     message.hidden = true;
@@ -1122,7 +1798,8 @@ async function loadOffers() {
     } catch (error) {
         offerState.all = [];
         grid.replaceChildren();
-        document.getElementById('offer-count').textContent = 'Offers unavailable';
+        const countEl = document.getElementById('offer-count');
+        if (countEl) countEl.textContent = 'Offers unavailable';
         message.replaceChildren(document.createTextNode(`${error.message} `));
         const retry = document.createElement('button');
         retry.type = 'button';
@@ -1159,6 +1836,7 @@ function offerSearchText(offer) {
 function renderOffers() {
     const grid = document.getElementById('offer-grid');
     const count = document.getElementById('offer-count');
+    if (!count || !grid) return;
     const visible = offerState.all.filter((offer) => {
         if (offerState.type !== 'all' && offer.offer_type !== offerState.type) return false;
         if (!offerState.search) return true;
@@ -1201,7 +1879,8 @@ function renderOffers() {
             reset.addEventListener('click', () => {
                 offerState.search = '';
                 offerState.type = 'all';
-                document.getElementById('offer-search').value = '';
+                const searchInput = document.getElementById('offer-search');
+                if (searchInput) searchInput.value = '';
                 document.querySelectorAll('[data-offer-type]').forEach((chip) => {
                     chip.setAttribute('aria-pressed', String(chip.dataset.offerType === 'all'));
                 });
@@ -1314,10 +1993,11 @@ function renderOffers() {
 }
 
 async function trackOffer(offerId, button) {
-    const token = sessionStorage.getItem(accountTokenKey);
+    const token = getSessionToken();
     if (!token) {
         showPageMessage('Connect your account before starting an offer.');
-        document.getElementById('account-dialog').showModal();
+        const dialog = document.getElementById('account-dialog');
+        if (dialog) dialog.showModal();
         return;
     }
 
@@ -1339,15 +2019,89 @@ async function trackOffer(offerId, button) {
         button.disabled = false;
         button.textContent = originalLabel;
         if (handleUnauthorized(error)) {
-            document.getElementById('account-dialog').showModal();
+            const dialog = document.getElementById('account-dialog');
+            if (dialog) dialog.showModal();
             return;
         }
         showPageMessage(error.message);
     }
 }
 
+/**
+ * Paints every part of the account identity: the header menu, the greeting, and the mark.
+ *
+ * The user's own picture when they have set one, the brand mark otherwise. The mark is not a
+ * generic "signed in" glyph: it is the logo the rest of the product uses, and it stays
+ * correct for a visitor who has not chosen a picture -- which is everyone on their first
+ * visit, and anyone who never sets one.
+ *
+ * The same values are written to several places -- the trigger, the panel header, the
+ * greeting -- from one state object, so they cannot disagree with each other. A header that
+ * says "Ada" above a panel that says "Your account" is the kind of small wrongness that
+ * makes a whole page feel unfinished.
+ */
+function paintAccountAvatar() {
+    const connected = Boolean(getSessionToken());
+    const source = connected && profileState.avatarData ? profileState.avatarData : '/brand.gif';
+
+    // The bare mark is kept for pages that have no account menu. On those it is the whole
+    // account affordance, and hiding it removes a control that does something.
+    const avatar = document.getElementById('account-avatar');
+    if (avatar) {
+        avatar.src = source;
+        avatar.hidden = !connected || document.getElementById('account-menu') !== null;
+    }
+
+    const name = connected ? profileState.displayName.trim() : '';
+    const email = connected ? profileState.email : '';
+
+    // The menu replaces the header's "Sign out" text entirely while signed in, so the two
+    // are never both on screen. That is the duplicate this removes: previously the header
+    // button became "Sign out" on sign-in *and* the settings card had its own, so one page
+    // offered the same destructive action twice.
+    const menu = document.getElementById('account-menu');
+    if (menu) menu.hidden = !connected;
+    const accountButton = document.getElementById('account-button');
+    if (accountButton && connected) {
+        // Signed in, the menu owns signing out. The button stays in the DOM for pages that
+        // still need it, but it is not shown on this one.
+        accountButton.hidden = document.getElementById('account-menu') !== null;
+    }
+
+    for (const id of ['account-menu-avatar', 'account-menu-avatar-lg']) {
+        const image = document.getElementById(id);
+        if (image) image.src = source;
+    }
+    for (const id of ['account-menu-name', 'account-menu-header-name']) {
+        const element = document.getElementById(id);
+        if (element) element.textContent = name || 'Your account';
+    }
+    for (const id of ['account-menu-email', 'account-menu-header-email']) {
+        const element = document.getElementById(id);
+        if (!element) continue;
+        element.textContent = email;
+        element.hidden = email.length === 0;
+    }
+
+    // The greeting. Falls back to the address's local part when no display name has been
+    // chosen, because "Welcome back" on its own is a banner and "Welcome back, ada" is a
+    // greeting -- and a new account has no name yet, which is exactly when a greeting is
+    // most welcome. Never rendered signed out.
+    const greeting = document.getElementById('account-greeting');
+    if (greeting) {
+        const salutation = name || (email ? email.split('@')[0] : '');
+        greeting.textContent = salutation ? `Welcome back, ${salutation}` : '';
+        greeting.hidden = !connected || salutation.length === 0;
+    }
+
+    // A menu left open across a sign-out would be showing the previous user's name and
+    // address to whoever signs in next on this tab.
+    if (!connected) closeAccountMenu();
+}
+
 function showPageMessage(message) {
     const box = document.getElementById('page-message');
+    if (!box) return;
     box.replaceChildren(document.createTextNode(message));
     box.hidden = false;
 }
@@ -1355,48 +2109,804 @@ function showPageMessage(message) {
 /* ---------------------------------------------------------------- account */
 
 function syncAccountControls() {
-    const connected = Boolean(sessionStorage.getItem(accountTokenKey));
+    const connected = Boolean(getSessionToken());
+    // "Connect account" only, and only while signed out.
+    //
+    // This used to become "Sign out" on sign-in, which is what made the account page offer
+    // the same destructive action twice: once here and once in the settings card. With the
+    // account menu in the header, signing out happens there, and this button is the way in
+    // rather than the way out. Its visibility is decided in `paintAccountAvatar`, which is
+    // the one place that knows whether the menu exists on this page.
     const accountButton = document.getElementById('account-button');
-    accountButton.textContent = connected ? 'Disconnect' : 'Connect account';
-    document.getElementById('deposit-button').disabled = !connected;
-    document.getElementById('withdraw-button').disabled = !connected;
+    if (accountButton) accountButton.textContent = 'Connect account';
+    paintAccountAvatar();
+
+    // The account page's balance card holds this pair and it is the only money control on
+    // screen there, so its state follows the session like everything else. The header's account
+    // menu carries the same pair on every page -- the offers page's narrow action bar mirrors
+    // those two -- which is why both sets are optional here: each page carries the ones it owns.
+    const accountDepositBtn = document.getElementById('account-menu-deposit');
+    if (accountDepositBtn) accountDepositBtn.disabled = !connected;
+    const accountWithdrawBtn = document.getElementById('account-menu-withdraw');
+    if (accountWithdrawBtn) accountWithdrawBtn.disabled = !connected;
+
+    const accountCardDepositBtn = document.getElementById('account-deposit-btn');
+    if (accountCardDepositBtn) accountCardDepositBtn.disabled = !connected;
+    const accountCardWithdrawBtn = document.getElementById('account-withdraw-btn');
+    if (accountCardWithdrawBtn) accountCardWithdrawBtn.disabled = !connected;
 
     // The notification bell is only useful when signed in; hide it (and close any
-    // open dropdown) for a logged-out visitor.
-    const bell = document.getElementById('notification-bell');
-    if (bell) {
+    // open dropdown) for a logged-out visitor. Both bells are toggled: the header one is
+    // `display: none` on a phone and the action-bar one is hidden there, so a signed-in
+    // visitor on either layout needs its own copy revealed.
+    for (const id of ['notification-bell', 'notification-bell-mobile']) {
+        const bell = document.getElementById(id);
+        if (!bell) continue;
         bell.hidden = !connected;
         if (!connected) closeNotificationDropdown();
     }
 
-    // Mirror the header state onto the narrow-screen action bar.
+    // Mirror the header state onto the narrow-screen action bar. Every mirrored control now
+    // ships `disabled` in the markup and is lifted here, so a bar button is never live while
+    // the header control it forwards to is not.
     document.querySelectorAll('[data-mirror]').forEach((barButton) => {
         const target = document.getElementById(barButton.dataset.mirror);
         if (!target) return;
         barButton.disabled = target.disabled;
-        if (target === accountButton) {
-            const label = barButton.querySelector('.action-bar-label');
-            if (label) label.textContent = connected ? 'Account' : 'Sign in';
-        }
     });
 
     if (!connected) {
-        document.getElementById('user-balance').textContent = '--';
-        document.getElementById('demo-balance').textContent = '--';
+        const userBalance = document.getElementById('user-balance');
+        if (userBalance) userBalance.textContent = '--';
+        const demoBalance = document.getElementById('demo-balance');
+        if (demoBalance) demoBalance.textContent = '--';
+        const accountBalance = document.getElementById('account-balance-main');
+        if (accountBalance) accountBalance.textContent = '--';
+        const accountDemoBalance = document.getElementById('account-demo-balance');
+        if (accountDemoBalance) accountDemoBalance.textContent = '--';
+    }
+}
+
+/**
+ * Paints the money-email switch from whatever is currently known.
+ *
+ * Three states, not two. Signed out, the switch is disabled and reads as on: there is no
+ * session to read a preference from, and painting it off would tell a signed-out visitor
+ * they had turned their receipts off when the page has no idea. Saving is its own state so a
+ * slow round trip does not let the user flip it twice and leave it somewhere they did not
+ * choose.
+ */
+function renderEmailPreference() {
+    const toggle = document.getElementById('money-emails-toggle');
+    if (!toggle) return;
+    const connected = Boolean(getSessionToken());
+    toggle.disabled = !connected || emailPrefState.saving;
+    toggle.checked = emailPrefState.enabled;
+
+    const status = document.getElementById('money-emails-status');
+    if (!status) return;
+    if (emailPrefState.saving) {
+        status.textContent = 'Saving...';
+        status.classList.remove('is-error');
+        return;
+    }
+    if (!connected) {
+        status.textContent = 'Sign in to change this.';
+        status.classList.remove('is-error');
+        return;
+    }
+    if (!emailPrefState.loaded) {
+        status.textContent = '';
+        status.classList.remove('is-error');
+        return;
+    }
+    // The confirmation is the point. A switch that silently changes leaves the user unsure
+    // whether it took, and the natural next move is to click it again -- which is how a
+    // setting gets put back the way it was by accident.
+    status.textContent = emailPrefState.enabled
+        ? 'Deposit and withdrawal emails are on.'
+        : 'Off. Everything still appears on this page and in your history.';
+    status.classList.remove('is-error');
+}
+
+/**
+ * Reads the current preference.
+ *
+ * Silent on failure: the page has not asked the user to change anything yet, so a request
+ * that did not succeed is better left unreported than shown as an error they did not cause.
+ * The switch stays on, which matches the server's own fail-open rule for the send path.
+ */
+async function loadEmailPreference() {
+    const toggle = document.getElementById('money-emails-toggle');
+    if (!toggle) return;
+    if (!getSessionToken()) {
+        emailPrefState.loaded = false;
+        emailPrefState.enabled = true;
+        renderEmailPreference();
+        return;
+    }
+    try {
+        const result = await requestJson('/api/user/email-preferences', {
+            headers: authHeaders(),
+            cache: 'no-store'
+        });
+        emailPrefState.enabled = result.moneyEmailsEnabled !== false;
+        emailPrefState.loaded = true;
+    } catch (error) {
+        if (handleUnauthorized(error)) return;
+        emailPrefState.enabled = true;
+        emailPrefState.loaded = false;
+    }
+    renderEmailPreference();
+}
+
+/**
+ * Writes the preference, and puts the switch back where it was if the write failed.
+ *
+ * The revert is the important half. An optimistic switch that stays flipped after a failed
+ * save tells the user their receipts are off when they are not -- and the failure mode of
+ * that is a missed withdrawal receipt, which is precisely what the setting exists to control.
+ */
+async function saveEmailPreference(next) {
+    const toggle = document.getElementById('money-emails-toggle');
+    if (!toggle || emailPrefState.saving) return;
+
+    const previous = emailPrefState.enabled;
+    emailPrefState.enabled = next;
+    emailPrefState.saving = true;
+    renderEmailPreference();
+
+    try {
+        const result = await requestJson('/api/user/email-preferences', {
+            method: 'PATCH',
+            headers: {
+                ...authHeaders(),
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({ moneyEmailsEnabled: Boolean(next) })
+        });
+        // Trust the stored value over the requested one, so what is shown is what is saved.
+        emailPrefState.enabled = result.moneyEmailsEnabled !== false;
+        emailPrefState.loaded = true;
+        emailPrefState.saving = false;
+        renderEmailPreference();
+        showToast(
+            emailPrefState.enabled ? 'Emails switched on' : 'Emails switched off',
+            emailPrefState.enabled
+                ? 'You will get receipts and progress updates for deposits and withdrawals.'
+                : 'You will still see everything on this page and in your history.'
+        );
+    } catch (error) {
+        emailPrefState.enabled = previous;
+        emailPrefState.saving = false;
+        renderEmailPreference();
+        if (handleUnauthorized(error)) return;
+        const status = document.getElementById('money-emails-status');
+        if (status) {
+            // Says the switch moved back rather than that "nothing changed". The user is
+            // looking at a control that snapped to a position they did not choose, and
+            // "unchanged" does not explain why it is no longer where they left it.
+            status.textContent = 'Could not save that, so the switch is back where it was.';
+            status.classList.add('is-error');
+        }
+    }
+}
+
+/* ---------------------------------------------------------------- account data */
+
+/**
+ * Quotes one CSV field.
+ *
+ * The naive `field.replace(/"/g, '""')` is not enough on its own: a value containing a
+ * comma, a newline, or a leading `=` is not just a display problem. Excel and Google Sheets
+ * both treat a cell beginning with `=`, `+`, `-`, or `@` as a formula, so a transaction
+ * description that happens to start with one is executed on open. Prefixing an apostrophe
+ * is the standard way to force the cell to be read as text, and it is invisible to the
+ * person looking at the sheet.
+ */
+function csvField(value) {
+    if (value === null || value === undefined) return '""';
+    let text = String(value);
+    if (/^[=+\-@\t\r]/.test(text)) text = `'${text}`;
+    return `"${text.replace(/"/g, '""')}"`;
+}
+
+/**
+ * Downloads the account's transactions as a CSV.
+ *
+ * Built in the browser from the same `/api/user/history` the page already renders, rather
+ * than from a new server-side export. That is a deliberate choice: it is the identical data
+ * the user is looking at, so the file and the screen cannot disagree, and there is no second
+ * query to keep in step with the first. The cost is that it covers the history endpoint's
+ * page size, which is stated in the confirmation rather than left to be discovered when the
+ * sheet turns out to be short.
+ */
+async function exportTransactions() {
+    const status = document.getElementById('account-data-status');
+    const button = document.getElementById('account-export-btn');
+    const token = getSessionToken();
+    if (!token) return;
+
+    if (button) button.disabled = true;
+    if (status) {
+        status.textContent = 'Preparing your transactions...';
+        status.classList.remove('is-error');
+    }
+
+    try {
+        const rows = await requestJson('/api/user/history', {
+            headers: { Authorization: `Bearer ${token}` },
+            cache: 'no-store'
+        });
+
+        const header = ['Date', 'Type', 'Amount (USD)', 'Description', 'Reference'];
+        const lines = [header.map(csvField).join(',')];
+        for (const row of Array.isArray(rows) ? rows : []) {
+            lines.push([
+                row.created_at || '',
+                row.transaction_type || '',
+                row.amount ?? '',
+                row.description || '',
+                row.source_id || ''
+            ].map(csvField).join(','));
+        }
+
+        // The BOM is what makes Excel read the file as UTF-8 rather than as the local
+        // codepage, which is what turns every non-ASCII character in a description into
+        // mojibake. Harmless to every other reader.
+        const csv = `\uFEFF${lines.join('\r\n')}`;
+        const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = `rewardzone-transactions-${new Date().toISOString().slice(0, 10)}.csv`;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        // Revoked on the next tick rather than immediately: Safari cancels the download if
+        // the object URL disappears in the same task that started it.
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+
+        const count = Array.isArray(rows) ? rows.length : 0;
+        if (status) {
+            status.textContent = count > 0
+                ? `Downloaded ${count} transaction${count === 1 ? '' : 's'}.`
+                : 'There are no transactions to download yet.';
+        }
+        if (button) button.disabled = false;
+    } catch (error) {
+        if (button) button.disabled = false;
+        if (handleUnauthorized(error)) return;
+        if (status) {
+            status.textContent = error.message || 'Could not build your transactions file.';
+            status.classList.add('is-error');
+        }
+    }
+}
+
+/**
+ * Copies the reference support asks for, to the clipboard.
+ *
+ * Deliberately the account *id* and not anything secret. Support needs to find the account,
+ * and the id is the only value that does that without handing over a credential -- a support
+ * agent who can paste an id into a query is useful; one holding a working session token is a
+ * liability.
+ */
+async function copyAccountReference() {
+    const status = document.getElementById('account-data-status');
+    const button = document.getElementById('account-copy-ref-btn');
+    const reference = `RewardZone account ${profileState.accountId || '(id unavailable)'} — ${profileState.email || '(no address on file)'}`;
+
+    try {
+        // The async Clipboard API is unavailable on http:// origins other than localhost,
+        // which includes any deployment still behind a plain-HTTP tunnel. It is not a rare
+        // edge: it is the whole local development environment.
+        if (navigator.clipboard?.writeText) {
+            await navigator.clipboard.writeText(reference);
+        } else {
+            throw new Error('The clipboard is not available in this browser.');
+        }
+        if (status) {
+            status.textContent = 'Copied. Paste it into a message to support.';
+            status.classList.remove('is-error');
+        }
+    } catch {
+        // The text is shown either way. A copy button that fails silently on an insecure
+        // origin is worse than no copy button, and showing the value means the feature still
+        // does the one thing it is for.
+        if (status) {
+            status.textContent = `Copy this: ${reference}`;
+            status.classList.remove('is-error');
+        }
+    }
+    if (button) button.disabled = false;
+}
+
+/**
+ * Ends every session on the account.
+ *
+ * The button is disabled for the duration rather than the request being fire-and-forget,
+ * because the response means this tab is signed out too and the user needs to be told that
+ * before they click anything else. `signOut` then clears the local copy; its own call to
+ * `/api/auth/logout` is now made with a token that no longer verifies, which is harmless
+ * because the server has already done the work by this point.
+ */
+async function revokeAllSessions() {
+    const button = document.getElementById('account-revoke-sessions-btn');
+    const status = document.getElementById('account-revoke-sessions-status');
+    const token = getSessionToken();
+    if (!token || (button && button.disabled)) return;
+
+    if (button) button.disabled = true;
+    if (status) {
+        status.textContent = 'Ending every session...';
+        status.classList.remove('is-error');
+    }
+
+    try {
+        const result = await requestJson('/api/user/sessions/revoke', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                Authorization: `Bearer ${token}`
+            },
+            body: '{}'
+        });
+        showToast('Signed out everywhere', result.message || 'Every session on this account has ended.');
+        // `leave: true` because this page needs a session and there no longer is one, so
+        // staying would leave the user staring at controls that are all about to go grey.
+        signOut({ leave: true });
+    } catch (error) {
+        if (button) button.disabled = false;
+        if (handleUnauthorized(error)) return;
+        if (status) {
+            status.textContent = error.message || 'Could not end your other sessions.';
+            status.classList.add('is-error');
+        }
+    }
+}
+
+/* ---------------------------------------------------------------- account menu */
+
+/**
+ * Opens or closes the account menu.
+ *
+ * The one piece of state is `aria-expanded` on the trigger, and the panel's `hidden` is
+ * derived from it, so the two cannot drift. A menu that is visually open while the trigger
+ * still says `collapsed` is announced as closed to a screen reader and is dismissed by the
+ * first Escape -- which reads as the menu ignoring the keyboard.
+ */
+function setAccountMenuOpen(open) {
+    const trigger = document.getElementById('account-menu-trigger');
+    const panel = document.getElementById('account-menu-panel');
+    if (!trigger || !panel) return;
+    trigger.setAttribute('aria-expanded', String(open));
+    panel.hidden = !open;
+    if (open) {
+        // Focus moves into the panel so a keyboard user is not left behind it, and lands on
+        // the first item rather than the panel itself, which is not focusable.
+        const first = panel.querySelector('.account-menu-item');
+        if (first) first.focus();
+    }
+}
+
+function closeAccountMenu() {
+    setAccountMenuOpen(false);
+}
+
+function accountMenuIsOpen() {
+    return document.getElementById('account-menu-trigger')?.getAttribute('aria-expanded') === 'true';
+}
+
+/**
+ * Wires the account menu: open on click, close on Escape, on outside click, and on blur.
+ *
+ * Closing on blur rather than only on an outside click is what makes it behave like a menu
+ * rather than a panel -- tabbing past the last item closes it, instead of leaving a floating
+ * box open behind the page while the user carries on somewhere else.
+ */
+function initAccountMenu() {
+    const trigger = document.getElementById('account-menu-trigger');
+    const panel = document.getElementById('account-menu-panel');
+    if (!trigger || !panel) return;
+
+    trigger.addEventListener('click', (event) => {
+        event.stopPropagation();
+        setAccountMenuOpen(!accountMenuIsOpen());
+    });
+
+    // Escape, and Tab out of the last item.
+    panel.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape') {
+            event.stopPropagation();
+            closeAccountMenu();
+            trigger.focus();
+            return;
+        }
+        if (event.key !== 'Tab') return;
+        const items = [...panel.querySelectorAll('.account-menu-item')].filter((item) => !item.disabled);
+        if (items.length === 0) return;
+        const first = items[0];
+        const last = items[items.length - 1];
+        // Only wrap the ends. Wrapping everywhere turns the menu into a carousel, which makes
+        // reaching anything on the page behind it with the keyboard impossible.
+        if (event.shiftKey && document.activeElement === first) {
+            event.preventDefault();
+            last.focus();
+        } else if (!event.shiftKey && document.activeElement === last) {
+            event.preventDefault();
+            first.focus();
+        }
+    });
+
+    // Any click outside the menu closes it. Capture phase, so a click that also dismisses a
+    // dialog does not reopen it on the way through.
+    document.addEventListener('click', (event) => {
+        if (!accountMenuIsOpen()) return;
+        if (!event.target.closest('#account-menu')) closeAccountMenu();
+    }, true);
+
+    // Focus leaving the menu entirely closes it, for the same reason the Tab wrap exists.
+    document.addEventListener('focusin', (event) => {
+        if (!accountMenuIsOpen()) return;
+        if (!event.target.closest('#account-menu')) closeAccountMenu();
+    });
+
+    // The menu is anchored below the trigger. On a short window it would open off the bottom
+    // of the screen, so it flips above instead of being clipped.
+    const positionMenu = () => {
+        if (!accountMenuIsOpen()) return;
+        const rect = panel.getBoundingClientRect();
+        const spaceBelow = window.innerHeight - rect.top;
+        if (rect.height > spaceBelow && rect.top > rect.height) {
+            panel.style.top = 'auto';
+            panel.style.bottom = 'calc(100% + 10px)';
+        } else {
+            panel.style.top = 'calc(100% + 10px)';
+            panel.style.bottom = 'auto';
+        }
+    };
+    window.addEventListener('resize', positionMenu, { passive: true });
+    window.addEventListener('orientationchange', positionMenu, { passive: true });
+    trigger.addEventListener('click', () => requestAnimationFrame(positionMenu));
+}
+
+/**
+ * Paints the profile card from whatever is currently known.
+ *
+ * Three states, matching the email switch's. Signed out there is no session to read a
+ * profile from, so the controls are disabled rather than showing an empty form that a save
+ * would silently attach to nobody. Loading and saving are their own states so a slow round
+ * trip cannot let the user press save twice, which on a partial form would send the second
+ * request for the same change and report a confusing sequence of successes.
+ */
+function renderProfileEditor() {
+    // The header identity is painted first and unconditionally. It used to sit *after* the
+    // early return below, which is the second half of the bug this was written for: the
+    // guard correctly skipped the editor on a page that has no editor, and then skipped the
+    // account menu and greeting with it. So on the offers page -- which has a menu and no
+    // editor -- the header kept its initial "Your account" and brand mark forever, and
+    // loading the profile changed nothing visible.
+    paintAccountAvatar();
+
+    const nameInput = document.getElementById('profile-display-name');
+    const preview = document.getElementById('profile-avatar-preview');
+    const removeBtn = document.getElementById('profile-avatar-remove');
+    const saveBtn = document.getElementById('profile-save');
+    const avatarInput = document.getElementById('profile-avatar-input');
+    if (!nameInput || !saveBtn) return;
+
+    const connected = Boolean(getSessionToken());
+    const picture = profileState.avatarData;
+
+    if (preview) preview.src = picture || '/brand.gif';
+    if (removeBtn) removeBtn.hidden = !picture || !connected;
+    if (avatarInput) avatarInput.disabled = !connected || profileState.saving;
+
+    nameInput.disabled = !connected || profileState.saving;
+    saveBtn.disabled = !connected || profileState.saving || !profileState.dirty;
+
+    const status = document.getElementById('profile-status');
+    if (!status) return;
+    if (profileState.saving) {
+        status.textContent = 'Saving...';
+        status.classList.remove('is-error');
+        return;
+    }
+    if (!connected) {
+        status.textContent = 'Sign in to change this.';
+        status.classList.remove('is-error');
+        return;
+    }
+    if (!profileState.loaded) {
+        status.textContent = '';
+        status.classList.remove('is-error');
+    }
+}
+
+/**
+ * Records that the form no longer matches what is stored, which is what enables Save.
+ *
+ * Comparing the working values against the last confirmed ones is the honest definition of
+ * "changed". A save button that is merely always-on would let a user press it with nothing
+ * to save and get a confirmation for a write that changed nothing; a button that is enabled
+ * per-keystroke by any edit would go dead the moment the user typed a name and then deleted
+ * it back to exactly what was already stored.
+ */
+function updateProfileDirty() {
+    profileState.dirty =
+        profileState.displayName !== profileState.saved.displayName ||
+        profileState.avatarData !== profileState.saved.avatarData;
+    renderProfileEditor();
+}
+
+/**
+ * Reads the profile from the server.
+ *
+ * Silent on failure, like the email preference: the page has not asked the user to change
+ * anything yet, so a request that did not succeed is better left unreported than surfaced
+ * as an error they did not cause. The card stays empty and editable, and a save that then
+ * works is the real answer.
+ */
+/**
+ * Reads the profile from the server.
+ *
+ * Runs on every page that shows *any* of the account identity, not only the one with the
+ * profile editor in it. The gate used to be `#profile-display-name`, which exists only on the
+ * account page -- so on the offers page the header had nothing to draw from and painted the
+ * fallback: "Your account" and the brand mark, for a visitor who was signed in and had a name
+ * and a picture saved. The session and the profile are two facts, and the page was reading
+ * one of them.
+ *
+ * Silent on failure, like the email preference: the page has not asked the user to change
+ * anything yet, so a request that did not succeed is better left unreported than surfaced
+ * as an error they did not cause. The controls stay empty and editable, and a save that then
+ * works is the real answer.
+ */
+async function loadProfile() {
+    // Any of these means the page draws the account's name or picture. The editor is the
+    // one that is optional; the menu and the bare mark are the ones that must be fed.
+    const hasIdentity = Boolean(
+        document.getElementById('profile-display-name') ||
+        document.getElementById('account-menu') ||
+        document.getElementById('account-avatar')
+    );
+    if (!hasIdentity) return;
+
+    if (!getSessionToken()) {
+        profileState.loaded = false;
+        profileState.dirty = false;
+        profileState.email = '';
+        profileState.accountId = null;
+        renderProfileEditor();
+        return;
+    }
+
+    try {
+        const result = await requestJson('/api/user/profile', {
+            headers: authHeaders(),
+            cache: 'no-store'
+        });
+        profileState.displayName = result.displayName || '';
+        profileState.avatarData = result.avatarData || null;
+        profileState.email = result.email || sessionStorage.getItem(accountEmailKey) || '';
+        profileState.accountId = result.id ?? null;
+        // What the server reported, not what was typed into the form. Without this the `saved`
+        // baseline stays empty, `updateProfileDirty` sees a difference on a freshly loaded
+        // page, and Save is enabled with nothing to save.
+        profileState.saved = { displayName: profileState.displayName, avatarData: profileState.avatarData };
+        profileState.loaded = true;
+    } catch (error) {
+        profileState.loaded = false;
+        if (handleUnauthorized(error)) return;
+    }
+
+    const nameInput = document.getElementById('profile-display-name');
+    // Only written when the user is not mid-edit. A response that lands after they have
+    // started typing would otherwise replace what they are typing with what they typed
+    // before, which reads as the field fighting back.
+    if (nameInput && !profileState.dirty) nameInput.value = profileState.displayName;
+    updateProfileDirty();
+}
+
+/**
+ * Turns a picked file into the data URL that will actually be stored.
+ *
+ * The file is decoded, drawn centred and square-cropped onto a canvas, and re-encoded as
+ * PNG. Doing the resize here rather than asking the server to do it is what keeps the
+ * request inside the 32 KB body limit and the stored row inside its 16 KB cap, and it means
+ * the user picks any picture their device has rather than having to pre-crop one to a
+ * square themselves.
+ *
+ * `Promise` around the `FileReader` because the alternative is an event handler that has to
+ * remember what to do on failure, and a rejected promise routes into the same error path as
+ * everything else in this file.
+ */
+function readPickedAvatar(file) {
+    return new Promise((resolve, reject) => {
+        // Checked before the reader, because the reader will happily pull 10 MB into a data
+        // URL and the decode below will then run for a second and a half before failing on a
+        // file that was never going to be usable. `size` is metadata the browser already has,
+        // so this costs nothing. The message names the real limit and says what it means in
+        // the units people check in their file manager, because "too large" alone makes a
+        // user re-pick the same photo twice.
+        if (file.size > PROFILE_AVATAR_MAX_SOURCE_BYTES) {
+            const limitMb = Math.round(PROFILE_AVATAR_MAX_SOURCE_BYTES / (1024 * 1024));
+            const actualMb = (file.size / (1024 * 1024)).toFixed(1);
+            reject(new Error(`That photo is ${actualMb} MB, and the limit is ${limitMb} MB. `
+                + 'Most phones can make a smaller one: in Photos, use Share and choose '
+                + 'Save a Copy or Compress, or take a screenshot of it.'));
+            return;
+        }
+
+        // HEIC is what an iPhone camera produces and most desktops cannot decode. It is
+        // checked before anything else so the message can say what to do about it, rather
+        // than surfacing as a generic "that file is not an image we can use" after a decode
+        // attempt that was never going to work. Safari can open HEIC, so the image path is
+        // still attempted -- this is a hint, not a refusal.
+        const isHeic = /image\/(heic|heif)/i.test(file.type) || /\.hei[cf]$/i.test(file.name);
+
+        const reader = new FileReader();
+        reader.onerror = () => reject(new Error('That file could not be read.'));
+        reader.onload = () => {
+            const image = new Image();
+            image.onerror = () => reject(new Error(isHeic
+                ? 'That looks like a HEIC photo, which this browser cannot open. In Photos, choose Export and pick JPEG, or take the screenshot.'
+                : 'That file is not an image this browser can open.'));
+            image.onload = () => {
+                try {
+                    const size = PROFILE_AVATAR_SIZE;
+                    const canvas = document.createElement('canvas');
+                    canvas.width = size;
+                    canvas.height = size;
+                    const context = canvas.getContext('2d');
+                    if (!context) {
+                        reject(new Error('This browser cannot prepare the picture.'));
+                        return;
+                    }
+                    // Centre crop: the longest edge fills the square and the overflow is
+                    // trimmed equally from both sides, so a wide photo is not squashed into
+                    // a circle by being stretched to fit.
+                    const scale = Math.max(size / image.width, size / image.height);
+                    const width = image.width * scale;
+                    const height = image.height * scale;
+                    context.drawImage(
+                        image,
+                        (size - width) / 2,
+                        (size - height) / 2,
+                        width,
+                        height
+                    );
+                    // Always PNG, whatever came in. The browser has already decoded the
+                    // original, so this normalises every accepted format to one the server
+                    // can verify from its first eight bytes -- and a 1x1 or 0x0 image is
+                    // refused here rather than being stored as a blank square.
+                    if (image.width < 1 || image.height < 1) {
+                        reject(new Error('That image is too small to use.'));
+                        return;
+                    }
+                    resolve(canvas.toDataURL('image/png'));
+                } catch {
+                    reject(new Error('That file could not be prepared.'));
+                }
+            };
+            image.src = String(reader.result);
+        };
+        reader.readAsDataURL(file);
+    });
+}
+
+/**
+ * Saves whichever of the two fields the user actually changed.
+ *
+ * Only the changed fields are sent. A request carrying both would need the client to know
+ * the current value of the one it is not changing, and reading it first is a race between
+ * two open tabs -- so a name change in one tab and a picture change in the other would
+ * lose one of them. Sending just the edits makes each save mean exactly what it says.
+ */
+async function saveProfile() {
+    if (!getSessionToken() || profileState.saving || !profileState.dirty) return;
+
+    const patch = {};
+    if (profileState.displayName !== profileState.saved.displayName) {
+        patch.displayName = profileState.displayName;
+    }
+    if (profileState.avatarData !== profileState.saved.avatarData) {
+        patch.avatarData = profileState.avatarData;
+    }
+    if (Object.keys(patch).length === 0) return;
+
+    profileState.saving = true;
+    renderProfileEditor();
+
+    try {
+        const result = await requestJson('/api/user/profile', {
+            method: 'PATCH',
+            headers: {
+                ...authHeaders(),
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify(patch)
+        });
+        // What the server stored, not what was submitted. A name is trimmed and its spacing
+        // collapsed there, and reporting the submitted value would show the user a name
+        // that is not the one on their account.
+        profileState.displayName = result.displayName || '';
+        profileState.avatarData = result.avatarData || null;
+        // The save response carries the whole resource, so the identity is refreshed from
+        // the same answer rather than left over from a read that is now stale.
+        if (result.email) profileState.email = result.email;
+        if (result.id) profileState.accountId = result.id;
+        profileState.saved = { displayName: profileState.displayName, avatarData: profileState.avatarData };
+        profileState.saving = false;
+        profileState.loaded = true;
+
+        const nameInput = document.getElementById('profile-display-name');
+        if (nameInput) nameInput.value = profileState.displayName;
+        updateProfileDirty();
+        showToast('Profile saved', 'Your name and picture are updated on this account.');
+    } catch (error) {
+        profileState.saving = false;
+        renderProfileEditor();
+        if (handleUnauthorized(error)) return;
+        const status = document.getElementById('profile-status');
+        if (status) {
+            status.textContent = error.message || 'Could not save your profile.';
+            status.classList.add('is-error');
+        }
+        // Re-read rather than trusting the form: the value that failed may be one the
+        // server rejected for a reason the form never applied, and leaving it in place
+        // invites the user to press the same button again.
+        await loadProfile();
     }
 }
 
 function handleAccountButton() {
-    if (sessionStorage.getItem(accountTokenKey)) {
-        signOut();
+    if (getSessionToken()) {
+        // The explicit choice to sign out, so it also leaves a page that needs a session --
+        // see `signOut`. An expired session is different: the visitor did not choose that,
+        // and is sent to sign in again instead of to the front page.
+        signOut({ leave: true });
         setFormMessage('account-message', '');
         return;
     }
-    document.getElementById('account-email').value = '';
-    document.getElementById('account-password').value = '';
+    // On a page that is already the sign-in page, the dialog is right there. On any other
+    // page -- the home page, which is the one place a signed-out visitor can still be -- the
+    // dialog does not exist, so "Connect account" would have been a button that silently did
+    // nothing. It goes to the sign-in page instead, carrying this page along so the visitor
+    // lands back on it afterwards.
+    if (!document.getElementById('account-dialog') && window.RewardZoneSession) {
+        window.RewardZoneSession.goToLogin(window.RewardZoneSession.currentReturnPath());
+        return;
+    }
+    const email = document.getElementById('account-email');
+    const password = document.getElementById('account-password');
+    if (email) email.value = '';
+    if (password) password.value = '';
     setFormMessage('account-message', '');
     setAuthMode('login');
-    document.getElementById('account-dialog').showModal();
+    const dialog = document.getElementById('account-dialog');
+    if (dialog) dialog.showModal();
+}
+
+/**
+ * "Change password" on the account page.
+ *
+ * There is no password form for a signed-in user, and building one would mean deciding what
+ * proof it needs (current password? a fresh emailed token?) and how it interacts with
+ * `token_version`. The flow that already exists, and that the card's own copy describes, is
+ * the emailed reset: `forgotPassword` issues a single-use token and the link in the message
+ * sets the new password. So the button opens the account dialog already in its `forgot` mode,
+ * rather than a dialog that looks like it will change the password and cannot.
+ *
+ * Note this does not sign the visitor out. The reset link lands them on `/reset-password`,
+ * which is a separate page and completes on its own.
+ */
+function openPasswordReset() {
+    setFormMessage('account-message', '');
+    setAuthMode('forgot');
+    const dialog = document.getElementById('account-dialog');
+    if (dialog) dialog.showModal();
+    document.getElementById('account-email')?.focus();
 }
 
 function setAuthMode(mode) {
@@ -1408,19 +2918,25 @@ function setAuthMode(mode) {
     const password = document.getElementById('account-password');
     const passwordLabel = document.getElementById('account-password-label');
 
+    if (!form || !title || !submit) return;
+
     form.dataset.authMode = forgot ? 'forgot' : register ? 'register' : 'login';
     title.textContent = forgot ? 'Reset your password' : register ? 'Create your account' : 'Welcome back';
     submit.textContent = forgot ? 'Email me a reset link' : register ? 'Create account' : 'Sign in';
 
     // The password row is hidden during a reset. The `hidden` attribute is enough
     // because the stylesheet forces `[hidden]` to win over component display rules.
-    passwordLabel.hidden = forgot;
-    password.hidden = forgot;
-    password.required = !forgot;
-    password.autocomplete = register ? 'new-password' : 'current-password';
-    password.minLength = register ? 12 : 1;
-    document.getElementById('password-hint').hidden = !register;
-    document.getElementById('forgot-password-link').hidden = register || forgot;
+    if (passwordLabel) passwordLabel.hidden = forgot;
+    if (password) {
+        password.hidden = forgot;
+        password.required = !forgot;
+        password.autocomplete = register ? 'new-password' : 'current-password';
+        password.minLength = register ? 12 : 1;
+    }
+    const passwordHint = document.getElementById('password-hint');
+    if (passwordHint) passwordHint.hidden = !register;
+    const forgotLink = document.getElementById('forgot-password-link');
+    if (forgotLink) forgotLink.hidden = register || forgot;
 
     document.querySelectorAll('[data-auth-mode]').forEach((button) => {
         const selected = button.dataset.authMode === form.dataset.authMode;
@@ -1443,9 +2959,12 @@ function setAuthMode(mode) {
 function showVerifyStep(email, expiresInMinutes) {
     const step = document.getElementById('verify-step');
     const form = document.getElementById('account-form');
+    if (!step || !form) return;
 
-    document.getElementById('verify-email').textContent = email;
-    document.getElementById('verify-expiry').textContent = expiresInMinutes
+    const verifyEmail = document.getElementById('verify-email');
+    if (verifyEmail) verifyEmail.textContent = email;
+    const verifyExpiry = document.getElementById('verify-expiry');
+    if (verifyExpiry) verifyExpiry.textContent = expiresInMinutes
         ? `It expires in ${expiresInMinutes} minutes.`
         : '';
 
@@ -1455,9 +2974,12 @@ function showVerifyStep(email, expiresInMinutes) {
     form.dataset.verifyEmail = email;
 
     setFormMessage('verify-message', '');
-    document.getElementById('verify-code').value = '';
-    document.getElementById('verify-submit').disabled = false;
-    document.getElementById('verify-resend').disabled = false;
+    const verifyCode = document.getElementById('verify-code');
+    if (verifyCode) verifyCode.value = '';
+    const verifySubmit = document.getElementById('verify-submit');
+    if (verifySubmit) verifySubmit.disabled = false;
+    const verifyResend = document.getElementById('verify-resend');
+    if (verifyResend) verifyResend.disabled = false;
 
     for (const id of ['account-email', 'account-password', 'account-password-label',
         'password-hint', 'connect-submit', 'forgot-password-link', 'account-message']) {
@@ -1467,7 +2989,7 @@ function showVerifyStep(email, expiresInMinutes) {
     document.querySelector('.auth-mode')?.setAttribute('hidden', '');
 
     step.hidden = false;
-    document.getElementById('verify-code').focus();
+    if (verifyCode) verifyCode.focus();
 }
 
 function hideVerifyStep() {
@@ -1481,7 +3003,8 @@ function hideVerifyStep() {
     }
     const tabs = document.querySelector('.auth-mode');
     if (tabs) tabs.removeAttribute('hidden');
-    document.getElementById('account-form').dataset.verifyEmail = '';
+    const form = document.getElementById('account-form');
+    if (form) form.dataset.verifyEmail = '';
 }
 
 /**
@@ -1492,9 +3015,13 @@ function hideVerifyStep() {
  */
 async function submitVerification() {
     const form = document.getElementById('account-form');
-    const email = form.dataset.verifyEmail || document.getElementById('account-email').value.trim();
-    const code = document.getElementById('verify-code').value.trim();
+    const emailEl = document.getElementById('account-email');
+    const verifyCode = document.getElementById('verify-code');
     const button = document.getElementById('verify-submit');
+    if (!button || !form || !verifyCode) return;
+
+    const email = form.dataset.verifyEmail || (emailEl ? emailEl.value.trim() : '');
+    const code = verifyCode.value.trim();
 
     if (!/^\d{6}$/.test(code)) {
         setFormMessage('verify-message', 'Enter the 6-digit code from your email.', 'error');
@@ -1518,16 +3045,19 @@ async function submitVerification() {
         button.textContent = 'Confirm email';
         // The field is cleared and refocused: a rejected code should not sit there being
         // retyped character by character, and the next one may have come from a new email.
-        document.getElementById('verify-code').value = '';
-        document.getElementById('verify-code').focus();
+        verifyCode.value = '';
+        verifyCode.focus();
     }
 }
 
 /** Asks for another code. The address is shown, so a wrong entry is corrected here. */
 async function resendVerificationCode() {
     const form = document.getElementById('account-form');
-    const email = form.dataset.verifyEmail || document.getElementById('account-email').value.trim();
+    const emailEl = document.getElementById('account-email');
     const button = document.getElementById('verify-resend');
+    if (!button || !form) return;
+
+    const email = form.dataset.verifyEmail || (emailEl ? emailEl.value.trim() : '');
 
     button.disabled = true;
     setFormMessage('verify-message', '');
@@ -1555,9 +3085,12 @@ async function resendVerificationCode() {
  */
 async function sendMagicLink() {
     const form = document.getElementById('account-form');
-    const email = form.dataset.verifyEmail || document.getElementById('account-email').value.trim();
+    const emailEl = document.getElementById('account-email');
     const button = document.getElementById('verify-magic-link');
     const messageBox = document.getElementById('verify-message');
+    if (!button || !form) return;
+
+    const email = form.dataset.verifyEmail || (emailEl ? emailEl.value.trim() : '');
 
     button.disabled = true;
     button.textContent = 'Sending magic link...';
@@ -1594,15 +3127,28 @@ async function sendMagicLink() {
  * so it never lands in browser history or gets copied by the user.
  */
 function checkMagicLinkReturn() {
-    const fragment = window.location.hash.startsWith('#') ? window.location.hash.slice(1) : '';
+    // The token is looked for in the fragment first and in the return path second, because
+    // a magic link is an email addressed to someone who is not signed in yet. The gate
+    // therefore intercepted it on the way to the sign-in page, and carried the fragment
+    // along inside `next` rather than leaving it in the address bar -- reading only the
+    // fragment made every magic link a dead link the moment a page became private.
+    let fragment = window.location.hash.startsWith('#') ? window.location.hash.slice(1) : '';
+    if (!fragment) {
+        const pending = new URLSearchParams(window.location.search).get('next');
+        const hashIndex = typeof pending === 'string' ? pending.indexOf('#') : -1;
+        if (hashIndex !== -1) fragment = pending.slice(hashIndex + 1);
+    }
     if (!fragment) return;
     const params = new URLSearchParams(fragment);
     const token = params.get('magic');
     if (!token || !/^[0-9a-f]{64}$/i.test(token)) return;
 
-    // Remove the fragment from the address bar immediately, before any navigation.
-    window.history.replaceState(null, '', window.location.pathname + window.location.search);
+    // Remove the fragment from the address bar immediately, before any navigation, and drop
+    // the return path with it: the token has been used to sign in, so the page it was
+    // addressed to is no longer somewhere the visitor needs sending back to.
+    window.history.replaceState(null, '', window.location.pathname);
     window.location.hash = '';
+    magicLinkPending = true;
 
     exchangeMagicLink(token);
 }
@@ -1622,13 +3168,76 @@ async function exchangeMagicLink(token) {
         });
         completeSignIn(data);
     } catch (error) {
+        // The link did not work. The visitor is standing on the sign-in page with no way
+        // forward unless the form is in front of them, which is the only thing that turns a
+        // dead link into a way to sign in.
+        magicLinkPending = false;
         showToast('Magic link failed', error.message || 'Could not sign in with that link.', { tone: 'error' });
+        const dialog = document.getElementById('account-dialog');
+        if (dialog && !dialog.open) {
+            setFormMessage('account-message', 'That link did not work. Sign in with your password, or ask for a new one.');
+            setAuthMode('login');
+            dialog.showModal();
+        }
     }
 }
 
 /** Everything that has to happen once a session exists, for either sign-in route. */
 function completeSignIn(data) {
+    // The token is checked before it is stored, not after.
+    //
+    // `setItem(key, undefined)` does not throw and does not store `undefined` -- it stores the
+    // string "undefined". So a sign-in response that was not the expected shape, which any
+    // 200-with-an-error-body from a proxy or a renamed API field will produce, put a non-token
+    // into the session slot. Everything downstream then believed it was signed in and sent
+    // `Bearer undefined`, and the server logged a `jwt malformed` rejection for every request
+    // from then on, including one per live-sync poll.
+    //
+    // A response without a usable token is a failed sign-in, so it is treated as one: nothing
+    // is written, whatever was there before is cleared, and the caller is told. `getSessionToken`
+    // is the same test applied on the way out, which covers slots poisoned by an older build
+    // that this one can never repair.
+    // `data.token`, not `data`.
+    //
+    // `getSessionTokenFrom` takes the string. Handed the response object it sees a non-string
+    // and returns null, so *every* successful sign-in took the branch below and threw "Sign in
+    // did not return a session" with a perfectly good token sitting in the response. The check
+    // was added to stop `setItem(key, undefined)` storing the string "undefined", and it did --
+    // by refusing every session, which is a worse version of the same fault.
+    if (!getSessionTokenFrom(data.token)) {
+        try {
+            sessionStorage.removeItem(accountTokenKey);
+            sessionStorage.removeItem(accountEmailKey);
+        } catch {
+            // Storage unavailable; there is nothing to clear and nothing was written.
+        }
+        throw new Error('Sign-in did not return a session. Please try again.');
+    }
+
     sessionStorage.setItem(accountTokenKey, data.token);
+    if (data.user?.email) sessionStorage.setItem(accountEmailKey, data.user.email);
+
+    // Where the visitor was sent from. Read before anything else, because the session now
+    // exists and the gate would let them stay on this page either way -- the sign-in would
+    // "work" and leave them looking at a sign-in page they had already satisfied, which is
+    // the same dead end as a gate that never returns anyone.
+    //
+    // On the sign-in page there is a destination even when the visitor did not name one: it
+    // is a page with nothing on it but the form, so staying put would leave a signed-in
+    // person staring at a sign-in form. The account page is where "connect account" means
+    // they are trying to end up. Everywhere else -- the header button on a public page, or
+    // the dialog over a page they were already on -- no destination was named and the right
+    // answer is to stay where they are, because the page behind the form is the one they
+    // were already using.
+    const onward = window.RewardZoneSession
+        ? (window.RewardZoneSession.consumeReturnTo()
+            || (window.RewardZoneSession.isLoginPath() ? '/account' : null))
+        : null;
+    if (onward) {
+        window.location.replace(onward);
+        return;
+    }
+
     applyBalance(data.user.balance, data.user.demoBalance);
     // The bar and the header have to agree the moment a session exists, because the
     // header controls were disabled for a signed-out visitor and the mirrored ones were
@@ -1636,21 +3245,30 @@ function completeSignIn(data) {
     // the live sync's indicator for the first time.
     syncAccountControls();
     paintLiveIndicator();
+    loadEmailPreference();
+    loadProfile();
     syncNow();
 
     hideVerifyStep();
-    document.getElementById('account-dialog').close();
-    document.getElementById('account-password').value = '';
+    const dialog = document.getElementById('account-dialog');
+    if (dialog) dialog.close();
+    const password = document.getElementById('account-password');
+    if (password) password.value = '';
     // A deposit created before sign-in would have been blocked, so a fresh catalog
     // read is enough; no history needs reloading here.
 }
 
 async function connectAccount(event) {
     event.preventDefault();
-    const email = document.getElementById('account-email').value.trim();
-    const password = document.getElementById('account-password').value;
+    const emailEl = document.getElementById('account-email');
+    const passwordEl = document.getElementById('account-password');
     const button = document.getElementById('connect-submit');
-    const mode = document.getElementById('account-form').dataset.authMode || 'login';
+    const form = document.getElementById('account-form');
+    if (!button || !form) return;
+
+    const email = emailEl ? emailEl.value.trim() : '';
+    const password = passwordEl ? passwordEl.value : '';
+    const mode = form.dataset.authMode || 'login';
 
     button.disabled = true;
     button.textContent = mode === 'register' ? 'Creating...' : mode === 'forgot' ? 'Sending...' : 'Signing in...';
@@ -1664,6 +3282,7 @@ async function connectAccount(event) {
                 body: JSON.stringify({ email })
             });
             setFormMessage('account-message', data.message, 'success');
+            showToast('Reset link sent', data.message || 'Check your email for a password reset link.', { tone: 'success' });
             return;
         }
 
@@ -1705,8 +3324,20 @@ async function connectAccount(event) {
 }
 
 function applyBalance(balance, demoBalance) {
-    document.getElementById('user-balance').textContent = formatBalance(balance);
-    document.getElementById('demo-balance').textContent = formatBalance(demoBalance);
+    const userBalance = document.getElementById('user-balance');
+    if (userBalance) userBalance.textContent = formatBalance(balance);
+    const demoBalanceEl = document.getElementById('demo-balance');
+    if (demoBalanceEl) demoBalanceEl.textContent = formatBalance(demoBalance);
+
+    // The account page shows the same two figures a second time, in the balance card, under
+    // their own ids. Every write to the header pair has to be mirrored here or the account
+    // page shows `--` forever even with a live session, which is what it did.
+    const accountBalance = document.getElementById('account-balance-main');
+    if (accountBalance) accountBalance.textContent = formatBalance(balance);
+    const accountDemoBalanceEl = document.getElementById('account-demo-balance');
+    if (accountDemoBalanceEl) accountDemoBalanceEl.textContent = formatBalance(demoBalance);
+
+    const previous = accountState.balance;
     accountState.balance = Number(balance);
     // Seed the live-sync baseline so reward detection works from the first poll,
     // not the second one. Only set when NaN so a live update does not clobber
@@ -1714,10 +3345,16 @@ function applyBalance(balance, demoBalance) {
     if (!Number.isFinite(liveState.lastKnownBalance)) liveState.lastKnownBalance = Number(balance);
     if (!Number.isFinite(liveState.lastKnownDemoBalance)) liveState.lastKnownDemoBalance = Number(demoBalance ?? 0);
     syncWithdrawBalance();
+
+    // After the write, so the flash runs off the new figure, and only when the number really
+    // moved -- `previous` is NaN on the first load, which is a first figure rather than a
+    // change, and is not something to announce.
+    noteBalanceChange(previous, accountState.balance);
+    paintBalanceFreshness();
 }
 
 async function refreshBalance() {
-    const token = sessionStorage.getItem(accountTokenKey);
+    const token = getSessionToken();
     if (!token) return;
 
     try {
@@ -1797,9 +3434,42 @@ function updateWithdrawAmountHint() {
 
 /* --------------------------------------------------------------- deposits */
 
+/**
+ * Runs the money action a hash asks for, once, on arrival.
+ *
+ * The header's account menu is on every page but the money dialogs are not, so a page without
+ * them sends the visitor here to run the action (`openDeposits` and `openWithdrawal`). Landing
+ * on the account page with the dialog still shut would ask for one more tap to finish what the
+ * button they pressed already said, so the hash carries which one it was.
+ *
+ * The hash is dropped with `replaceState` before the dialog opens, so a refresh reopens the
+ * page rather than the dialog, and the browser's back button still goes back where it came
+ * from. A hash that is not one of these two is left alone: `#profile-settings` and `#history`
+ * are real anchors on this page and the browser handles them.
+ */
+function openMoneyActionFromHash() {
+    const action = window.location.hash.slice(1);
+    if (action !== 'add-funds' && action !== 'withdraw') return;
+    if (!getSessionToken()) return;
+    window.history.replaceState(null, '', window.location.pathname + window.location.search);
+    if (action === 'add-funds') openDeposits();
+    else openWithdrawal();
+}
+
 function openDeposits() {
-    if (!sessionStorage.getItem(accountTokenKey)) {
-        document.getElementById('account-dialog').showModal();
+    if (!getSessionToken()) {
+        const dialog = document.getElementById('account-dialog');
+        if (dialog) dialog.showModal();
+        return;
+    }
+    // The deposit dialog lives on the account and offers pages, and the header's account menu
+    // is on every page -- including the home page, which has the menu and not the dialog. The
+    // menu item was therefore a control that closed the menu and did nothing at all, which
+    // reads as a broken app rather than as a missing feature. A page without the dialog is sent
+    // to the account page, which has it, rather than swallowing the tap.
+    const depositDialog = document.getElementById('deposit-dialog');
+    if (!depositDialog) {
+        window.location.assign('/account#add-funds');
         return;
     }
     // The same reset a repeat deposit uses, so reopening the dialog after a completed
@@ -1807,7 +3477,7 @@ function openDeposits() {
     // "Generating address...", and the previous countdown still ticking against a
     // deposit the user can no longer see.
     resetDepositForAnother();
-    document.getElementById('deposit-dialog').showModal();
+    depositDialog.showModal();
     loadDepositOptions();
     loadDepositHistory();
 }
@@ -1825,6 +3495,7 @@ function clampDepositAmountToRange() {
     const input = document.getElementById('deposit-amount');
     const minimum = minimumForSelectedCurrency();
     const maximum = maximumForSelectedCurrency();
+    if (!input) return;
     const current = Number(input.value);
     if (!Number.isFinite(current)) return;
     if (current >= minimum && current <= maximum) return;
@@ -1838,39 +3509,17 @@ function clampDepositAmountToRange() {
 }
 
 /**
- * The smallest amount the provider will accept for the currency currently picked.
+ * The floor the amount box itself enforces.
  *
- * NOWPayments enforces a floor per currency pair, and it is well above a nominal $1 for
- * most coins. The server reports the real one per currency; the picker-level minimum is
- * only the smallest of those, so it is the per-currency value that has to be applied
- * while the user changes coins.
- */
-/**
- * The floor the amount box itself enforces: the app's own $1.00.
- *
- * This is deliberately NOT the selected coin's provider minimum. Pinning `min` to a
- * volatile, pair-specific figure meant the advertised $1.00 minimum was unreachable for
- * every coin NOWPayments happens to charge $18 to, and the visible symptom was the amount
- * silently jumping to a number the user never typed. The provider's real floor is
- * reported separately by `providerMinimumForSelectedCurrency`, shown as guidance, and
- * still enforced at payment creation.
+ * For crypto this is only a guard against a blank or negative field: the provider is the only
+ * party that knows what it will accept, its figure moves between reads, and hard-coding it here
+ * made the form jump to a number the user never typed. Card deposits keep the app's $1.00,
+ * which is a real network/processing floor rather than a guess.
  */
 function minimumForSelectedCurrency() {
+    if (depositState.method === 'crypto') return 0.01;
     const appMinimum = depositState.options?.appMinimumUsd;
     return Number.isFinite(appMinimum) && appMinimum > 0 ? appMinimum : 1;
-}
-
-/**
- * The coin's real provider floor, or null when the provider has not imposed one.
- */
-function providerMinimumForSelectedCurrency() {
-    if (depositState.method !== 'crypto') return null;
-    const currency = document.getElementById('deposit-currency')?.value;
-    const perCurrency = depositState.options?.minimums?.[currency];
-    // Only meaningful when it sits above the app's own floor; otherwise it is noise.
-    return Number.isFinite(perCurrency) && perCurrency > minimumForSelectedCurrency()
-        ? perCurrency
-        : null;
 }
 
 /**
@@ -1891,13 +3540,13 @@ function maximumForSelectedCurrency() {
 }
 
 /**
- * States the limit that actually applies right now, so the reason a coin was rejected is
- * visible before the user submits rather than after.
+ * States the bounds the form actually applies.
  *
- * Two facts, deliberately kept apart. The app's own range is the headline, because that is
- * what the box accepts. The provider's per-coin floor is appended as a second sentence, so
- * someone who types a $5 BCH deposit learns why it is refused *before* they submit rather
- * than from a server error afterwards.
+ * For crypto that is deliberately not a provider figure. The provider's quoted minimum moves
+ * between reads and is different per coin, so putting it here made the one number a user reads
+ * before typing disagree with the one that decides acceptance -- and made a small deposit look
+ * like it should work and then fail. The provider is asked instead, and the server translates a
+ * real refusal into a sentence with a number in it.
  */
 function updateDepositAmountHint() {
     const hint = document.getElementById('deposit-amount-hint');
@@ -1907,49 +3556,64 @@ function updateDepositAmountHint() {
 
     const minimum = minimumForSelectedCurrency();
     const maximum = maximumForSelectedCurrency();
-    const providerMinimum = providerMinimumForSelectedCurrency();
 
-    let text = `Minimum ${formatBalance(minimum)}. Maximum ${formatBalance(maximum)}.`;
-    if (providerMinimum) {
-        const currency = document.getElementById('deposit-currency')?.value;
-        const symbol = cryptoCurrencyNames[currency] || String(currency || '').toUpperCase();
-        text += ` ${symbol} deposits start at ${formatBalance(providerMinimum)}.`;
-    }
-    hint.textContent = text;
+    hint.textContent = depositState.method === 'crypto'
+        ? `No minimum set by us. Maximum ${formatBalance(maximum)}.`
+        : `Minimum ${formatBalance(minimum)}. Maximum ${formatBalance(maximum)}.`;
     validateDepositAmount();
 }
 
 /**
- * Warns about an amount the provider will refuse, before the user submits.
+ * The one place the deposit button is turned back on.
  *
- * The box accepts anything from the app's $1.00, so a $5 Bitcoin Cash deposit is
- * submittable and then rejected by NOWPayments with a server error. Saying so while the
- * amount is still being typed turns a failed submission into a visible, correctable
- * field. It only annotates: it never rewrites the amount, because an amount the user
- * typed and is still editing is not ours to silently replace.
+ * It is never turned off for the amount. The provider's quoted minimum is an advisory figure
+ * that moves between reads, and gating submission on it made deposits impossible to create for
+ * amounts the provider would in fact have taken: the form simply refused to submit, with no
+ * way for the user to find out why. The provider is asked instead, and the server's
+ * `isProviderMinimumRefusal` path turns a real refusal into a message with a number in it.
+ *
+ * What remains here is the genuinely blocking case -- no payment method available at all, or a
+ * chosen coin that is disabled. No amount fixes those, and a live button that goes nowhere is
+ * worse than a dead one.
+ */
+function setDepositSubmitEnabled() {
+    const submit = document.getElementById('deposit-submit');
+    if (submit) submit.disabled = Boolean(depositBlockedForAvailability());
+}
+
+/**
+ * Whether a deposit cannot be created at all right now, as opposed to merely being risky.
+ *
+ * Split from the amount so the option-painting and the end-of-submission paths can ask this
+ * without also asking the floor question, which no longer gates anything.
+ */
+function depositBlockedForAvailability() {
+    const chosen = depositState.options?.currencies?.find((c) => c.code === depositState.currency);
+    if (chosen?.disabled) return true;
+    const options = depositState.options;
+    return !(options?.stripeAvailable || options?.cryptoAvailable);
+}
+
+/**
+ * Keeps the amount hint in a neutral state.
+ *
+ * Nothing is annotated and nothing is blocked here. The provider's quoted minimum is advisory,
+ * it moves between reads, and gating on it stopped deposits that would otherwise have been
+ * created -- so a user who is under it presses the button and finds out for real, from the
+ * server's translated refusal.
  */
 function validateDepositAmount() {
     const hint = document.getElementById('deposit-amount-hint');
-    if (!hint) return;
-    const providerMinimum = providerMinimumForSelectedCurrency();
-    if (!providerMinimum) {
-        hint.classList.remove('is-error');
-        updateDepositSwapOffer();
-        return;
-    }
-    const amount = Number(document.getElementById('deposit-amount').value);
-    const below = Number.isFinite(amount) && amount > 0 && amount < providerMinimum;
-    hint.classList.toggle('is-error', below);
-    updateDepositSwapOffer();
+    if (hint) hint.classList.remove('is-error');
 }
 
 /**
  * States the floor for the coin currently chosen, so it stays on screen after the menu closes.
  *
  * The option labels read "from $X", which makes the choice informed before it is made but
- * leaves the number behind once it is made. It is also the number a user is most likely to
- * misread, so it is labelled explicitly: it is a floor, not a charge, and when it came from
- * the provider it is that provider's volatile per-pair limit rather than this app's rule.
+ * leaves the number behind once it is made. This app does not impose a crypto minimum of its
+ * own, so what it can honestly say here is that the provider decides -- not a figure that moves
+ * between reads and would then contradict what the amount box accepts.
  */
 function updateCoinSummary() {
     const summary = document.getElementById('deposit-coin-summary');
@@ -1964,117 +3628,21 @@ function updateCoinSummary() {
     }
 
     const name = cryptoCurrencyNames[code] || code.toUpperCase();
-    const providerMinimum = providerMinimumForSelectedCurrency();
-    const reported = Number(depositState.options?.minimums?.[code]);
-    const fromProvider = Number.isFinite(reported) && reported > 0;
 
     const amount = document.createElement('strong');
     amount.className = 'coin-summary-amount';
-    amount.textContent = providerMinimum ? formatBalance(providerMinimum) : 'any amount';
+    amount.textContent = 'any amount';
 
+    // One line, not a paragraph. This sits between the coin picker and the button, so every
+    // sentence it does not need is a line the user scrolls past to reach the action.
     summary.replaceChildren(
-        document.createTextNode(`${name} accepts deposits from `),
+        document.createTextNode('Our minimum is '),
         amount,
         document.createTextNode(
-            fromProvider
-                ? '. That is the payment provider\'s minimum for this network and it moves with their rates.'
-                : '. The payment provider\'s minimum for this network is not known right now, so this is our own limit.'
+            ` for ${name}. The payment provider may still set a minimum for this network.`
         )
     );
     summary.hidden = false;
-}
-
-/**
- * The cheapest coin the provider will actually accept for the amount already in the box.
- *
- * Returns null when the selected coin is already the cheapest, when nothing else qualifies,
- * or when no options have loaded. A coin with no reported floor is treated as accepting the
- * app's own $1.00, because that is the only floor this app enforces itself.
- */
-function cheapestCurrencyAccepting(amount) {
-    const options = depositState.options;
-    const select = document.getElementById('deposit-currency');
-    // `cryptoCurrencies` is checked for shape, not just for existence. This runs on every
-    // keystroke in the amount box, including before the first options request has resolved and
-    // again if that request fails, so it has to survive whatever `depositState.options` happens
-    // to be holding rather than assuming the fully-populated server shape.
-    if (!options || !select || !Array.isArray(options.cryptoCurrencies)) return null;
-    if (!Number.isFinite(amount) || amount <= 0) return null;
-
-    const current = select.value;
-    const appFloor = minimumForSelectedCurrency();
-    let best = null;
-
-    for (const code of options.cryptoCurrencies) {
-        if (code === current) continue;
-        const reported = Number(options.minimums?.[code]);
-        const floor = Number.isFinite(reported) && reported > 0 ? reported : appFloor;
-        if (floor > amount) continue;
-        if (!best || floor < best.floor) best = { code, floor };
-    }
-    return best;
-}
-
-/**
- * Offers a one-tap switch to a coin that will take the amount already typed.
- *
- * The app advertises a $1.00 minimum, and that promise is only true of some coins: NOWPayments
- * genuinely refuses a Bitcoin Cash deposit under about $18.79, and a handful of other pairs
- * sit in the same range. Telling the user that the amount is too small is necessary and not
- * sufficient, because the actionable part is not "type more" -- it is "use a different coin".
- * Without this, the only way to discover a $1 deposit exists is to read every entry in the
- * picker.
- *
- * Deliberately does not change the amount or the selected coin on its own. Switching a user's
- * payment method because their amount was rejected is not a correction, it is a substitution,
- * and the coin they pick is the one whose network and fees they agreed to. The button performs
- * the change, so it is visible and reversible.
- */
-function updateDepositSwapOffer() {
-    const offer = document.getElementById('deposit-swap-hint');
-    if (!offer) return;
-
-    const hide = () => {
-        offer.hidden = true;
-        offer.replaceChildren();
-    };
-
-    const providerMinimum = providerMinimumForSelectedCurrency();
-    const amount = Number(document.getElementById('deposit-amount')?.value);
-    if (!providerMinimum || !Number.isFinite(amount) || amount <= 0 || amount >= providerMinimum) {
-        hide();
-        return;
-    }
-
-    const cheaper = cheapestCurrencyAccepting(amount);
-    if (!cheaper) {
-        hide();
-        return;
-    }
-
-    const name = cryptoCurrencyNames[cheaper.code] || cheaper.code.toUpperCase();
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.className = 'swap-button';
-    button.textContent = `Use ${name} instead — from ${formatBalance(cheaper.floor)}`;
-
-    button.addEventListener('click', () => {
-        const select = document.getElementById('deposit-currency');
-        if (!select) return;
-        select.value = cheaper.code;
-        clearDepositMessage();
-        // Reuses the currency-change path so the amount bounds, the hint, and the presets all
-        // recompute from the new coin. Driving the select and dispatching is what keeps this
-        // button from being a second, subtly different implementation of the same change.
-        select.dispatchEvent(new Event('change'));
-        document.getElementById('deposit-amount')?.focus();
-    });
-
-    offer.replaceChildren(
-        document.createTextNode(`${formatBalance(amount)} is below the ${formatBalance(providerMinimum)} floor for this coin. `),
-        button
-    );
-    offer.hidden = false;
 }
 
 async function loadDepositOptions() {
@@ -2083,108 +3651,132 @@ async function loadDepositOptions() {
     const copy = document.getElementById('deposit-provider-copy');
     const notice = document.getElementById('provider-notice');
     const providerFinePrint = document.getElementById('deposit-provider-fine-print');
-    submit.disabled = true;
-    notice.classList.remove('is-ready', 'is-offline', 'is-compact');
+    if (submit) submit.disabled = true;
+    if (notice) notice.classList.remove('is-ready', 'is-offline', 'is-compact');
     // The fine print belongs to the "ready" state only, so it is cleared with the rest of
     // the notice rather than being left behind if a later load reports an outage.
-    providerFinePrint.hidden = true;
-    title.textContent = 'Checking payment providers';
-    copy.textContent = 'Contacting the configured payment services...';
+    if (providerFinePrint) providerFinePrint.hidden = true;
+    if (title) title.textContent = 'Checking payment providers';
+    if (copy) copy.textContent = 'Contacting the configured payment services...';
 
     try {
         const options = await requestJson('/api/user/payment-options', {
-            headers: { Authorization: `Bearer ${sessionStorage.getItem(accountTokenKey)}` }
+            headers: authHeaders()
         });
         depositState.options = options;
 
         const stripeButton = document.querySelector('[data-deposit-method="stripe"]');
         const cryptoButton = document.querySelector('[data-deposit-method="crypto"]');
-        stripeButton.disabled = !options.stripeAvailable;
-        cryptoButton.disabled = !options.cryptoAvailable;
+        if (stripeButton) stripeButton.disabled = !options.stripeAvailable;
+        if (cryptoButton) cryptoButton.disabled = !options.cryptoAvailable;
         // A greyed-out card with no explanation is a dead end: the only way to find out why
         // Card is unavailable was to guess. The reason is stated on the card itself, so the
-        // answer is where the question is asked.
+        // answer is where the question is asked -- and it distinguishes the two reasons that
+        // look identical from here. "Not configured" means nobody set the keys up. "Temporarily
+        // unavailable" means they are set and Stripe itself is refusing charges, which is
+        // retried and recovers on its own, and it is worth telling the customer to try cards
+        // again later rather than writing the feature off.
         describeDepositMethod(stripeButton, options.stripeAvailable
             ? 'Visa, Mastercard, Apple Pay'
-            : 'Not configured on this deployment');
-        describeDepositMethod(cryptoButton, options.cryptoAvailable
+            : unavailableDescriptor(options.stripeUnavailableBecause));
+        const cryptoAvailableText = Array.isArray(options.cryptoCurrencies)
             ? `${options.cryptoCurrencies.length} ${options.cryptoCurrencies.length === 1 ? 'coin' : 'coins'} available`
+            : 'Not configured on this deployment';
+        describeDepositMethod(cryptoButton, options.cryptoAvailable
+            ? cryptoAvailableText
             : 'Not configured on this deployment');
 
+        // `depositState.method` defaults to `crypto`, so a deployment with no card provider
+        // opened on a method that could not work, with a greyed-out card beside it and no
+        // reason the selection had moved. Anything that cannot be chosen is not a choice:
+        // if the current selection is unavailable and the other one is not, the selection
+        // follows what is actually configured.
+        const availableMethods = [
+            options.stripeAvailable ? 'stripe' : null,
+            options.cryptoAvailable ? 'crypto' : null
+        ].filter(Boolean);
+        if (availableMethods.length > 0 && !availableMethods.includes(depositState.method)) {
+            depositState.method = availableMethods[0];
+        }
+
         const currencySelect = document.getElementById('deposit-currency');
-        const previous = currencySelect.value;
-        currencySelect.replaceChildren(...options.cryptoCurrencies.map((currency) => {
-            const option = document.createElement('option');
-            option.value = currency;
-            // The provider's own floor is shown in the list itself, phrased as a starting
-            // point rather than a hard limit, because that is what it is: NOWPayments will
-            // refuse a smaller payment, but the box accepts anything from the app's $1.00.
-            // Putting the figure here means it is known *before* the coin is chosen, instead
-            // of only after, when a sub-minimum amount is already in the box.
-            const name = cryptoCurrencyNames[currency] || currency.toUpperCase();
-            const minimum = options.minimums?.[currency];
-            const maximum = options.maximums?.[currency];
-            const range = [];
-            if (Number.isFinite(minimum) && minimum > 0) range.push(`from ${formatBalance(minimum)}`);
-            if (Number.isFinite(maximum) && maximum > 0) range.push(`up to ${formatBalance(maximum)}`);
-            option.textContent = range.length ? `${name} (${range.join(', ')})` : name;
-            return option;
-        }));
-        if (options.cryptoCurrencies.includes(previous)) {
-            currencySelect.value = previous;
-        } else {
-            // Open on the coin the provider will accept the least of. The app advertises a
-            // $1.00 minimum, and that is only true in practice if the coin the form happens to
-            // start on can actually be funded for that little. Taking the provider's order
-            // made the first thing a depositor met a coin with a floor near $18.80, so the
-            // advertised minimum was unreachable without the user first having to work out
-            // which coins were cheap to start.
-            const cheapest = [...options.cryptoCurrencies].sort((a, b) => {
-                const floor = (code) => {
-                    const value = Number(options.minimums?.[code]);
-                    return Number.isFinite(value) && value > 0 ? value : Number.MAX_SAFE_INTEGER;
-                };
-                return floor(a) - floor(b);
-            })[0];
-            if (cheapest) currencySelect.value = cheapest;
+        if (currencySelect && Array.isArray(options.cryptoCurrencies)) {
+            const previous = currencySelect.value;
+            currencySelect.replaceChildren(...options.cryptoCurrencies.map((currency) => {
+                const option = document.createElement('option');
+                option.value = currency;
+                // The provider's own floor is shown in the list itself, phrased as a starting
+                // point rather than a hard limit, because that is what it is: NOWPayments will
+                // refuse a smaller payment, but this app adds no floor of its own and lets the
+                // submission through so the provider can actually be asked.
+                // Putting the figure here means it is known *before* the coin is chosen, instead
+                // of only after, when a sub-minimum amount is already in the box.
+                const name = cryptoCurrencyNames[currency] || currency.toUpperCase();
+                const minimum = options.minimums?.[currency];
+                const maximum = options.maximums?.[currency];
+                const range = [];
+                if (Number.isFinite(minimum) && minimum > 0) range.push(`from ${formatBalance(minimum)}`);
+                if (Number.isFinite(maximum) && maximum > 0) range.push(`up to ${formatBalance(maximum)}`);
+                option.textContent = range.length ? `${name} (${range.join(', ')})` : name;
+                return option;
+            }));
+            if (options.cryptoCurrencies.includes(previous)) {
+                currencySelect.value = previous;
+            } else {
+                // Open on the coin the provider will accept the least of. The app no longer
+                // imposes a minimum, so this is purely about a good first impression: taking
+                // the provider's order made the first thing a depositor met a coin with a floor
+                // near $18.80, which reads as "nothing small is possible here".
+                const cheapest = [...options.cryptoCurrencies].sort((a, b) => {
+                    const floor = (code) => {
+                        const value = Number(options.minimums?.[code]);
+                        return Number.isFinite(value) && value > 0 ? value : Number.MAX_SAFE_INTEGER;
+                    };
+                    return floor(a) - floor(b);
+                })[0];
+                if (cheapest) currencySelect.value = cheapest;
+            }
         }
 
         const amount = document.getElementById('deposit-amount');
-        amount.min = String(minimumForSelectedCurrency());
-        amount.max = String(maximumForSelectedCurrency());
-        // The default 10.00 can sit outside the first coin's range, which would leave the
-        // form un-submittable on open with no visible reason why.
-        clampDepositAmountToRange();
+        if (amount) {
+            amount.min = String(minimumForSelectedCurrency());
+            amount.max = String(maximumForSelectedCurrency());
+            // The default 10.00 can sit outside the first coin's range, which would leave the
+            // form un-submittable on open with no visible reason why.
+            clampDepositAmountToRange();
+        }
         updateDepositAmountHint();
         updateCoinSummary();
         syncDepositPresets();
 
-        // Fall back to whichever method actually works rather than leaving the user on
-        // a disabled option.
-        if (depositState.method === 'stripe' && !options.stripeAvailable && options.cryptoAvailable) {
-            depositState.method = 'crypto';
-        } else if (depositState.method === 'crypto' && !options.cryptoAvailable && options.stripeAvailable) {
-            depositState.method = 'stripe';
-        }
+        // Repaint after the method may have moved. The selection is settled above, before the
+        // coin list and the amount bounds are read, because both of those depend on it -- the
+        // old fallback sat after them, so the bounds were computed for a method the user was
+        // no longer on, and it never repainted the buttons, leaving the active highlight on
+        // the card that had just been ruled out.
+        updateDepositFields();
 
         if (options.stripeAvailable || options.cryptoAvailable) {
-            notice.classList.add('is-ready', 'is-compact');
+            if (notice) notice.classList.add('is-ready', 'is-compact');
             const available = [
                 options.stripeAvailable ? 'card' : null,
                 options.cryptoAvailable ? 'crypto' : null
             ].filter(Boolean).join(' and ');
-            title.textContent = 'Provider available';
+            if (title) title.textContent = 'Provider available';
             // Once a provider answers, the long explanation is noise between the user and
             // the form. The reassurance that credit waits for confirmation is kept, because
             // it is the one sentence a first-time depositor actually needs; the rest of the
             // wording is moved into the fine print under the form so nothing is lost.
-            copy.textContent = `Pay by ${available}.`;
-            providerFinePrint.textContent = 'Your balance is credited only after the provider confirms the payment.';
-            providerFinePrint.hidden = false;
+            if (copy) copy.textContent = `Pay by ${available}.`;
+            if (providerFinePrint) {
+                providerFinePrint.textContent = 'Your balance is credited only after the provider confirms the payment.';
+                providerFinePrint.hidden = false;
+            }
         } else {
-            notice.classList.add('is-offline');
-            title.textContent = 'Payment providers are not configured';
-            copy.textContent = 'Set Stripe or NOWPayments credentials in the server environment to accept deposits.';
+            if (notice) notice.classList.add('is-offline');
+            if (title) title.textContent = 'Payment providers are not configured';
+            if (copy) copy.textContent = 'Set Stripe or NOWPayments credentials in the server environment to accept deposits.';
         }
 
         // A locally hosted build cannot receive confirmations: the provider posts to
@@ -2202,10 +3794,10 @@ async function loadDepositOptions() {
         }
         updateDepositFields();
     } catch (error) {
-        notice.classList.add('is-offline');
-        title.textContent = 'Payment providers unavailable';
-        copy.textContent = error.message;
-        submit.disabled = true;
+        if (notice) notice.classList.add('is-offline');
+        if (title) title.textContent = 'Payment providers unavailable';
+        if (copy) copy.textContent = error.message;
+        if (submit) submit.disabled = true;
     }
 }
 
@@ -2223,6 +3815,21 @@ function describeDepositMethod(button, text) {
     if (target) target.textContent = text;
 }
 
+/**
+ * Why a payment method is unavailable, as the customer reads it.
+ *
+ * The server distinguishes a deployment that was never set up from one where the provider
+ * itself is refusing right now, because the two have opposite meanings: the first will stay
+ * broken until someone configures it, the second usually clears on its own. Collapsing them
+ * into one "unavailable" string is what made a Stripe account-level refusal look like a
+ * missing environment variable.
+ */
+function unavailableDescriptor(reason) {
+    return reason === 'temporarily unavailable'
+        ? 'Temporarily unavailable, try again later'
+        : 'Not configured on this deployment';
+}
+
 function updateDepositFields() {
     const isCrypto = depositState.method === 'crypto';
     document.querySelectorAll('[data-deposit-method]').forEach((button) => {
@@ -2231,43 +3838,71 @@ function updateDepositFields() {
         button.setAttribute('aria-pressed', String(selected));
     });
 
-    document.getElementById('crypto-deposit-fields').hidden = !isCrypto;
+    // A two-option picker where one option is permanently disabled is not a choice, it is a
+    // dead control with a promise on it. When exactly one method is configured the group and
+    // its label are removed entirely, so what is on screen is the thing that works. Both
+    // available keeps the picker, because then it is a real decision.
+    const options = depositState.options;
+    const usable = Boolean(options && (options.stripeAvailable || options.cryptoAvailable));
+    const onlyOne = usable && Number(Boolean(options.stripeAvailable)) + Number(Boolean(options.cryptoAvailable)) === 1;
+    const methodGroup = document.querySelector('.deposit-method-options');
+    const methodLabel = document.getElementById('deposit-method-label');
+    if (methodGroup) methodGroup.hidden = onlyOne;
+    if (methodLabel) methodLabel.hidden = onlyOne;
+
+    const cryptoFields = document.getElementById('crypto-deposit-fields');
+    if (cryptoFields) cryptoFields.hidden = !isCrypto;
     const submit = document.getElementById('deposit-submit');
-    submit.textContent = isCrypto ? 'Generate crypto payment address' : 'Continue to secure checkout';
+    if (submit) {
+        submit.textContent = isCrypto ? 'Generate crypto payment address' : 'Continue to secure checkout';
+    }
 
     // Card and crypto have different limits, so the amount bounds and the stated range
     // both have to follow the method as well as the coin.
     const amount = document.getElementById('deposit-amount');
-    amount.min = String(minimumForSelectedCurrency());
-    amount.max = String(maximumForSelectedCurrency());
+    if (amount) {
+        amount.min = String(minimumForSelectedCurrency());
+        amount.max = String(maximumForSelectedCurrency());
+    }
     updateDepositAmountHint();
 
     const chosen = document.querySelector(`[data-deposit-method="${depositState.method}"]`);
-    submit.disabled = Boolean(chosen?.disabled) || !(depositState.options?.stripeAvailable || depositState.options?.cryptoAvailable);
+    if (submit) {
+        // Three reasons the button can be off, and all three are real: the selected method is
+        // unavailable, nothing on this deployment can take a payment, or the amount is below the
+        // floor for the chosen coin. The floor is re-checked here rather than only while typing,
+        // Only availability gates this, not the amount -- see `depositBlockedForAvailability`. The
+        // floor is advisory and is allowed to be wrong without blocking a payment.
+        submit.disabled = depositBlockedForAvailability();
+    }
 }
 
 function syncDepositPresets() {
-    const amount = Number(document.getElementById('deposit-amount').value);
+    const amountEl = document.getElementById('deposit-amount');
+    const amount = amountEl ? Number(amountEl.value) : 0;
     const minimum = minimumForSelectedCurrency();
     const maximum = maximumForSelectedCurrency();
+    // A preset is a one-tap way to fill the box, so it is judged against the bounds THIS FORM
+    // applies -- the app's own floor and ceiling. It used to be compared against the provider's
+    // quoted minimum too, which greyed out most of the presets on this account (the provider
+    // quotes ~$18.74 for every coin while the presets are $5-$50) and left a deposit form where
+    // most of the one-tap options could not be pressed. The provider is asked at submit time and
+    // its refusal is translated into a sentence, so nothing is lost by letting the user press.
     document.querySelectorAll('[data-deposit-amount]').forEach((button) => {
         const value = Number(button.dataset.depositAmount);
         const selected = amount === value;
-        // A coin with a high minimum made the cheap presets a trap: pressing "$5" filled
-        // the box with an amount the server always refuses, and the only feedback was a
-        // rejection after submitting. Out-of-range presets are disabled instead, so the
-        // button state states the limit before the user commits to it.
         const usable = value >= minimum && value <= maximum;
         button.classList.toggle('is-active', selected && usable);
         button.disabled = !usable;
         button.setAttribute('aria-pressed', String(selected && usable));
-        button.title = usable ? '' : `Outside the ${formatBalance(minimum)} to ${formatBalance(maximum)} range this app accepts`;
+        button.title = usable ? '' : `Outside the ${formatBalance(minimum)} to ${formatBalance(maximum)} this form accepts`;
     });
 }
 
 /** Fills the amount box with the largest deposit the selected coin will accept. */
 function setMaximumDepositAmount() {
     const input = document.getElementById('deposit-amount');
+    if (!input) return;
     input.value = maximumForSelectedCurrency().toFixed(2);
     syncDepositPresets();
     validateDepositAmount();
@@ -2277,8 +3912,22 @@ function setMaximumDepositAmount() {
 async function createDeposit(event) {
     event.preventDefault();
     const submit = document.getElementById('deposit-submit');
+    if (!submit) return;
     const isCrypto = depositState.method === 'crypto';
+    const amountEl = document.getElementById('deposit-amount');
+    const currencyEl = document.getElementById('deposit-currency');
     const originalLabel = submit.textContent;
+
+    // No floor refusal here. This used to refuse the submission client-side and print the
+    // provider's quoted minimum, because "amountTo is too small" is an unusable message to
+    // show someone. The translation is still worth having -- it now happens on the server,
+    // where the provider has actually answered -- but doing it before the request meant
+    // refusing deposits that would have been created, since a quoted minimum is not a promise
+    // about what the next request will be accepted for.
+    //
+    // So the amount is sent and the provider decides. If it refuses, the error handler below
+    // receives the actionable sentence instead of the raw provider text.
+
     submit.disabled = true;
     submit.textContent = isCrypto ? 'Generating address...' : 'Creating checkout...';
     setFormMessage('deposit-message', '');
@@ -2287,13 +3936,13 @@ async function createDeposit(event) {
         const result = await requestJson('/api/user/deposits', {
             method: 'POST',
             headers: {
-                'Content-Type': 'application/json',
-                Authorization: `Bearer ${sessionStorage.getItem(accountTokenKey)}`
+                ...authHeaders(),
+                'Content-Type': 'application/json'
             },
             body: JSON.stringify({
-                amount: Number(document.getElementById('deposit-amount').value),
+                amount: Number(amountEl?.value),
                 method: depositState.method,
-                currency: isCrypto ? document.getElementById('deposit-currency').value : null
+                currency: isCrypto ? currencyEl?.value : null
             })
         });
 
@@ -2303,7 +3952,8 @@ async function createDeposit(event) {
         }
 
         renderDepositInstructions(result);
-        document.getElementById('deposit-form').hidden = true;
+        const depositForm = document.getElementById('deposit-form');
+        if (depositForm) depositForm.hidden = true;
         await loadDepositHistory();
         // No interval is started here any more. The page-wide live sync already covers this
         // case and does it better: it keeps the balance, both history lists, the header, and
@@ -2319,10 +3969,21 @@ async function createDeposit(event) {
         scheduleLiveSync();
     } catch (error) {
         setFormMessage('deposit-message', error.message, 'error');
+        // A provider-level refusal changes what this deployment can offer, not just this
+        // submission: the server has already stopped advertising the method. Reloading the
+        // options is what moves the card button to greyed-out with the reason on it, so the
+        // user's next action is visible on the form instead of being another attempt at the
+        // same dead end.
+        if (error.status === 503) {
+            await loadDepositOptions().catch(() => {});
+        }
         updateDepositFields();
     } finally {
-        if (!document.getElementById('deposit-form').hidden) {
-            submit.disabled = false;
+        const depositForm = document.getElementById('deposit-form');
+        if (depositForm && !depositForm.hidden) {
+            // Not `= false`: the amount may still be under the coin's floor, and re-enabling
+            // the button would undo the reason it was disabled.
+            setDepositSubmitEnabled();
             submit.textContent = originalLabel;
         }
     }
@@ -2330,6 +3991,7 @@ async function createDeposit(event) {
 
 function renderDepositInstructions(result) {
     const instructions = document.getElementById('deposit-instructions');
+    if (!instructions) return;
     instructions.replaceChildren();
 
     const heading = document.createElement('h3');
@@ -2506,42 +4168,61 @@ function startCountdown() {
 function resetDepositForAnother() {
     window.clearInterval(depositCountdownTimer);
     depositCountdownTimer = undefined;
-    window.clearInterval(depositStatusTimer);
-    depositStatusTimer = undefined;
 
     const instructions = document.getElementById('deposit-instructions');
-    instructions.replaceChildren();
-    instructions.hidden = true;
+    if (instructions) {
+        instructions.replaceChildren();
+        instructions.hidden = true;
+    }
 
     const form = document.getElementById('deposit-form');
-    form.hidden = false;
+    if (form) form.hidden = false;
 
     const submit = document.getElementById('deposit-submit');
-    submit.disabled = false;
-    submit.textContent = depositState.method === 'crypto'
-        ? 'Generate crypto payment address'
-        : 'Continue to secure checkout';
+    if (submit) {
+        // Through the helper, for the same reason as the end of a submission: the amount that
+        // was in the box a moment ago may be under the coin's floor, and a second deposit starts
+        // with the box disabled until the user types something payable.
+        setDepositSubmitEnabled();
+        submit.textContent = depositState.method === 'crypto'
+            ? 'Generate crypto payment address'
+            : 'Continue to secure checkout';
+    }
 
     clearDepositMessage();
     updateDepositFields();
-    document.getElementById('deposit-amount').focus();
+    const amountEl = document.getElementById('deposit-amount');
+    if (amountEl) amountEl.focus();
 }
 
 /* ------------------------------------------------------------ withdrawals */
 
 function openWithdrawal() {
-    if (!sessionStorage.getItem(accountTokenKey)) {
-        document.getElementById('account-dialog').showModal();
+    if (!getSessionToken()) {
+        const dialog = document.getElementById('account-dialog');
+        if (dialog) dialog.showModal();
+        return;
+    }
+    // As with `openDeposits`: the dialog is on the account and offers pages, and the header's
+    // account menu is on every page. Without the dialog this was a menu item that closed the
+    // menu and stopped, so a page that carries the menu has to send the visitor to one that
+    // carries the dialog.
+    const withdrawDialog = document.getElementById('withdraw-dialog');
+    if (!withdrawDialog) {
+        window.location.assign('/account#withdraw');
         return;
     }
     setFormMessage('withdraw-message', '');
     // A previous visit may have left the confirmation panel showing, which would open the
     // dialog straight onto a receipt for a request that is already in the history below.
     const confirmation = document.getElementById('withdraw-confirmation');
-    confirmation.hidden = true;
-    confirmation.replaceChildren();
-    document.getElementById('withdraw-form').hidden = false;
-    document.getElementById('withdraw-dialog').showModal();
+    if (confirmation) {
+        confirmation.hidden = true;
+        confirmation.replaceChildren();
+    }
+    const withdrawForm = document.getElementById('withdraw-form');
+    if (withdrawForm) withdrawForm.hidden = false;
+    withdrawDialog.showModal();
     loadWithdrawalOptions();
     loadWithdrawalHistory();
     refreshBalance();
@@ -2555,11 +4236,12 @@ function openWithdrawal() {
  */
 async function loadWithdrawalOptions() {
     const container = document.getElementById('withdraw-method-options');
+    if (!container) return;
     try {
         if (!withdrawState.options) {
             container.textContent = 'Loading payment methods...';
             withdrawState.options = await requestJson('/api/user/withdrawal-options', {
-                headers: { Authorization: `Bearer ${sessionStorage.getItem(accountTokenKey)}` }
+                headers: authHeaders()
             });
         }
         const options = withdrawState.options;
@@ -2567,7 +4249,7 @@ async function loadWithdrawalOptions() {
         // The floor and ceiling are the provider's, but the balance is the real limit, so
         // both are reconciled here rather than leaving the box to a stale pair of bounds.
         const amount = document.getElementById('withdraw-amount');
-        amount.min = String(options.minimumUsd);
+        if (amount) amount.min = String(options.minimumUsd);
         syncWithdrawBalance();
         updateWithdrawAmountHint();
 
@@ -2601,8 +4283,10 @@ async function loadWithdrawalOptions() {
     } catch (error) {
         container.replaceChildren();
         if (handleUnauthorized(error)) {
-            document.getElementById('withdraw-dialog').close();
-            document.getElementById('account-dialog').showModal();
+            const withdrawDialog = document.getElementById('withdraw-dialog');
+            if (withdrawDialog) withdrawDialog.close();
+            const accountDialog = document.getElementById('account-dialog');
+            if (accountDialog) accountDialog.showModal();
             return;
         }
         setFormMessage('withdraw-message', error.message, 'error');
@@ -2675,10 +4359,12 @@ function selectedNetwork() {
 /** Shows the destination, network, and resulting balance for the current selection. */
 function updateWithdrawFields() {
     const isCrypto = withdrawState.method === 'crypto';
-    document.getElementById('crypto-withdraw-fields').hidden = !isCrypto;
+    const cryptoFields = document.getElementById('crypto-withdraw-fields');
+    if (cryptoFields) cryptoFields.hidden = !isCrypto;
 
     const addressLabel = document.getElementById('withdraw-address-label');
     const address = document.getElementById('withdraw-address');
+    if (!addressLabel || !address) return;
     if (isCrypto) {
         addressLabel.textContent = 'Wallet address';
         address.placeholder = 'Your wallet address';
@@ -2708,20 +4394,24 @@ function updateWithdrawFields() {
     const needsTag = isCrypto && asset?.requiresDestinationTag === true;
     if (tagField) {
         tagField.hidden = !needsTag;
-        document.getElementById('withdraw-tag').required = needsTag;
+        const tagInput = document.getElementById('withdraw-tag');
+        if (tagInput) tagInput.required = needsTag;
     }
 
     // The network picker is the authoritative list for the chosen asset, so it is only
     // required while a crypto destination is being described.
-    document.getElementById('withdraw-network').required = isCrypto;
+    const networkEl = document.getElementById('withdraw-network');
+    if (networkEl) networkEl.required = isCrypto;
     updateWithdrawSummary();
 }
 
 function updateWithdrawSummary() {
     renderWithdrawalConfirm();
     const summary = document.getElementById('withdraw-summary');
-    const amount = Number(document.getElementById('withdraw-amount').value);
-    const destination = document.getElementById('withdraw-address').value.trim();
+    const amountEl = document.getElementById('withdraw-amount');
+    const destinationEl = document.getElementById('withdraw-address');
+    const amount = amountEl ? Number(amountEl.value) : 0;
+    const destination = destinationEl ? destinationEl.value.trim() : '';
     const isCrypto = withdrawState.method === 'crypto';
 
     const rows = [];
@@ -2751,9 +4441,11 @@ function updateWithdrawSummary() {
     }
 
     if (rows.length === 0) {
-        summary.hidden = true;
+        if (summary) summary.hidden = true;
         return;
     }
+
+    if (!summary) return;
 
     const list = document.createElement('dl');
     for (const [term, value] of rows) {
@@ -2777,7 +4469,8 @@ function updateWithdrawSummary() {
  * address is one character long.
  */
 function validateWithdrawalDestination() {
-    const address = document.getElementById('withdraw-address').value.trim();
+    const addressEl = document.getElementById('withdraw-address');
+    const address = addressEl ? addressEl.value.trim() : '';
     const method = withdrawState.method;
 
     if (!address) {
@@ -2805,7 +4498,8 @@ function validateWithdrawalDestination() {
             return false;
         }
         const tagField = document.getElementById('withdraw-tag-field');
-        if (tagField && !tagField.hidden && !document.getElementById('withdraw-tag').value.trim()) {
+        const tagInput = document.getElementById('withdraw-tag');
+        if (tagField && !tagField.hidden && !(tagInput?.value.trim())) {
             setHint('withdraw-address-hint', 'This network routes by destination tag as well as address, so the tag is required.', true);
             return false;
         }
@@ -2823,14 +4517,17 @@ function validateWithdrawalDestination() {
  */
 function withdrawalRequestBody() {
     const isCrypto = withdrawState.method === 'crypto';
+    const amountEl = document.getElementById('withdraw-amount');
+    const addressEl = document.getElementById('withdraw-address');
+    const tagEl = document.getElementById('withdraw-tag');
     return {
-        amount: Number(document.getElementById('withdraw-amount').value),
+        amount: Number(amountEl?.value),
         paymentMethod: withdrawState.method,
-        paymentAddress: document.getElementById('withdraw-address').value.trim(),
+        paymentAddress: addressEl ? addressEl.value.trim() : '',
         assetCode: isCrypto ? withdrawState.asset : null,
         network: isCrypto ? withdrawState.network : null,
         destinationTag: isCrypto
-            ? document.getElementById('withdraw-tag').value.trim() || null
+            ? (tagEl ? tagEl.value.trim() || null : null)
             : null
     };
 }
@@ -2929,8 +4626,8 @@ async function sendWithdrawalCode() {
         const result = await requestJson('/api/user/withdrawals/code', {
             method: 'POST',
             headers: {
-                'Content-Type': 'application/json',
-                Authorization: `Bearer ${sessionStorage.getItem(accountTokenKey)}`
+                ...authHeaders(),
+                'Content-Type': 'application/json'
             },
             body: JSON.stringify(body)
         });
@@ -2957,7 +4654,8 @@ async function submitWithdrawal(event) {
 
     // Checked before the request rather than after, so a typo does not cost a round trip.
     if (!validateWithdrawalDestination()) {
-        document.getElementById('withdraw-address').focus();
+        const addressEl = document.getElementById('withdraw-address');
+        if (addressEl) addressEl.focus();
         return;
     }
 
@@ -2972,6 +4670,7 @@ async function submitWithdrawal(event) {
         return;
     }
 
+    if (!button) return;
     button.disabled = true;
     button.textContent = 'Submitting...';
     setFormMessage('withdraw-message', '');
@@ -2980,21 +4679,25 @@ async function submitWithdrawal(event) {
         const result = await requestJson('/api/user/withdraw', {
             method: 'POST',
             headers: {
-                'Content-Type': 'application/json',
-                Authorization: `Bearer ${sessionStorage.getItem(accountTokenKey)}`
+                ...authHeaders(),
+                'Content-Type': 'application/json'
             },
             body: JSON.stringify({ ...withdrawalRequestBody(), code })
         });
 
         showWithdrawalConfirmation(result);
         notifyWithdrawalSubmitted(result);
-        document.getElementById('withdraw-amount').value = '';
-        document.getElementById('withdraw-address').value = '';
-        document.getElementById('withdraw-tag').value = '';
+        const amountEl = document.getElementById('withdraw-amount');
+        if (amountEl) amountEl.value = '';
+        const addressEl = document.getElementById('withdraw-address');
+        if (addressEl) addressEl.value = '';
+        const tagEl = document.getElementById('withdraw-tag');
+        if (tagEl) tagEl.value = '';
         // The code is single-use and already spent server-side. Clearing it stops the next
         // withdrawal from being submitted with a dead one, and stops it being read over a
         // shoulder in the meantime.
-        document.getElementById('withdraw-code').value = '';
+        const codeEl = document.getElementById('withdraw-code');
+        if (codeEl) codeEl.value = '';
         const panel = document.getElementById('withdraw-confirm');
         if (panel) panel.hidden = true;
         withdrawState.codeFor = null;
@@ -3015,7 +4718,8 @@ async function submitWithdrawal(event) {
         // A refused code is spent or stale, so the step goes back to asking for a new one
         // rather than leaving a user typing the same six digits at a dead code.
         if (/code/i.test(error.message || '')) {
-            document.getElementById('withdraw-code').value = '';
+            const codeEl = document.getElementById('withdraw-code');
+            if (codeEl) codeEl.value = '';
             const send = document.getElementById('withdraw-code-send');
             if (send) {
                 send.disabled = false;
@@ -3040,9 +4744,10 @@ async function submitWithdrawal(event) {
  */
 function showWithdrawalConfirmation(result) {
     const form = document.getElementById('withdraw-form');
-    form.hidden = true;
+    if (form) form.hidden = true;
 
     const panel = document.getElementById('withdraw-confirmation');
+    if (!panel) return;
     panel.replaceChildren();
 
     const mark = document.createElement('span');
@@ -3073,7 +4778,8 @@ function showWithdrawalConfirmation(result) {
     close.type = 'button';
     close.textContent = 'Done';
     close.addEventListener('click', () => {
-        document.getElementById('withdraw-dialog').close();
+        const withdrawDialog = document.getElementById('withdraw-dialog');
+        if (withdrawDialog) withdrawDialog.close();
     });
 
     const another = document.createElement('button');
@@ -3090,14 +4796,17 @@ function showWithdrawalConfirmation(result) {
 /** Returns the withdrawal dialog to the entry form after a confirmed request. */
 function resetWithdrawalForAnother() {
     const panel = document.getElementById('withdraw-confirmation');
-    panel.replaceChildren();
-    panel.hidden = true;
+    if (panel) {
+        panel.replaceChildren();
+        panel.hidden = true;
+    }
 
     const form = document.getElementById('withdraw-form');
-    form.hidden = false;
+    if (form) form.hidden = false;
     clearWithdrawMessage();
     updateWithdrawFields();
-    document.getElementById('withdraw-amount').focus();
+    const amountEl = document.getElementById('withdraw-amount');
+    if (amountEl) amountEl.focus();
 }
 
 /* ---------------------------------------------------------------- history */
@@ -3227,7 +4936,8 @@ function buildHistoryRow(item, kind) {
             // offering a second amount box next to a live address invites paying twice.
             const form = document.getElementById('deposit-form');
             if (form) form.hidden = true;
-            document.getElementById('deposit-provider-copy').hidden = true;
+            const providerCopy = document.getElementById('deposit-provider-copy');
+            if (providerCopy) providerCopy.hidden = true;
             const title = document.getElementById('deposit-title');
             if (title) title.textContent = 'Complete your deposit';
             renderDepositInstructions({
@@ -3296,7 +5006,7 @@ async function loadPaymentHistory(endpoint, containerId, kind) {
     const container = document.getElementById(containerId);
     if (!container) return { settled: false, settledCount: 0 };
     container.textContent = 'Loading history...';
-    const token = sessionStorage.getItem(accountTokenKey);
+    const token = getSessionToken();
     if (!token) {
         container.textContent = 'Sign in to view history.';
         return { settled: false, settledCount: 0 };
@@ -3329,6 +5039,13 @@ async function loadPaymentHistory(endpoint, containerId, kind) {
                     creditedDepositsSeen.add(item.id);
                     newlyConfirmed = item;
                 }
+                if (kind === 'withdrawal') {
+                    const seenStatus =
+                        status === 'paid' ? 'paid' : status === 'failed' ? 'failed' : null;
+                    if (seenStatus && !withdrawalStateSeen(item.id, seenStatus)) {
+                        markWithdrawalSeen(item.id, seenStatus);
+                    }
+                }
             }
 
             fragment.append(buildHistoryRow(item, kind));
@@ -3358,9 +5075,10 @@ async function showDepositSuccess(deposit) {
     const dialog = document.getElementById('deposit-success-dialog');
     if (!dialog || dialog.open) return;
 
-    document.getElementById('deposit-success-amount').textContent =
-        formatBalance(deposit.amount);
-    document.getElementById('deposit-success-lead').textContent = deposit.asset_code
+    const amountEl = document.getElementById('deposit-success-amount');
+    if (amountEl) amountEl.textContent = formatBalance(deposit.amount);
+    const leadEl = document.getElementById('deposit-success-lead');
+    if (leadEl) leadEl.textContent = deposit.asset_code
         ? `Your ${deposit.asset_code} deposit has been confirmed and credited.`
         : 'Your card payment has been confirmed and credited.';
 
@@ -3378,7 +5096,7 @@ async function showDepositSuccess(deposit) {
     let balanceText = '--';
     try {
         const data = await requestJson('/api/user/balance', {
-            headers: { Authorization: `Bearer ${sessionStorage.getItem(accountTokenKey)}` }
+            headers: authHeaders()
         });
         applyBalance(data.balance, data.demoBalance);
         balanceText = formatBalance(data.balance);
@@ -3386,10 +5104,11 @@ async function showDepositSuccess(deposit) {
         // The credit is confirmed regardless; a balance read that fails is not a reason
         // to withhold the confirmation, so the field is simply left unavailable.
     }
-    document.getElementById('deposit-success-balance').textContent = balanceText;
+    const balanceEl = document.getElementById('deposit-success-balance');
+    if (balanceEl) balanceEl.textContent = balanceText;
 
     const receiptLink = document.getElementById('deposit-success-receipt');
-        receiptLink.href = deposit.receipt_url || `/receipt/deposit/${deposit.id}`;
+    if (receiptLink) receiptLink.href = deposit.receipt_url || `/receipt/deposit/${deposit.id}`;
 
     // A toast as well as the dialog: the dialog only appears when the poll that
     // noticed the credit is running, which is while the deposit dialog is open.
@@ -3409,35 +5128,8 @@ function renderReceiptFacts(container, rows) {
         dd.textContent = value;
         list.append(dt, dd);
     }
-    container.replaceChildren(list);
-    container.hidden = false;
-}
-
-/**
- * Announces a deposit that was credited while the user was away.
- *
- * The in-dialog poll only runs while the deposit dialog is open, so a payment that
- * confirmed ten minutes later was never announced at all. This is a single check when the
- * page loads and whenever the tab regains focus, and it is the difference between "my
- * money arrived" being an event and being a number that changed at some point.
- */
-async function announceMissedCredits() {
-    if (!sessionStorage.getItem(accountTokenKey)) return;
-    try {
-        const items = await requestJson('/api/user/deposits', {
-            headers: { Authorization: `Bearer ${sessionStorage.getItem(accountTokenKey)}` }
-        });
-        const missed = items.find((item) => {
-            const status = String(item.status || '').toLowerCase();
-            return (status === 'confirmed' || status === 'paid') && !creditedDepositsSeen.has(item.id);
-        });
-        if (!missed) return;
-        // Mark it seen before showing, so a failure to render cannot cause a repeat on the
-        // next focus event.
-        creditedDepositsSeen.add(missed.id);
-        await showDepositSuccess(missed);
-    } catch (error) {
-        // Silent by design: this is a courtesy notification, and a failed check must not
-        // surface as an error the user did not cause.
+    if (container) {
+        container.replaceChildren(list);
+        container.hidden = false;
     }
 }

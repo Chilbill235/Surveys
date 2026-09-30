@@ -1,5 +1,6 @@
 const pool = require('../config/db');
 const payoutEmails = require('./payoutEmails');
+const { COLUMN, isMoneyEmailEnabled } = require('./emailPreferences');
 
 /**
  * The terminal states a withdrawal can be moved to, and which of them keep the money.
@@ -29,16 +30,16 @@ const WITHDRAWAL_RETURN_COLUMNS = [
     'payment_method', 'payment_address', 'asset_code', 'network'
 ];
 
-/** Reads the recipient address for a withdrawal that has just been closed. */
+/** Reads the recipient address, and the money-email opt-out, for a withdrawal that has just been closed. */
 async function recipientEmail(client, withdrawalId) {
     const row = await client.query(
-        `SELECT u.email
+        `SELECT u.email, u.${COLUMN} AS money_emails
          FROM withdrawals w
          JOIN users u ON u.id = w.user_id
          WHERE w.id = $1`,
         [withdrawalId]
     );
-    return row.rows[0]?.email || null;
+    return row.rows[0] || null;
 }
 
 /**
@@ -75,7 +76,9 @@ async function markWithdrawalPaid(client, withdrawalId, providerReference) {
         return { changed: false, reason: await describeUnclaimable(client, withdrawalId) };
     }
     const withdrawal = claimed.rows[0];
-    withdrawal.user_email = await recipientEmail(client, withdrawal.id);
+    const recipient = await recipientEmail(client, withdrawal.id);
+    withdrawal.user_email = recipient?.email || null;
+    withdrawal.user_money_emails = isMoneyEmailEnabled(recipient?.money_emails);
     return { changed: true, withdrawal };
 }
 
@@ -107,7 +110,7 @@ async function refundWithdrawal(client, withdrawalId, reason) {
     const settled = await client.query(
         `SELECT w.id, w.user_id, w.amount, w.status, w.provider_reference,
                 w.payment_method, w.payment_address, w.asset_code, w.network,
-                u.email AS user_email
+                u.email AS user_email, u.${COLUMN} AS user_money_emails
          FROM withdrawals w
          JOIN users u ON u.id = w.user_id
          WHERE w.id = $1 FOR UPDATE`,
@@ -141,10 +144,14 @@ async function refundWithdrawal(client, withdrawalId, reason) {
     if (closed.rows.length === 0) {
         return { changed: false, reason: 'already-resolved', withdrawal };
     }
-    // The email came from the pre-flight SELECT above, not from this UPDATE, because an
-    // UPDATE cannot join another table in its RETURNING clause. Carried over so the caller
-    // can notify the right person without a second lookup against a row that may have moved.
+    // The email and the opt-out came from the pre-flight SELECT above, not from this UPDATE,
+    // because an UPDATE cannot join another table in its RETURNING clause. Carried over so the
+    // caller can notify the right person, or correctly skip, without a second lookup against a
+    // row that may have moved. `isMoneyEmailEnabled` is applied here for the same reason it is
+    // applied to the value read after a paid write: the caller should not have to know that a
+    // missing value means "send" and a string means "parse".
     closed.rows[0].user_email = withdrawal.user_email;
+    closed.rows[0].user_money_emails = isMoneyEmailEnabled(withdrawal.user_money_emails);
 
     const balanceUpdate = await client.query(
         'UPDATE users SET balance = balance + $1 WHERE id = $2 RETURNING balance',
@@ -235,13 +242,24 @@ async function withTransaction(work) {
  * make a successful payout look like a failure. The email is advisory and is awaited
  * neither for the response nor for the balance, so a mail provider that is down leaves the
  * payout intact and the user simply uninformed.
+ *
+ * "Uninformed" is where the swallowed error used to end. `.catch(() => {})` left no record
+ * anywhere, so a receipt that failed to send and a receipt that was never attempted were
+ * indistinguishable -- which is the state this file's own tests kept reaching without
+ * noticing. The failure is still not propagated, because a mail provider being down must not
+ * fail a payout; it is now logged, so the one thing an operator needs is the one thing they
+ * get.
  */
 async function sendWithdrawal(withdrawalId, providerReference) {
     const result = await withTransaction((client) =>
         markWithdrawalPaid(client, Number(withdrawalId), providerReference)
     );
     if (result.changed) {
-        await notifySent(result.withdrawal).catch(() => {});
+        await notifySent(result.withdrawal).catch((error) => {
+            console.error(
+                `Withdrawal ${withdrawalId} was paid but its receipt email was not sent: ${error.message}`
+            );
+        });
     }
     return result;
 }
@@ -252,7 +270,11 @@ async function reverseWithdrawal(withdrawalId, reason) {
         refundWithdrawal(client, Number(withdrawalId), reason)
     );
     if (result.changed) {
-        await notifyRefunded(result.withdrawal, reason).catch(() => {});
+        await notifyRefunded(result.withdrawal, reason).catch((error) => {
+            console.error(
+                `Withdrawal ${withdrawalId} was refunded but its email was not sent: ${error.message}`
+            );
+        });
     }
     return result;
 }
@@ -261,6 +283,10 @@ async function reverseWithdrawal(withdrawalId, reason) {
 async function notifySent(withdrawal) {
     const email = String(withdrawal?.user_email || '').trim();
     if (!email) return;
+    if (!isMoneyEmailEnabled(withdrawal?.user_money_emails)) {
+        console.log(`Withdrawal ${withdrawal?.id}: user has money email switched off, sent email not sent.`);
+        return;
+    }
     await payoutEmails.sendWithdrawalSentEmail({
         to: email,
         amount: withdrawal.amount,
@@ -275,6 +301,10 @@ async function notifySent(withdrawal) {
 async function notifyRefunded(withdrawal, reason) {
     const email = String(withdrawal?.user_email || '').trim();
     if (!email) return;
+    if (!isMoneyEmailEnabled(withdrawal?.user_money_emails)) {
+        console.log(`Withdrawal ${withdrawal?.id}: user has money email switched off, refunded email not sent.`);
+        return;
+    }
     await payoutEmails.sendWithdrawalRefundedEmail({
         to: email,
         amount: withdrawal.amount,

@@ -56,8 +56,14 @@ if (typeof fetch !== 'function') {
  * `BASE_URL` wins over the built-in default so a deployment can be targeted from the same
  * terminal that runs the local server. A trailing slash is stripped so `BASE_URL=https://x/`
  * and `BASE_URL=https://x` produce the same URL.
+ *
+ * A `let`, not a `const`, because `--url` overrides it. It used to be a `const` and the
+ * override "worked" by assigning `process.env.BASE_URL`, which nothing reads: the value
+ * had already been computed. `npm run withdrawals -- send 10 --url https://elsewhere`
+ * therefore claimed and sent against the default host while printing the `--url` host in
+ * its own error messages -- the override was accepted, announced, and ignored.
  */
-const BASE_URL = String(process.env.BASE_URL || 'http://127.0.0.1:3001').replace(/\/+$/, '');
+let BASE_URL = String(process.env.BASE_URL || 'http://127.0.0.1:3001').replace(/\/+$/, '');
 
 /** How long to wait before giving up on a request, in milliseconds. */
 const REQUEST_TIMEOUT_MS = 30_000;
@@ -298,7 +304,14 @@ function report(response, { json }) {
     return response.ok ? 0 : 1;
 }
 
-const USAGE = `Usage: node scripts/withdrawals.js <command> [args]
+/**
+ * Built on demand rather than at module load, so the default it prints is the one this
+ * run is actually pointed at. With the override applied afterwards, a template literal
+ * evaluated at load time reports the pre-override host -- which is how a script could
+ * claim it was talking to a deployment it was not.
+ */
+function usage() {
+    return `Usage: node scripts/withdrawals.js <command> [args]
 
   list                                     List withdrawals awaiting a decision
   paid <id> <provider-reference>           Mark a withdrawal as sent
@@ -317,8 +330,9 @@ Environment:
   BASE_URL       Target host (default ${BASE_URL})
   CRON_SECRET    Shared secret for the maintenance endpoints
 `;
+}
 
-/** Reads `--url <value>` from the argument list without touching the env. */
+/** Removes `--url <value>` from the argument list so its value is not read as a command. */
 function extractUrlOverride(argv) {
     const at = argv.indexOf('--url');
     if (at === -1) return null;
@@ -330,26 +344,33 @@ function extractUrlOverride(argv) {
 
 async function main() {
     const argv = process.argv.slice(2);
-    const flags = new Set(argv.filter((arg) => arg.startsWith('--')));
-    const positional = argv.filter((arg) => !arg.startsWith('--'));
 
+    // The override is consumed *before* the rest of the arguments are split up. The two
+    // used to run the other way round, and the value of `--url` was left in the
+    // positional list -- where it became the command name, so
+    // `withdrawals.js --url https://example.com list` failed with
+    // `Unknown command "https://example.com"`.
+    //
+    // It replaces `BASE_URL` itself rather than only `process.env.BASE_URL`, because
+    // that is the value every request below actually reads.
     const urlOverride = extractUrlOverride(argv);
     if (urlOverride) {
-        // The override is applied by rewriting the module-level value the `call` function
-        // reads. A parameter would be cleaner, but it would mean threading it through
-        // every command and every diagnostic, and there is only one place it is used.
-        process.env.BASE_URL = urlOverride;
+        BASE_URL = String(urlOverride).replace(/\/+$/, '');
+        process.env.BASE_URL = BASE_URL;
     }
+
+    const flags = new Set(argv.filter((arg) => arg.startsWith('--')));
+    const positional = argv.filter((arg) => !arg.startsWith('--'));
 
     const [name = 'help', ...args] = positional;
     const command = COMMANDS[name];
     if (!command) {
-        throw new UsageError(`Unknown command "${name}".\n\n${USAGE}`);
+        throw new UsageError(`Unknown command "${name}".\n\n${usage()}`);
     }
 
     const request = await command(args);
     if (request.help) {
-        console.log(USAGE);
+        console.log(usage());
         return;
     }
 

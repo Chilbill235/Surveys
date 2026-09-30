@@ -36,6 +36,17 @@ const IDLE_TIMEOUT_MS = 30_000;
 const CONNECTION_TIMEOUT_MS = 5_000;
 
 /**
+ * How long a shutdown is allowed to take before the process exits anyway.
+ *
+ * Every platform that sends SIGTERM sends SIGKILL shortly after, so a pool that cannot
+ * be closed -- because the database has already gone away -- must not be allowed to
+ * hold the process past the point where it would be killed regardless. The cost of
+ * exceeding it is that the connections are severed rather than drained; the cost of not
+ * having the bound at all is that the process is killed mid-close and logs nothing.
+ */
+const SHUTDOWN_TIMEOUT_MS = 5_000;
+
+/**
  * The individual variables `pg` reads when `connectionString` is undefined.
  * A deployment using these instead of a full URL is not misconfigured, and
  * must not be treated as one.
@@ -314,16 +325,114 @@ pool.on('error', (err) => {
  */
 async function verifyConnectivity() {
     let client;
+    let failure = null;
     try {
         client = await pool.connect();
         await client.query('SELECT 1');
         return { ok: true };
     } catch (error) {
+        failure = error;
         return { ok: false, error: describeError(error) };
     } finally {
-        if (client) client.release();
+        // Released *with* the error when there was one. A plain `release()` puts the
+        // client back on the idle list, and if the failure was a severed connection that
+        // client is exactly the one that must be discarded -- it is the failure a health
+        // check is most likely reporting, and handing it to the next request reproduces
+        // the same error on work that never touched the database.
+        if (client) client.release(failure ?? undefined);
     }
 }
+
+/**
+ * Runs `work` inside a transaction and returns whatever it returns.
+ *
+ * Exists because the alternative is the same four lines in every caller, and the four
+ * lines have three ways to be wrong. A `COMMIT` that is not awaited lets the function
+ * return before the transaction is durable, so a caller that reports success can be
+ * describing a commit that then fails. A missing `ROLLBACK` leaves the connection in an
+ * aborted transaction, so the next checkout inherits a client that fails every query
+ * with 25P02 until something resets it. A `release()` on only some of the paths -- the
+ * success path but not the `throw` path, or a `return` added to the callback later --
+ * leaks a client permanently: the pool shrinks one connection at a time and eventually
+ * every request fails with "timeout exceeded when trying to connect", which reads as
+ * the database being down.
+ *
+ * `BEGIN` is awaited before `work` is called, so `work` never issues a query outside the
+ * transaction it is about to be rolled back.
+ */
+async function withTransaction(work) {
+    const client = await pool.connect();
+    let inTransaction = false;
+    try {
+        await client.query('BEGIN');
+        inTransaction = true;
+        const result = await work(client);
+        await client.query('COMMIT');
+        inTransaction = false;
+        return result;
+    } catch (error) {
+        if (inTransaction) {
+            // Best effort, and deliberately swallowed. If the connection is gone the
+            // ROLLBACK fails too, and letting that failure escape would replace the
+            // original error -- the only one that says what actually went wrong -- with
+            // a generic "connection terminated" from the unwind.
+            await client.query('ROLLBACK').catch(() => {});
+        }
+        throw error;
+    } finally {
+        // Unconditional. This is the whole point of the helper: every exit from the
+        // function above, including a `return` inside `work`, passes through here.
+        client.release();
+    }
+}
+
+/**
+ * Closes the pool when the process is asked to stop.
+ *
+ * Vercel, Docker, Kubernetes, systemd, and every container orchestrator send SIGTERM
+ * (and Ctrl-C sends SIGINT) and then SIGKILL after a short grace period. On the default
+ * action the process dies with its sockets still open: PostgreSQL records an abrupt
+ * disconnect, rolls back whatever transaction was in flight -- which is how a deposit
+ * claim can be lost mid-write -- and leaves connection slots to reap. Ending the pool
+ * first drains the idle connections and lets in-flight queries finish inside the grace
+ * period.
+ *
+ * `process.exit` is called explicitly because registering a signal listener replaces
+ * Node's default "terminate immediately" behaviour. Without it the process would keep
+ * running, holding the event loop open on the very handles being closed.
+ */
+function installShutdownHandlers() {
+    let shuttingDown = false;
+
+    const shutdown = (signal) => {
+        // A second signal while the first is still draining must not start a second
+        // `pool.end()`: `pg` rejects that with "Called end on pool more than once", and
+        // the resulting rejection is thrown from a signal handler, where it becomes an
+        // unhandled rejection.
+        if (shuttingDown) return;
+        shuttingDown = true;
+        console.log(`Received ${signal}; closing the PostgreSQL pool.`);
+
+        // Not unref'd: while the pool is still closing this timer is the only thing
+        // guaranteeing the process exits at all if the close hangs.
+        const forced = setTimeout(() => process.exit(0), SHUTDOWN_TIMEOUT_MS);
+
+        pool.end()
+            .catch((error) => {
+                console.error('Error while closing the PostgreSQL pool:', describeError(error));
+            })
+            .then(() => {
+                clearTimeout(forced);
+                process.exit(0);
+            });
+    };
+
+    for (const signal of ['SIGTERM', 'SIGINT']) {
+        process.on(signal, () => shutdown(signal));
+    }
+}
+
+installShutdownHandlers();
 
 // The helpers are attached to the pool so callers that already have it in
 // hand (the routers, the maintenance endpoints) can reach them without a
@@ -333,5 +442,6 @@ async function verifyConnectivity() {
 pool.describeError = describeError;
 pool.buildSslOptions = buildSslOptions;
 pool.verifyConnectivity = verifyConnectivity;
+pool.withTransaction = withTransaction;
 
 module.exports = pool;

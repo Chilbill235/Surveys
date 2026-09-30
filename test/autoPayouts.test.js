@@ -322,6 +322,86 @@ test('a refused submission releases the claim, and an unknown one holds it', asy
 });
 
 /**
+ * A failure at the token exchange is the one transport failure that is safe to give up on.
+ *
+ * `POST /v1/auth` creates nothing and moves no funds -- it hands back a five-minute JWT. If it
+ * did not complete then no batch was made, nothing was submitted, and no callback is coming.
+ * Holding the claim anyway is what leaves a user short by the full amount, in `processing`,
+ * with no email, because a misconfigured outbound proxy (the usual cause) is a deployment
+ * fault and should not need a user's withdrawal touched to work around.
+ */
+test('a failure at the auth stage fails the withdrawal instead of stranding it', async () => {
+    const claimed = [{ id: 5, payoutId: 'wd-5', address: 'bc1qexample', currency: 'btc', amount: 0.001, assetCode: 'btc', network: 'bitcoin' }];
+    const originalSubmit = nowPayments.submitPayoutBatch;
+    // A row in the state the claim left it: `processing`, no provider reference, so there is
+    // no evidence a payout was ever submitted and `refundWithdrawal` will not refuse it.
+    const row = {
+        id: 5, user_id: 1, amount: '20.00', status: 'processing', payout_status: 'SUBMIT_FAILED',
+        provider_reference: null, payment_method: 'crypto', payment_address: 'bc1qexample',
+        asset_code: 'BTC', network: 'bitcoin', user_email: 'user@example.com', user_money_emails: true
+    };
+    try {
+        nowPayments.submitPayoutBatch = async () => {
+            throw new nowPayments.NowPaymentsError(
+                'NOWPayments request to /v1/auth could not be completed.',
+                { path: '/v1/auth' }
+            );
+        };
+        const { result, statements } = await withStubbedWithdrawals(
+            () => autoPayouts.submitClaimedPayouts(claimed),
+            { rows: [row] }
+        );
+
+        // Closed and refunded, not held: there was no payout for it to be uncertain about.
+        assert.equal(result.uncertain, 0);
+        assert.equal(result.abandoned, 1);
+        assert.equal(result.outcomes[0].verdict, 'abandoned');
+        // It must NOT go back to `pending` -- that would be a resend -- and must not be parked
+        // as unknown either, which is the stranding this replaces.
+        assert.equal(sqlMatching(statements, "SET status = 'pending'").length, 0);
+        assert.equal(sqlMatching(statements, "SET payout_status = 'SUBMISSION_UNKNOWN'").length, 0);
+        // The refund is a real ledger-and-balance write, not a status flip.
+        assert.equal(sqlMatching(statements, "SET status = 'failed'").length, 1);
+        assert.equal(sqlMatching(statements, 'UPDATE users SET balance').length, 1);
+        assert.equal(sqlMatching(statements, 'INSERT INTO balance_transactions').length, 1);
+    } finally {
+        nowPayments.submitPayoutBatch = originalSubmit;
+    }
+});
+
+/**
+ * A failure after the batch exists is a different animal, and must keep the old behaviour.
+ *
+ * Once `submitPayoutBatch` has returned, a batch may or may not have been released. Failing
+ * these would refund a user whose money is already in flight, which is the one outcome that
+ * pays the same withdrawal twice. The test exists to stop the new fast path from creeping
+ * across that line.
+ */
+test('a failure after the batch exists is still held, never auto-failed', async () => {
+    const claimed = [{ id: 5, payoutId: 'wd-5', address: 'bc1qexample', currency: 'btc', amount: 0.001 }];
+    const originalSubmit = nowPayments.submitPayoutBatch;
+    try {
+        // Same exception, same transport failure -- but this one is at the submission path.
+        nowPayments.submitPayoutBatch = async () => {
+            throw new nowPayments.NowPaymentsError(
+                'NOWPayments request to /v1/payout could not be completed.',
+                { path: '/v1/payout' }
+            );
+        };
+        const { result, statements } = await withRecordedDatabase(() => autoPayouts.submitClaimedPayouts(claimed));
+
+        assert.equal(result.uncertain, 1);
+        assert.equal(result.abandoned, undefined);
+        assert.equal(wroteValue(statements, 'SUBMISSION_UNKNOWN'), true);
+        // No refund. This is the assertion that keeps the auth fix from becoming a double-pay.
+        assert.equal(sqlMatching(statements, "transaction_type, source_id").length, 0);
+        assert.equal(sqlMatching(statements, "SET status = 'failed'").length, 0);
+    } finally {
+        nowPayments.submitPayoutBatch = originalSubmit;
+    }
+});
+
+/**
  * The batch is created but not sent until it is verified.
  *
  * This is the step whose absence produces no error at all: the provider accepts the batch,

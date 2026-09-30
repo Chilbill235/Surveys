@@ -31,6 +31,20 @@ function historyUrl() {
 }
 
 /**
+ * The history link as a `link` block, so it survives a client that drops the button.
+ *
+ * Every message here carries a "View history" button, and every one of them also needs the
+ * URL written out: these are the messages a user opens on a phone to find out whether their
+ * money arrived, which is exactly the client most likely to have lost the button. Returns an
+ * empty list when there is no public base URL, so a caller can spread it into `blocks`
+ * without a conditional.
+ */
+function historyLinkBlocks() {
+    const history = historyUrl();
+    return history ? [{ type: 'link', label: 'Or open your withdrawal history:', url: history }] : [];
+}
+
+/**
  * The amount, formatted for a human.
  *
  * Stored as a numeric, so it is formatted here rather than passed through pre-formatted. A
@@ -82,6 +96,7 @@ async function sendWithdrawalStartedEmail({ to, amount, assetCode, network, dest
     ];
 
     const history = historyUrl();
+    blocks.push(...historyLinkBlocks());
 
     return sendEmail({
         to,
@@ -129,6 +144,7 @@ async function sendWithdrawalSentEmail({ to, amount, assetCode, network, destina
     }
 
     const history = historyUrl();
+    blocks.push(...historyLinkBlocks());
 
     return sendEmail({
         to,
@@ -150,6 +166,101 @@ async function sendWithdrawalSentEmail({ to, amount, assetCode, network, destina
     });
 }
 
+/**
+ * Sent when a payout is held because its outcome is unknown.
+ *
+ * The case this exists for: a claim is taken, the provider is called, and the call fails in a
+ * way that does not say whether the money moved. The claim is deliberately kept rather than
+ * released -- releasing it is the one action that can pay a withdrawal twice -- so the row
+ * sits in `processing` until an operator or a reconciliation pass settles it.
+ *
+ * Silence is what made that unworkable. The balance was debited the moment the request was
+ * stored, so a user in this state is short by the full amount with no message and no way to
+ * tell "being sent" from "stuck". They file a ticket, or submit a second withdrawal.
+ *
+ * So it says the two things that are actually true and the one that matters: the money has
+ * **not** been sent, the amount is still held for them, and nothing is needed from them.
+ * It does not promise a time, because there is none to give -- a held payout is waiting on a
+ * provider lookup, and how long that takes is not something this system controls.
+ */
+async function sendWithdrawalDelayedEmail({ to, amount, assetCode, network, reason, stage = 'submit' }) {
+    if (!isEmailConfigured()) {
+        console.error('Withdrawal-delayed email was not sent (email is not configured).');
+        return { sent: false, reason: 'email-not-configured' };
+    }
+
+    const money = formatAmount(amount);
+    const assetLabel = String(assetCode || '').toUpperCase() || 'crypto';
+    const networkLabel = String(network || '').trim();
+    const method = networkLabel ? `${assetLabel} (${networkLabel})` : assetLabel;
+    const detail = String(reason || '').trim().slice(0, 200);
+
+    // The two stages are not interchangeable, and saying the wrong one is worse than saying
+    // nothing. Before the batch exists, nothing can have been sent, so the amount is
+    // certainly still held. Once a batch has been created and only the release is
+    // unconfirmed, the transfer may genuinely be in flight -- claiming it has not moved would
+    // be a false statement about the user's money, and could talk them into chasing something
+    // that is already on its way.
+    const moneyMayHaveMoved = stage === 'verify';
+
+    const callout = moneyMayHaveMoved
+        ? 'Your withdrawal has been sent to the payment provider and may already be moving. We are confirming the exact status before we tell you it has arrived.'
+        : 'Your money has not left. The full amount is still held against your balance and is not lost.';
+
+    const intro = moneyMayHaveMoved
+        ? `We are still confirming the status of your ${money || ''} withdrawal. Nothing is needed from you.`.replace(/\s+/g, ' ').trim()
+        : `We have not been able to send your ${money || ''} withdrawal, so we have paused it rather than risk sending it twice.`;
+
+    const items = [
+        { label: 'Amount', value: money || 'Unknown' },
+        { label: 'Method', value: method },
+        { label: 'Status', value: moneyMayHaveMoved ? 'Sent - confirmation pending' : 'Held - not yet sent' }
+    ];
+
+    const history = historyUrl();
+    const message = {
+        subject: moneyMayHaveMoved
+            ? `${money || 'Your'} withdrawal is on its way - confirming the exact status`
+            : `${money || 'Your'} withdrawal is delayed, not lost`,
+        preheader: moneyMayHaveMoved
+            ? `${money || 'Your withdrawal'} has been sent. We are confirming before we say it has arrived.`
+            : `${money || 'Your withdrawal'} has not been sent yet. The money is still held for you.`,
+        heading: moneyMayHaveMoved ? 'Your withdrawal is on its way' : 'Your withdrawal is on hold',
+        footnote: 'We will email you as soon as this is resolved, whichever way it goes.'
+    };
+
+    const blocks = [
+        { type: 'callout', tone: moneyMayHaveMoved ? 'warning' : 'warning', text: callout },
+        { type: 'details', items },
+        ...(detail ? [{ type: 'callout', tone: 'neutral', text: `What we saw: ${detail}` }] : []),
+        { type: 'paragraph', text: moneyMayHaveMoved
+            ? 'We are checking with the payment provider now. You do not need to do anything, and you should not ' +
+              'submit this withdrawal again - we will confirm when it completes, or return it to your balance.'
+            : 'We are checking with the payment provider now. You do not need to do anything, and you should not ' +
+              'submit this withdrawal again - we will either send it or return it to your balance.' },
+        ...historyLinkBlocks()
+    ];
+
+    return sendEmail({
+        to,
+        subject: message.subject,
+        text: renderEmailText({
+            intro,
+            blocks,
+            action: history ? { label: 'View withdrawal history', url: history } : null,
+            footnote: message.footnote
+        }),
+        html: renderEmail({
+            preheader: message.preheader,
+            heading: message.heading,
+            intro,
+            blocks,
+            action: history ? { label: 'View withdrawal history', url: history } : null,
+            footnote: message.footnote
+        })
+    });
+}
+
 /** Sent when a payout is refused and the balance is returned. */
 async function sendWithdrawalRefundedEmail({ to, amount, reason }) {
     if (!isEmailConfigured()) {
@@ -160,15 +271,19 @@ async function sendWithdrawalRefundedEmail({ to, amount, reason }) {
     const money = formatAmount(amount);
     const detail = String(reason || 'The payout provider refused this withdrawal.').slice(0, 200);
     const history = historyUrl();
+    // Named here rather than inline in both render calls, so the two copies cannot drift --
+    // and so the history link can be appended once and appear in both.
+    const blocks = [
+        { type: 'callout', tone: 'neutral', text: detail },
+        ...historyLinkBlocks()
+    ];
 
     return sendEmail({
         to,
         subject: `${money} returned to your account`,
         text: renderEmailText({
             intro: `Your withdrawal of ${money || 'an unknown amount'} was not sent and the money has been returned to your balance.`,
-            blocks: [
-                { type: 'callout', tone: 'neutral', text: detail }
-            ],
+            blocks,
             action: history ? { label: 'View history', url: history } : null,
             footnote: 'If you would like to try again, you can submit a new withdrawal request.'
         }),
@@ -176,9 +291,7 @@ async function sendWithdrawalRefundedEmail({ to, amount, reason }) {
             preheader: `${money} has been returned to your balance.`,
             heading: 'Withdrawal returned',
             intro: `Your withdrawal of ${money || 'an unknown amount'} was not sent, so the money has been returned to your balance.`,
-            blocks: [
-                { type: 'callout', tone: 'neutral', text: detail }
-            ],
+            blocks,
             action: history ? { label: 'View history', url: history } : null,
             footnote: 'If you would like to try again, you can submit a new withdrawal request.'
         })
@@ -188,5 +301,6 @@ async function sendWithdrawalRefundedEmail({ to, amount, reason }) {
 module.exports = {
     sendWithdrawalStartedEmail,
     sendWithdrawalSentEmail,
+    sendWithdrawalDelayedEmail,
     sendWithdrawalRefundedEmail
 };

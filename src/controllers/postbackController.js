@@ -7,6 +7,17 @@ const { parseAmountInRange } = require('../services/money');
 // ---------------------------------------------------------------------------
 
 /**
+ * The shape `clicks.click_id` has.
+ *
+ * The column is a UUID, and PostgreSQL raises `22P02` for any text that is not one, so an
+ * unvalidated id turns a malformed postback into a 500 rather than the 400 that describes
+ * it. A repeated query parameter is refused the same way: `String(['a','b'])` is `'a,b'`,
+ * which is neither a UUID nor a lookup that could match.
+ */
+const CLICK_ID_PATTERN = /^[\da-f]{8}-(?:[\da-f]{4}-){3}[\da-f]{12}$/i;
+const MAX_CLICK_ID_LENGTH = 64;
+
+/**
  * Whether the request carries a secret that matches POSTBACK_SECRET.
  *
  * Two things that matter for the answer to be trustworthy:
@@ -97,15 +108,19 @@ const postbackController = {
             return res.status(403).send('Unauthorized postback.');
         }
 
-        const clickId = String(req.query.click_id || req.body?.click_id || '').trim();
+        const rawClickId = req.query.click_id ?? req.body?.click_id;
+        const clickId = Array.isArray(rawClickId) ? '' : String(rawClickId || '').trim();
         const payout = parsePayoutAmount(req.query.payout ?? req.body?.payout);
         const newStatus = normalizeStatus(req.query.status ?? req.body?.status);
 
         // The payout is allowed to be null only when the status is one where no
         // money changes hands. A rejected postback with no payout is legitimate;
         // an approved one is not, because there is nothing to credit.
-        if (!clickId || clickId.length > 128 || newStatus === null) {
+        if (!clickId || clickId.length > MAX_CLICK_ID_LENGTH || newStatus === null) {
             return res.status(400).send('Invalid postback parameters.');
+        }
+        if (!CLICK_ID_PATTERN.test(clickId)) {
+            return res.status(400).send('Invalid click ID.');
         }
         if (payout === null && newStatus === 'approved') {
             return res.status(400).send('An approved postback must include a payout amount.');
@@ -122,7 +137,7 @@ const postbackController = {
             // not on `conversions`, because the click row is the one that
             // exists on both the insert path and the update path.
             const clickRes = await client.query(
-                `SELECT clicks.user_id, offers.is_demo
+                `SELECT clicks.user_id, offers.is_demo, offers.payout AS offer_payout
                  FROM clicks
                  JOIN offers ON offers.id = clicks.offer_id
                  WHERE clicks.click_id = $1
@@ -136,6 +151,11 @@ const postbackController = {
             }
 
             const { user_id: userId, is_demo: isDemo } = clickRes.rows[0];
+            // What the catalog advertised this offer pays, read here so the amount that is
+            // about to be credited is checked against a stored row rather than trusted from
+            // the request. `|| 0` makes an absent or unreadable payout fail closed: an offer
+            // with no recorded amount cannot have a postback that credits one.
+            const offerPayout = Number(clickRes.rows[0].offer_payout) || 0;
 
             const convRes = await client.query(
                 `SELECT payout, status, revision FROM conversions WHERE click_id = $1 FOR UPDATE`,
@@ -206,6 +226,25 @@ const postbackController = {
                 const shouldReverse = oldStatus === 'approved'
                     && newStatus !== 'approved'
                     && oldPayout > 0;
+
+                // A credit cannot be larger than the offer's own payout. This is the same rule
+                // the deposit path follows -- a provider's payment id, amount, and currency
+                // must match the stored deposit before anything is credited -- applied to the
+                // other direction money enters the system. Without it the amount in the
+                // postback is the only number that decides a balance, so anyone who can reach
+                // this endpoint decides a balance.
+                //
+                // Only over-payment is refused. A network that pays less than advertised is
+                // not a reason to refuse a real conversion, and the reversal path is
+                // unaffected because it takes back what was credited.
+                if (shouldCredit && payoutAmount > offerPayout) {
+                    console.error(
+                        `Refused a postback for click ${clickId}: it reports ${payoutAmount} ` +
+                        `and the offer pays ${offerPayout}.`
+                    );
+                    await client.query('ROLLBACK');
+                    return res.status(400).send('Postback payout does not match the offer payout.');
+                }
 
                 if (shouldCredit) {
                     await creditConversion(client, {

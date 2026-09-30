@@ -80,8 +80,15 @@ function emailConfiguration() {
  * unverified sender, a rejected address, an exhausted daily quota -- and without it the
  * operator is left with a bare status code and no way to tell a configuration fault from a
  * bad recipient.
+ *
+ * `replyTo` is optional and only meaningful for messages a person is expected to answer.
+ * The contact form is the case that matters: the site owner receives it from the site's own
+ * address, and without a reply-to the reply goes to the site address too, so answering
+ * "just reply" -- which the footer tells them to do -- reaches the support inbox instead of
+ * the person who wrote. Brevo names it `replyTo` and Resend `reply_to`, and both require a
+ * verified sender there, which is the same address already sending the message.
  */
-async function sendEmail({ to, subject, text, html }) {
+async function sendEmail({ to, subject, text, html, replyTo }) {
     const provider = emailProvider();
     if (!provider) return { sent: false, reason: 'no email provider is configured' };
     if (!isEmailConfigured()) {
@@ -90,6 +97,12 @@ async function sendEmail({ to, subject, text, html }) {
 
     const from = senderAddress();
     const name = senderName();
+    // An address a person typed is only trusted enough to be a reply-to once it is a
+    // well-formed address. Anything else is dropped rather than passed to the provider,
+    // which would reject the whole message over a header.
+    const replyToAddress = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(String(replyTo || '').trim())
+        ? String(replyTo).trim()
+        : null;
 
     try {
         const response = await fetch(provider === 'brevo' ? BREVO_ENDPOINT : RESEND_ENDPOINT, {
@@ -108,14 +121,16 @@ async function sendEmail({ to, subject, text, html }) {
                     to: [{ email: to }],
                     subject,
                     htmlContent: html,
-                    textContent: text
+                    textContent: text,
+                    ...(replyToAddress ? { replyTo: { email: replyToAddress } } : {})
                 }
                 : {
                     from: `${name} <${from}>`,
                     to: [to],
                     subject,
                     text,
-                    html
+                    html,
+                    ...(replyToAddress ? { reply_to: replyToAddress } : {})
                 }),
             // Without this the request can outlive the serverless invocation that started it,
             // and the caller is left waiting on a send that may already have happened.

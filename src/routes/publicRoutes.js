@@ -3,7 +3,6 @@ const router = express.Router();
 const clickController = require('../controllers/clickController');
 const demoController = require('../controllers/demoController');
 const postbackController = require('../controllers/postbackController');
-const paymentController = require('../controllers/paymentController');
 const fraudDetection = require('../middlewares/fraudDetection');
 const requireAuth = require('../middlewares/requireAuth');
 const pool = require('../config/db');
@@ -136,6 +135,16 @@ router.post('/api/demo/complete', requireAuth, demoController.complete);
 router.get('/api/demo/survey', requireAuth, demoController.survey);
 registerMethod(/^\/api\/demo\/complete\/?$/, ['POST']);
 registerMethod(/^\/api\/demo\/survey\/?$/, ['GET']);
+// The three public routes that were missing from this list. The registry exists so a known
+// path reached with the wrong verb answers 405 with the correct `Allow` header instead of a
+// flat 404 -- a distinction that is the whole point of the design, and one that quietly did
+// not apply to these. `GET /api/contact` reported "API route not found" for a contact form
+// that exists, which reads as the feature being absent rather than as a method mistake.
+registerMethod(/^\/api\/offers\/?$/, ['GET']);
+registerMethod(/^\/api\/contact\/?$/, ['POST']);
+// `\d{1,19}` rather than `[^/]+`: the id is numeric everywhere else, and bounding the length
+// keeps a hostile path segment from being reflected into a log line unexamined.
+registerMethod(/^\/api\/click\/\d{1,19}\/?$/, ['GET', 'POST']);
 
 // ---------------------------------------------------------------------------
 // Server-to-server postbacks from advertiser networks
@@ -150,28 +159,162 @@ router.route('/api/postback')
 // ---------------------------------------------------------------------------
 
 /**
- * Rejects any non-POST request to the NOWPayments IPN endpoint.
+ * The NOWPayments IPN endpoint is registered once, in `src/app.js`, immediately before the
+ * global body middleware so its raw body parser can run first.
  *
- * The provider only posts, so a GET here is a misconfigured scheduler or a
- * probe. `Allow: POST` is set per RFC 7231 so a well-behaved client and a
- * scanner both see the correct method rather than a bare 405.
- *
- * Registered as an `.all()` guard rather than a `.get()` handler so PUT and
- * DELETE also receive a proper 405 rather than Express's default 404, which
- * would leave the route looking unregistered to anything that only checks
- * whether the endpoint exists.
+ * A second copy used to sit here as well. It was unreachable -- the route in `app.js`
+ * matches first, for every method -- and its 405 body carried a different shape from the one
+ * that actually answers, so the two had already begun to disagree about what a caller is
+ * told. A duplicate that cannot be reached is worse than no duplicate: it looks like the live
+ * definition and is not one.
  */
-function requirePostIpn(req, res, next) {
-    if (req.method === 'POST') return next();
-    res.set('Allow', 'POST');
-    return res.status(405).json({
-        error: 'This webhook only accepts provider POST requests.',
-        method: 'POST',
-    });
+
+// ---------------------------------------------------------------------------
+// Contact form
+// ---------------------------------------------------------------------------
+
+/**
+ * Validates that a string is non-empty after trimming.
+ */
+function validateRequired(data, fields) {
+    const errors = [];
+    for (const field of fields) {
+        if (!data[field] || String(data[field]).trim().length === 0) {
+            errors.push(`Missing required field: ${field}`);
+        }
+    }
+    return errors;
 }
 
-router.route('/api/payments/nowpayments/ipn')
-    .all(requirePostIpn)
-    .post(paymentController.nowPaymentsIpn);
+/** Rate-limit key for the contact endpoint. */
+function contactRateLimitKey(req) {
+    return req.ip || 'unknown';
+}
+
+/**
+ * Submissions seen per address, per window.
+ *
+ * A Map rather than an object so a key is a key, and so the sweep below can
+ * delete entries without walking a prototype chain.
+ */
+const contactRateLimits = new Map();
+
+/**
+ * Simple in-memory rate limiter: max 3 submissions per IP per 10 minutes.
+ *
+ * The window is swept on the way in, so the map holds the addresses seen in the
+ * last ten minutes rather than every address the process has ever served.
+ * Without that, nothing ever released an entry and the map grew for the life
+ * of the instance.
+ */
+function contactRateLimit(req, res, next) {
+    const key = contactRateLimitKey(req);
+    const now = Date.now();
+    const windowMs = 10 * 60 * 1000;
+
+    for (const [address, bucket] of contactRateLimits) {
+        if (now - bucket.first > windowMs) contactRateLimits.delete(address);
+    }
+
+    const bucket = contactRateLimits.get(key);
+    if (!bucket) {
+        contactRateLimits.set(key, { first: now, count: 1 });
+        return next();
+    }
+
+    bucket.count += 1;
+    if (bucket.count > 3) {
+        // Written through the `res` this middleware was given. Reaching for
+        // `req.res` instead made the refusal depend on a property Express does
+        // not set, so the branch answered `null` and returned without calling
+        // `next()` -- a request that hangs instead of one that is limited.
+        return res.status(429).json({ error: 'Too many contact requests. Please try again later.' });
+    }
+    return next();
+}
+
+router.post('/api/contact', contactRateLimit, async (req, res) => {
+    const errors = validateRequired(req.body, ['name', 'email', 'subject', 'message']);
+    if (errors.length > 0) {
+        return res.status(400).json({ error: errors[0] });
+    }
+
+    // Coerced to strings before the length checks, because a JSON body can carry a
+    // number or an object for any of these fields. `(123).length > 5000` is
+    // `undefined > 5000`, which is false, so a non-string field skipped the limit
+    // entirely and reached the mailer as whatever it happened to be.
+    const name = String(req.body.name).trim();
+    const email = String(req.body.email).trim();
+    const subject = String(req.body.subject).trim();
+    const message = String(req.body.message).trim();
+
+    // Every field is bounded, not only the three that were. An unbounded address
+    // is as much a way to make somebody else's mail server do the work as an
+    // unbounded message is.
+    if (message.length > 5000 || subject.length > 200 || name.length > 200 || email.length > 254) {
+        return res.status(400).json({ error: 'Field length exceeds limit.' });
+    }
+
+    const { sendEmail, isEmailConfigured } = require('../services/mailer');
+    const { renderEmail, renderEmailText } = require('../services/emailLayout');
+
+    if (!isEmailConfigured()) {
+        console.warn('Contact form submission ignored: email is not configured.');
+        return res.status(503).json({ error: 'The contact form is not yet available on this deployment.' });
+    }
+
+    // The reply-to, so "reply to this message" in the footer reaches the person who wrote
+    // it. Without it a reply lands on the site's own address and the support inbox answers
+    // its own customer.
+    const recipient = process.env.CONTACT_EMAIL || process.env.EMAIL_FROM;
+
+    try {
+        // A `details` block rather than three paragraphs of "Name: ... From: ...", because
+        // the message is the one place the owner's own copy carries the sender's details, and
+        // a two-column table makes the reply-to address something they can read without
+        // parsing a sentence.
+        const senderFacts = {
+            items: [
+                { label: 'From', value: name },
+                { label: 'Reply to', value: email },
+                { label: 'Subject', value: subject },
+            ],
+        };
+        const shared = {
+            blocks: [
+                senderFacts,
+                { type: 'paragraph', text: message },
+            ],
+            footerNote: 'Sent from the RewardZone contact form. Replying goes straight to the address above.',
+        };
+
+        await sendEmail({
+            to: recipient,
+            // The subject is prefixed so a contact lands in its own filter alongside the
+            // transactional mail, and the sender's subject follows rather than being
+            // replaced -- `[Contact]` alone means every message looks identical in a list.
+            subject: `[Contact] ${subject}`,
+            html: renderEmail({
+                ...shared,
+                heading: `New message from ${name}`,
+                preheader: `Support message from ${name}: ${subject}`,
+                // The action a support inbox most needs, and the one a "Reply to" footer
+                // cannot deliver by itself in a client that routes replies to the sender
+                // address rather than the reply-to header.
+                action: { label: 'Reply to this message', url: `mailto:${email}` },
+            }),
+            text: renderEmailText({
+                ...shared,
+                action: { label: 'Reply to this message', url: `mailto:${email}` },
+            }),
+            replyTo: email,
+        });
+
+        res.json({ success: true, message: 'Message sent successfully.' });
+    } catch (error) {
+        console.error('Contact form error:', error.message);
+        res.status(500).json({ error: 'Failed to send message. Please try again later.' });
+    }
+});
 
 module.exports = router;

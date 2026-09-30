@@ -100,15 +100,39 @@ async function main() {
         ? 'Secret-file check skipped: git is unavailable, so nothing could be confirmed tracked.'
         : `Secret-file check passed: none of ${forbiddenFiles.join(', ')} is tracked by git.`);
 
-    const bundledEntryPoints = [
-        'public/app.js',
-        'public/home.js',
-        'public/demo.js',
-        'public/reset-password.js',
-        'public/deposit-receipt.js'
-    ];
-    for (const relativePath of bundledEntryPoints) {
+    // The entry points are read out of the pages rather than listed here.
+    //
+    // This was a hardcoded array, so it silently fell behind: `contact.js` and `history.js`
+    // were added and shipped on five and two pages respectively without ever appearing in
+    // this report. A page whose `<script src>` points at a file that does not exist then
+    // fails silently in the browser -- a 404 script, and a page whose buttons do nothing --
+    // while the build reports a clean set of entry points. Reading the pages makes the list
+    // self-maintaining, and makes a missing script a build failure instead.
+    const publicDirectory = path.join(projectRoot, 'public');
+    const entryPoints = new Map(); // repo-relative path -> the pages that load it
+    for (const page of fs.readdirSync(publicDirectory).filter((f) => f.endsWith('.html'))) {
+        const html = fs.readFileSync(path.join(publicDirectory, page), 'utf8');
+        for (const match of html.matchAll(/<script[^>]*src="\/([^"?#]+\.js)"/g)) {
+            const relativePath = `public/${match[1]}`;
+            if (!entryPoints.has(relativePath)) entryPoints.set(relativePath, []);
+            entryPoints.get(relativePath).push(page);
+        }
+    }
+
+    if (entryPoints.size === 0) {
+        console.error('Build aborted: no page loads a script, so there is nothing to deploy.');
+        process.exit(1);
+    }
+
+    for (const relativePath of [...entryPoints.keys()].sort()) {
         const absolutePath = path.join(projectRoot, relativePath);
+        if (!fs.existsSync(absolutePath)) {
+            console.error(
+                `Build aborted: ${entryPoints.get(relativePath).join(', ')} load ${relativePath}, ` +
+                'which does not exist. The page would 404 its script and render with dead controls.'
+            );
+            process.exit(1);
+        }
         const source = fs.readFileSync(absolutePath, 'utf8');
         const size = zlib.gzipSync(Buffer.from(source)).length;
         console.log(`${relativePath}: ${source.length} bytes (${size} bytes gzipped)`);
@@ -137,25 +161,60 @@ async function main() {
  * which no amount of running the good path would prove.
  */
 function checkRouting(config) {
-    const rewrites = (config && config.rewrites) || [];
-    const catchAll = rewrites.find((rule) => !/^\/api\//.test(rule.source));
-    if (!catchAll) {
+    const rewrites = config && config.rewrites;
+
+    // `rewrites` is not required to be an array: Vercel also accepts an object with
+    // `beforeFiles` / `afterFiles` / `fallback` keys, and a `vercel.json` that uses that
+    // form leaves `rewrites.find` undefined, so the check below threw a TypeError from
+    // inside a build script and the reason it was checking was never printed. Rejecting
+    // the shape explicitly says which key to look at.
+    if (!Array.isArray(rewrites)) {
+        return {
+            ok: false,
+            reason: '`rewrites` is not an array. Vercel also accepts the object form ' +
+                '(`beforeFiles` / `afterFiles` / `fallback`), which this check cannot read; ' +
+                'use the array form so the catch-all below is verifiable.'
+        };
+    }
+
+    // Every rewrite whose source is not under /api/ can serve a page request, so every
+    // one of them has to land on the function.
+    //
+    // The original version took the *first* such rule and checked only that one. That is
+    // fooled by a narrower page rule placed before the catch-all -- `{"source":
+    // "/offer/engage", "destination": "/api/index.js"}` is a perfectly reasonable thing
+    // to add and it satisfies every test below, so a catch-all still pointing at
+    // `index.html` after it was never examined. Which rule is checked therefore depends
+    // on where it happens to sit in the array, and JSON key order in the file is not
+    // something a reviewer reasons about.
+    const pageRules = rewrites.filter((rule) => !/^\/api\//.test(rule.source || ''));
+
+    if (pageRules.length === 0) {
         return {
             ok: false,
             reason: 'no catch-all. Non-API paths are unrouted, so /offer/engage, /, /reset-password, and /receipt/deposit/:id will 404.'
         };
     }
-    if (/index\.html$/.test(catchAll.destination)) {
-        return {
-            ok: false,
-            reason: 'non-API paths go to index.html. That swallows /offer/engage, so clicking an ' +
-                'offer returns the user to the catalog instead of the advertiser, and breaks /, ' +
-                '/reset-password, and /receipt/deposit/:id. Point it at the function instead.'
-        };
+
+    for (const rule of pageRules) {
+        const destination = String(rule.destination || '');
+        if (/index\.html$/.test(destination)) {
+            return {
+                ok: false,
+                reason: 'non-API paths go to index.html. That swallows /offer/engage, so clicking an ' +
+                    'offer returns the user to the catalog instead of the advertiser, and breaks /, ' +
+                    '/reset-password, and /receipt/deposit/:id. Point it at the function instead.'
+            };
+        }
+        if (!/^\/api\//.test(destination)) {
+            return { ok: false, reason: `page requests are routed to ${destination}, which is not a function.` };
+        }
     }
-    if (!/^\/api\//.test(catchAll.destination)) {
-        return { ok: false, reason: `page requests are routed to ${catchAll.destination}, which is not a function.` };
-    }
+
+    // Vercel applies rewrites in order and the first match wins, so the rule that has to
+    // exist is the last one: it is the only one still reachable after the /api/ rule has
+    // had its chance.
+    const catchAll = pageRules[pageRules.length - 1];
     return { ok: true, source: catchAll.source, destination: catchAll.destination };
 }
 

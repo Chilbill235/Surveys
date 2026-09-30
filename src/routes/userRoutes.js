@@ -6,6 +6,8 @@ const pool = require('../config/db');
 const paymentController = require('../controllers/paymentController');
 const { rateLimitByIp } = require('../services/security');
 const { register: registerMethod } = require('./methodRegistry');
+const emailPreferences = require('../services/emailPreferences');
+const profile = require('../services/profile');
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -116,6 +118,190 @@ function sendDatabaseFailure(res, logPrefix, error) {
 
 // ---------------------------------------------------------------------------
 // Account state
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Email preferences
+// ---------------------------------------------------------------------------
+
+/**
+ * Reads the one switchable email setting.
+ *
+ * The response carries the policy as well as the value, so the page can name what stays
+ * switched on instead of asserting it. "Some email always arrives" is not something a user
+ * can act on; "your password reset always arrives" is.
+ */
+router.get('/email-preferences', async (req, res) => {
+    try {
+        const result = await pool.query(
+            `SELECT money_emails_enabled FROM users WHERE id = $1`,
+            [req.user.id]
+        );
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'User not found.' });
+        }
+        return res.json({
+            moneyEmailsEnabled: emailPreferences.isMoneyEmailEnabled(result.rows[0].money_emails_enabled),
+            ...emailPreferences.describePolicy()
+        });
+    } catch (error) {
+        return sendDatabaseFailure(res, 'Email Preferences Error', error);
+    }
+});
+
+/**
+ * Turns money email on or off.
+ *
+ * Strict about the body: only a real boolean is accepted. A `PATCH` that treated any
+ * non-`false` value as truthy would mean a client sending `{ moneyEmailsEnabled: "false" }`,
+ * or `{}`, or `0`, silently switched the user's receipts off. A preference the user did not
+ * clearly express is not a preference, and the failure is invisible because the response
+ * reports the stored value as if the request had been understood.
+ */
+router.patch('/email-preferences', async (req, res) => {
+    const requested = req.body ? req.body.moneyEmailsEnabled : undefined;
+    if (typeof requested !== 'boolean') {
+        return res.status(400).json({ error: 'moneyEmailsEnabled must be true or false.' });
+    }
+    try {
+        const stored = await emailPreferences.setMoneyEmailPreference(req.user.id, requested);
+        if (stored === null) {
+            return res.status(404).json({ error: 'User not found.' });
+        }
+        return res.json({
+            moneyEmailsEnabled: stored,
+            ...emailPreferences.describePolicy()
+        });
+    } catch (error) {
+        return sendDatabaseFailure(res, 'Email Preferences Error', error);
+    }
+});
+
+// ---------------------------------------------------------------------------
+// Profile
+// ---------------------------------------------------------------------------
+
+/**
+ * Reads the signed-in user's display name and profile picture.
+ *
+ * Scoped to `req.user.id`, so there is no id in the path to tamper with and no way to ask
+ * this endpoint about anybody else. A user who has set neither field gets `null` for both
+ * rather than a 404, because "you have not chosen a name" is a normal state and the
+ * interface has a fallback for it.
+ */
+router.get('/profile', async (req, res) => {
+    try {
+        const stored = await profile.loadProfile(req.user.id);
+        if (!stored) {
+            return res.status(404).json({ error: 'User not found.' });
+        }
+        return res.json(stored);
+    } catch (error) {
+        return sendDatabaseFailure(res, 'Profile Error', error);
+    }
+});
+
+/**
+ * Updates the display name and/or the profile picture.
+ *
+ * Partial by design: a body carrying only `displayName` changes only the name, so changing
+ * a name does not require the client to also resend a picture it would then have to read
+ * back first. A field that is absent is left exactly as it is. A field that is present and
+ * `null` -- or an empty string -- clears it, which is how the "remove" affordance works.
+ *
+ * Validation runs here and not in the browser. The client checks the same rules to give
+ * immediate feedback, but the browser is the untrusted side of this connection: a request
+ * that arrived from anywhere else carries no such check, and the stored value is what ends
+ * up rendered next to a balance. Every rejection is a 400 with a message written for the
+ * person who typed it, rather than a silent no-op that leaves the interface showing a name
+ * the server never accepted.
+ */
+router.patch('/profile', async (req, res) => {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+
+    // An unknown key is a client bug worth surfacing rather than ignoring. A `PATCH` that
+    // silently dropped a misspelled field would report success while changing nothing, and
+    // the user would be told their picture was saved.
+    const allowedKeys = new Set(['displayName', 'avatarData']);
+    const unexpected = Object.keys(body).filter((key) => !allowedKeys.has(key));
+    if (unexpected.length > 0) {
+        return res.status(400).json({ error: `Unexpected field: ${unexpected[0]}.` });
+    }
+    if (unexpected.length === Object.keys(body).length && Object.keys(body).length > 0) {
+        return res.status(400).json({ error: 'Nothing to update.' });
+    }
+
+    const patch = {};
+
+    if (Object.prototype.hasOwnProperty.call(body, 'displayName')) {
+        const name = profile.normaliseDisplayName(body.displayName);
+        if (!name.ok) return res.status(400).json({ error: name.error });
+        patch.displayName = name.value;
+    }
+
+    if (Object.prototype.hasOwnProperty.call(body, 'avatarData')) {
+        const picture = profile.normaliseAvatar(body.avatarData);
+        if (!picture.ok) return res.status(400).json({ error: picture.error });
+        patch.avatarData = picture.value;
+    }
+
+    try {
+        const saved = await profile.saveProfile(req.user.id, patch);
+        if (!saved.updated) {
+            // Either the account vanished between the session check and this write, or the
+            // body named no updatable field. Both are answered 400/404 rather than 200,
+            // because a 200 here would claim a change that did not happen.
+            if (Object.keys(patch).length === 0) {
+                return res.status(400).json({ error: 'Nothing to update.' });
+            }
+            return res.status(404).json({ error: 'User not found.' });
+        }
+        return res.json(saved.profile);
+    } catch (error) {
+        return sendDatabaseFailure(res, 'Profile Update Error', error);
+    }
+});
+
+/**
+ * Ends every session on this account, including this one.
+ *
+ * The mechanism already exists: `users.token_version` is compared against the `ver` claim on
+ * every request by `requireAuth`, and bumping it invalidates every token ever signed. The
+ * password reset already relies on it -- which is why a reset signs you out everywhere -- so
+ * this is the same control, exposed deliberately rather than as a side effect of changing a
+ * password.
+ *
+ * It is worth having on its own. A token in `sessionStorage` is per-tab, so "sign out" on a
+ * shared or borrowed device only closes that tab, and the person who used it before can
+ * reopen the page and still be signed in. That is the gap this closes.
+ *
+ * The response is 200 and the caller's own token is now worthless, which is the intended
+ * outcome: the client is expected to clear its local copy and leave. It is told to do that
+ * explicitly in the response body rather than having to work out that a `200` means "you are
+ * now signed out, oddly".
+ */
+router.post('/sessions/revoke', async (req, res) => {
+    try {
+        const result = await pool.query(
+            'UPDATE users SET token_version = token_version + 1 WHERE id = $1 RETURNING id',
+            [req.user.id]
+        );
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'User not found.' });
+        }
+        return res.json({
+            signedOutEverywhere: true,
+            // Stated rather than implied, because the alternative reading of a successful
+            // response is "you are still signed in".
+            message: 'Every session on this account has been ended, including this one. Sign in again to continue.'
+        });
+    } catch (error) {
+        return sendDatabaseFailure(res, 'Session Revoke Error', error);
+    }
+});
+
+// ---------------------------------------------------------------------------
+// Balance
 // ---------------------------------------------------------------------------
 
 router.get('/balance', async (req, res) => {
@@ -366,11 +552,28 @@ router.get('/deposits/:id', async (req, res) => {
  * reward credits all appear here in chronological order. The frontend does not
  * need to join separate deposit and withdrawal lists to tell the user a credit
  * followed a withdrawal refund, or that a reward landed between two deposits.
+ *
+ * Demo rows used to be excluded outright, on the reasoning that this list is rendered as
+ * `+$1.00` against a header showing the real balance, so a demo reward in here reads as money
+ * the user received when none of it is. The reasoning was sound and the conclusion was not:
+ * excluding them meant a completed demo offer -- the entire point of the demo pages, and the
+ * only thing a new user can actually do here -- produced a Rewards tab that stayed on "No
+ * rewards yet" forever, with copy telling them to complete an offer they had just completed.
+ * A reward that cannot be seen is indistinguishable from a reward that never paid.
+ *
+ * So they are included and flagged instead. `is_demo` is returned on every row and the client
+ * renders a test reward as a test reward: no cash colouring, an explicit marker, and no sign
+ * in front of the amount. The number is what the user earned against the test balance, which
+ * is a true thing worth showing.
+ *
+ * Nothing here touches the cash invariant `npm run audit:balance` relies on -- that query reads
+ * the table with its own `is_demo IS NOT TRUE` filter and is unaffected by what this endpoint
+ * returns.
  */
 router.get('/history', async (req, res) => {
     try {
         const result = await pool.query(
-            `SELECT id, amount, transaction_type, source_id, description, created_at
+            `SELECT id, amount, transaction_type, source_id, description, is_demo, created_at
              FROM balance_transactions
              WHERE user_id = $1
              ORDER BY created_at DESC, id DESC
@@ -393,14 +596,20 @@ router.post('/deposits', financialMutationLimit, paymentController.createDeposit
 router.post('/withdraw', financialMutationLimit, payoutController.requestWithdrawal);
 
 registerMethod(/^\/api\/user\/history\/?$/, ['GET']);
+registerMethod(/^\/api\/user\/balance\/?$/, ['GET']);
+registerMethod(/^\/api\/user\/updates\/?$/, ['GET']);
+registerMethod(/^\/api\/user\/profile\/?$/, ['GET', 'PATCH']);
+registerMethod(/^\/api\/user\/sessions\/revoke\/?$/, ['POST']);
 registerMethod(/^\/api\/user\/payment-options\/?$/, ['GET']);
 registerMethod(/^\/api\/user\/withdrawal-options\/?$/, ['GET']);
 registerMethod(/^\/api\/user\/deposits\/?$/, ['GET', 'POST']);
 registerMethod(/^\/api\/user\/deposits\/\d{1,19}\/?$/, ['GET']);
+registerMethod(/^\/api\/user\/email-preferences\/?$/, ['GET', 'PATCH']);
 
 router.post('/withdrawals/code', financialMutationLimit, payoutController.sendWithdrawalCode);
 router.post('/withdrawals', financialMutationLimit, payoutController.requestWithdrawal);
 registerMethod(/^\/api\/user\/withdrawals\/?$/, ['GET', 'POST']);
+registerMethod(/^\/api\/user\/withdrawals\/code\/?$/, ['POST']);
 registerMethod(/^\/api\/user\/withdraw\/?$/, ['POST']);
 
 module.exports = router;

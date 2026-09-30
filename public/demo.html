@@ -14,15 +14,27 @@
 <link rel="icon" href="/icon-192.png" sizes="192x192" type="image/png">
 <link rel="apple-touch-icon" href="/apple-touch-icon.png">
 <link rel="manifest" href="/site.webmanifest">
+<!-- clock.js first: it builds #topbar-clock and #live-indicator into the header, and the
+     scripts below look them up once the DOM is ready. Deferred scripts run in document
+     order, so putting it ahead of them is what makes those lookups resolve. -->
+<script src="/clock.js" defer></script>
     <script src="/demo.js" defer></script>
 </head>
 <body>
+    <div class="toast-region" id="toast-region" aria-live="polite"></div>
     <header class="topbar">
         <a class="brand" href="/" aria-label="RewardZone home">
             <img class="brand-mark" src="/brand.gif" alt="" width="36" height="36">
-            <span>reward<span class="brand-light">zone</span></span>
+            <span>reward<span class="brand-light">zone</span><span class="brand-tm" aria-hidden="true">&#8482;</span></span>
         </a>
-        <a class="button button-light" href="/offers">Back to offers</a>
+        <!--
+            The only child besides the brand. `topbar-cta` is what puts it in the header's
+            right-hand cell. Without it the grid would place this link automatically into the
+            centre column, where it would sit centred above a "Back to offers" that reads as a
+            navigation item -- and on a page whose only navigation is that link, being
+            off-centre is the least of it.
+        -->
+        <a class="button button-light topbar-cta" href="/offers">Back to offers</a>
     </header>
 
     <main class="demo-shell">

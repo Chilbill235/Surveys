@@ -14,8 +14,9 @@
  * header, which is what the status exists for, and which a browser, curl, and every HTTP
  * client already understand.
  *
- * Patterns are matched against `req.path` and must be anchored. A path that matches nothing
- * here is left to the ordinary 404, so this never turns an unknown URL into a 405.
+ * Patterns are matched against the request's path with its query string removed, and must be
+ * anchored. A path that matches nothing here is left to the ordinary 404, so this never turns
+ * an unknown URL into a 405.
  */
 
 const registry = [];

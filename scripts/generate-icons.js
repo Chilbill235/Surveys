@@ -272,18 +272,57 @@ write('favicon.svg', Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" viewBo
   </g>
 </svg>
 `, 'utf8'));
+/**
+ * The manifest is written from here and nowhere else.
+ *
+ * It used to be hand-edited after generation, which produced a checked-in file that disagreed
+ * with this template in three ways: it pointed `maskable` at an `/icon-maskable-512.png` this
+ * script never writes, it listed two `/screenshots/*.png` that do not exist in `public/`, and
+ * it sent the "My rewards" shortcut to `/rewards`, which is not a route. Every one of those is
+ * a 404 the browser resolves silently. Then running `npm run icons` -- the documented command --
+ * overwrote the hand-edits and dropped the shortcuts with no other sign.
+ *
+ * So the shortcut URLs below have to name routes that exist: `/offers` and `/account`. Adding a
+ * page means adding its route here in the same change, which is the point of writing it down.
+ *
+ * `screenshots` is omitted entirely rather than left pointing at absent files. It is optional in
+ * the spec, and a manifest that 404s is worse than one that says less.
+ */
 write('site.webmanifest', Buffer.from(`${JSON.stringify({
+    id: '/',
     name: 'RewardZone',
     short_name: 'RewardZone',
     description: 'Browse available offers and track your rewards.',
-    start_url: '/',
+    start_url: '/?source=pwa',
     scope: '/',
     display: 'standalone',
+    display_override: ['window-controls-overlay', 'standalone', 'minimal-ui', 'browser'],
+    orientation: 'any',
     background_color: '#f5f2ea',
     theme_color: '#2449d8',
+    lang: 'en',
+    dir: 'ltr',
+    categories: ['shopping', 'finance', 'lifestyle'],
+    prefer_related_applications: false,
     icons: [
         { src: '/icon-192.png', sizes: '192x192', type: 'image/png', purpose: 'any' },
         { src: '/icon-512.png', sizes: '512x512', type: 'image/png', purpose: 'any' },
         { src: '/icon-512.png', sizes: '512x512', type: 'image/png', purpose: 'maskable' }
+    ],
+    shortcuts: [
+        {
+            name: 'Browse offers',
+            short_name: 'Offers',
+            description: 'See all available offers',
+            url: '/offers?source=shortcut',
+            icons: [{ src: '/icon-192.png', sizes: '192x192', type: 'image/png' }]
+        },
+        {
+            name: 'My rewards',
+            short_name: 'Rewards',
+            description: 'View your reward balance and history',
+            url: '/account?source=shortcut',
+            icons: [{ src: '/icon-192.png', sizes: '192x192', type: 'image/png' }]
+        }
     ]
 }, null, 2)}\n`, 'utf8'));

@@ -252,7 +252,24 @@ const PAIRS = [
     // warning colour, and the surrounding paragraph is already covered by warning/warning-bg
     // above. Worth its own entry because a filled button is the one place a semantic colour
     // stops being text and becomes a background, and the contrast maths is different.
-    { fg: 'surface', bg: 'warning', where: 'swap-coin button label' }
+    { fg: 'surface', bg: 'warning', where: 'swap-coin button label' },
+
+    // The filled brand buttons: accent (lime) and coral.
+    //
+    // These are checked against the *ends* of their gradients, not the middle. A label reads
+    // against whichever end of the gradient it lands on, and the lighter end is the one that
+    // washes text out, so the worse of the two is the number that matters.
+    //
+    // They were previously `heading` on lime, and `heading` inverts with the theme while the
+    // lime does not. In the dark scheme that was `#eef1fb` on `#d4fb52` -- 1.3:1, unreadable
+    // -- and every pair in this list still passed, because the list only covered
+    // foreground-on-surface combinations. A button label is foreground-on-fill, and that
+    // category was not represented at all. The `--on-lime` / `--on-coral` tokens exist so a
+    // theme-inverting token cannot reach a fixed-colour fill again, and these two entries are
+    // what keep them honest.
+    { fg: 'on-lime', bg: 'lime-400', where: 'accent button label, light end of gradient' },
+    { fg: 'on-lime', bg: 'lime-500', where: 'accent button label, dark end of gradient' },
+    { fg: 'on-coral', bg: 'coral-500', where: 'withdraw button label on the coral fill' }
 ];
 
 // ---------------------------------------------------------------------------

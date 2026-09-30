@@ -36,7 +36,7 @@
             ]
         },
         {
-            "source": "/reset-password",
+            "source": "/(reset-password|login|login.html|account|offers)",
             "headers": [
                 { "key": "Referrer-Policy", "value": "no-referrer" },
                 { "key": "Cache-Control", "value": "no-store" }
@@ -55,13 +55,7 @@
             ]
         },
         {
-            "source": "/api/offers",
-            "headers": [
-                { "key": "Cache-Control", "value": "public, max-age=30, stale-while-revalidate=60" }
-            ]
-        },
-        {
-            "source": "/(style|app|home|demo|reset-password|deposit-receipt).js",
+            "source": "/(style|app|home|demo|reset-password|deposit-receipt|history|contact|session-gate).js",
             "headers": [
                 { "key": "Cache-Control", "value": "public, max-age=3600, must-revalidate" }
             ]
@@ -73,7 +67,7 @@
             ]
         },
         {
-            "source": "/(favicon.ico|favicon.svg|favicon-32.png|icon-192.png|icon-512.png|apple-touch-icon.png|site.webmanifest)",
+            "source": "/(favicon.ico|favicon.svg|favicon-32.png|icon-192.png|icon-512.png|apple-touch-icon.png|site.webmanifest|brand.gif|rewardzone-logo.gif)",
             "headers": [
                 { "key": "Cache-Control", "value": "public, max-age=86400, must-revalidate" }
             ]

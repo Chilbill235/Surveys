@@ -14,44 +14,69 @@
 <link rel="icon" href="/icon-192.png" sizes="192x192" type="image/png">
 <link rel="apple-touch-icon" href="/apple-touch-icon.png">
 <link rel="manifest" href="/site.webmanifest">
+    <!-- clock.js first: it builds #topbar-clock and #live-indicator into the header, and the
+         scripts below look them up once the DOM is ready. Deferred scripts run in document
+         order, so putting it ahead of them is what makes those lookups resolve. -->
+    <script src="/clock.js" defer></script>
+    <script src="/session-gate.js" defer></script>
     <script src="/app.js" defer></script>
+    <script src="/helpdesk.js" defer></script>
 </head>
-<body class="has-action-bar">
+<body class="has-action-bar" data-requires-session="true">
     <div class="toast-region" id="toast-region" aria-live="polite"></div>
     <header class="topbar">
         <a class="brand" href="/" aria-label="RewardZone home">
             <img class="brand-mark" src="/brand.gif" alt="" width="36" height="36">
-            <span>reward<span class="brand-light">zone</span></span>
+            <span>reward<span class="brand-light">zone</span><span class="brand-tm" aria-hidden="true">&#8482;</span></span>
         </a>
         <nav class="header-nav" aria-label="Main">
             <a class="header-nav-link" href="/offers" aria-current="page">Offers</a>
-            <a class="header-nav-link" href="/history">History</a>
+            <a class="header-nav-link" href="/account">Account</a>
         </nav>
         <div class="account-tools">
-            <div class="balance-block" aria-live="polite">
-                <span class="balance-label">Available balance</span>
-                <strong id="user-balance">--</strong>
-                <span class="demo-balance-line">Test-only balance <strong id="demo-balance">--</strong></span>
-                <!-- Says whether the page is still current, and admits when it is not. A page
-                     that updates itself has to be able to say it stopped, or a stale balance
-                     reads as a live one. Announced politely rather than assertively: it
-                     changes on failure, and interrupting a screen reader for that would be
-                     worse than the silence. -->
-                <span class="live-indicator" id="live-indicator" hidden></span>
-             </div>
-             <button class="button button-light header-action" id="account-button" type="button">Connect account</button>
-             <button class="button button-light header-action" id="deposit-button" type="button" disabled>Deposit</button>
-             <button class="button button-accent header-action" id="withdraw-button" type="button" disabled>Withdraw</button>
+             <!-- The identity first, then the bell, then the signed-out-only action. Same
+                  order as the account page's header, deliberately: the two pages share this
+                  cluster's markup so a visitor who signs out of one and back into the other
+                  finds the controls in the same place. -->
+             <img class="account-avatar" id="account-avatar" src="/brand.gif" alt="" width="34" height="34" hidden>
+             <!-- The account menu. Same markup and behaviour as the account page, so the
+                  identity a visitor sees is identical wherever they are and the only way to
+                  sign out is the same place on both. Previously this page had a bare brand
+                  mark and a header button that relabelled itself to "Sign out", which meant
+                  signing in on Offers showed no name or picture at all -- the profile was
+                  only ever read on the account page. -->
+             <div class="account-menu" id="account-menu" hidden>
+                 <button type="button" class="account-menu-trigger" id="account-menu-trigger"
+                         aria-haspopup="menu" aria-expanded="false" aria-controls="account-menu-panel">
+                     <img class="account-menu-avatar" id="account-menu-avatar" src="/brand.gif" alt="" width="38" height="38">
+                     <span class="account-menu-identity">
+                         <span class="account-menu-name" id="account-menu-name">Your account</span>
+                         <span class="account-menu-email" id="account-menu-email"></span>
+                     </span>
+                     <span class="account-menu-caret" aria-hidden="true"></span>
+                 </button>
+                 <div class="account-menu-panel" id="account-menu-panel" role="menu" aria-labelledby="account-menu-name" hidden>
+                     <div class="account-menu-header">
+                         <img class="account-menu-avatar-lg" id="account-menu-avatar-lg" src="/brand.gif" alt="" width="56" height="56">
+                         <div class="account-menu-header-text">
+                             <p class="account-menu-header-name" id="account-menu-header-name">Your account</p>
+                             <p class="account-menu-header-email" id="account-menu-header-email"></p>
+                         </div>
+                     </div>
+                     <a class="account-menu-item" id="account-menu-profile" href="/account#profile-settings" role="menuitem">Profile &amp; settings</a>
+                     <a class="account-menu-item" id="account-menu-history" href="/account#history" role="menuitem">Transactions</a>
+                     <button type="button" class="account-menu-item" id="account-menu-deposit" role="menuitem">Add funds</button>
+                     <button type="button" class="account-menu-item" id="account-menu-withdraw" role="menuitem">Withdraw</button>
+                     <div class="account-menu-divider" role="separator"></div>
+                     <button type="button" class="account-menu-item is-danger" id="account-menu-signout" role="menuitem">Sign out</button>
+                 </div>
+</div>
              <!--
-                  Notification dropdown. Mirrors the toast notifications but keeps a
-                  dismissible history the user can review, like the dropdown on a
-                  gambling site: deposits landing, withdrawals settling, rewards crediting.
-                  The bell shows the unread count; clicking it toggles the panel. The
-                  bell and dropdown are wrapped in a relative container so the panel
-                  drops down from the bell itself on every screen size. Placed after
-                  the action buttons so the dropdown sits below the entire header row.
-             -->
-             <div class="notification-popover">
+                  The bell, to the right of the identity, so the panel it opens hangs off the
+                  right-hand end of the header rather than off an unrelated edge. Mirrors the
+                  account page's header, which is where the same move was made.
+              -->
+             <div class="notification-popover" id="notification-popover">
                  <button type="button" class="button button-ghost button-square notification-bell"
                          id="notification-bell" aria-label="Notifications" aria-haspopup="dialog" aria-expanded="false" hidden>
                      <span class="notification-icon" aria-hidden="true"></span>
@@ -61,16 +86,80 @@
                      <div class="notification-header">
                          <h3 id="notification-title">Notifications</h3>
                          <button type="button" class="link-button notification-mark-all" id="notification-mark-all" aria-label="Mark all as read">Mark all read</button>
+                           <button type="button" class="link-button notification-clear-all" id="notification-clear-all" aria-label="Clear all notifications">Clear all</button>
                      </div>
                      <div class="notification-list" id="notification-list">
                          <p class="notification-empty">No new notifications.</p>
                      </div>
                  </div>
              </div>
+             <button class="button button-light header-action" id="account-button" type="button">Connect account</button>
+             <!--
+                  Deposit and Withdraw used to live here too, as a second copy of the pair
+                  now in the balance card below. They were hidden below 720px to make room
+                  for the account menu, which left the header with a pair of buttons that
+                  appeared and vanished with the width and a balance block that overflowed
+                  the viewport at 768px. One copy, in the card, on every screen. The narrow
+                  action bar at the foot of the page mirrors the card's pair.
+              -->
         </div>
     </header>
 
     <main class="page-shell">
+        <!--
+            The balance, as a card at the top of the page rather than a line in the header.
+
+            It was a three-line stack in the topbar: label, amount, test-only amount, and a
+            live-sync badge underneath. On a desktop that is cramped, and on a phone it was
+            actively broken -- the header has a fixed budget for its height, so at 768px the
+            block pushed the notification bell past the right edge of the viewport and the page
+            scrolled sideways. The fix was never to squeeze the balance harder; it was that the
+            balance did not belong there. The topbar is for identity and navigation, and the
+            account menu next to it already answers "who am I".
+
+            Here it can be the same shape as the account page's balance, which is the other half
+            of the problem: a user comparing the two pages should not have to work out that two
+            different-looking numbers are the same number.
+
+            The Deposit and Withdraw buttons move in with it, for the same reason. On a phone
+            the action bar at the bottom of the screen already covers this, so these are the
+            desktop and tablet path, and both routes now show the same two choices in the same
+            order as the account page.
+
+            Same element IDs as before, so nothing in app.js changed. That is deliberate: the
+            live-sync logic, the balance fetch, and the formatting all keep working because
+            only the position and the styling moved.
+        -->
+        <section class="offer-balance-card" aria-label="Your balance">
+            <div class="offer-balance-block" aria-live="polite">
+                <span class="balance-label">Available balance</span>
+                <strong id="user-balance" class="offer-balance-main">--</strong>
+                <span class="demo-balance-line">Test-only balance <strong id="demo-balance">--</strong></span>
+                <!-- The live-sync status is not in this card. `clock.js` puts it in the topbar,
+                     in the same place on every page, rather than in whichever page happened to
+                     have a balance card -- which had it in three places at three different
+                     heights, and not at all on the homepage. A page that updates itself has to
+                     be able to say it stopped, and it can only do that from a fixed spot.
+                     `#live-indicator` is what `paintLiveIndicator()` looks for, and it finds
+                     the one in the header. -->
+            </div>
+            <!--
+                No Deposit or Withdraw here, and that is the whole point of this card.
+
+                They were in it as a second copy of the pair the header's account menu already
+                carries -- "Add funds" and "Withdraw", on every page, one tap from anywhere on
+                the screen. With the pair here as well, the offers page had two Deposit buttons
+                on a phone (this card's and the action bar's) and a third path in the menu, and
+                the card's own job -- the figure, and whether it is current -- was pushed down
+                the page by a row of buttons.
+
+                The account page is the one place the pair belongs in a card, because that is
+                the page you come to in order to move money, and its buttons are the only money
+                controls on screen there. Here the menu owns them, and on a phone the action bar
+                mirrors the menu so they stay in thumb reach.
+            -->
+        </section>
+
         <section class="catalog-heading" aria-labelledby="page-title">
             <div>
                 <p class="eyebrow"><span class="eyebrow-dot" aria-hidden="true"></span> Reward catalog</p>
@@ -139,30 +228,83 @@
         </section>
     </main>
 
+     <!--
+        The footer, identical on every page.
+
+        One column, top to bottom, at every width. The previous layout put Product / Help /
+        Legal side by side as parallel columns on desktop, which reads fine on paper and badly
+        on a screen: someone looking for the Privacy Policy has to guess which of three columns
+        holds it and then check the other two headings to be sure. Stacked, the page has one
+        reading order that is the same on every device, and "the legal links are further down"
+        is an answer a visitor can act on without a strategy.
+
+        Every href resolves. That is checked, not assumed: a legal link that goes nowhere is
+        worse than a missing one, because it implies the document exists and cannot be read.
+    -->
     <footer class="site-footer">
-        <span class="site-footer-meta"><span class="footer-mark" aria-hidden="true"></span> RewardZone</span>
-        <nav aria-label="Footer">
+        <div class="site-footer-brand">
+            <span class="site-footer-meta">
+                <span class="footer-mark" aria-hidden="true"></span>
+                RewardZone&trade;
+            </span>
+            <p class="site-footer-tagline">Free to join. Payouts from $1.00. No fees.</p>
+            <p class="site-footer-copy">&copy; <span data-current-year>2026</span> RewardZone. All rights reserved.</p>
+        </div>
+
+        <nav class="site-footer-group" aria-label="Product">
+            <h2 class="site-footer-heading">Product</h2>
             <a href="/">Home</a>
             <a href="/offers">Offers</a>
+            <a href="/account">Your account</a>
+            <a href="/#home-faq">Frequently asked questions</a>
+        </nav>
+
+        <nav class="site-footer-group" aria-label="Help">
+            <h2 class="site-footer-heading">Help</h2>
+            <a href="/account">Sign in or create an account</a>
+            <a href="/reset-password">Reset your password</a>
+            <a href="#" data-helpdesk-trigger>Help desk</a>
+            <a href="#" data-contact-trigger>Contact support</a>
+        </nav>
+
+        <nav class="site-footer-group" aria-label="Legal">
+            <h2 class="site-footer-heading">Legal</h2>
+            <a href="/terms">Terms of service</a>
+            <a href="/privacy">Privacy policy</a>
+            <a href="/cookies">Cookie policy</a>
+            <a href="/aml">AML and KYC policy</a>
         </nav>
     </footer>
 
-    <!-- Primary actions for narrow screens. The header keeps the balance and the brand
-         on one row; the three money actions move here so they sit inside thumb reach
-         instead of at the top of a three-row header. Hidden on wide screens, where the
-         header carries the same controls. -->
-    <nav class="action-bar" aria-label="Account and payment actions">
-        <button class="action-bar-item" id="mobile-account-button" type="button" data-mirror="account-button">
-            <span class="action-bar-icon" aria-hidden="true">&#9679;</span>
-            <span class="action-bar-label">Account</span>
-        </button>
-        <button class="action-bar-item" id="mobile-deposit-button" type="button" data-mirror="deposit-button" disabled>
+    <!-- The narrow-screen action bar. The header keeps the brand and nav on one row; the money
+         pair and notifications move here so they sit inside thumb reach rather than at the top of
+         a three-row header. Hidden on wide screens, where the header's account menu carries the
+         same pair.
+
+         The pair mirrors the account menu's "Add funds" and "Withdraw" -- the only money controls
+         this page has, since its balance card deliberately carries none.
+
+         No Account item, unlike the two pages that used to have one. The profile button and its
+         menu are in the header on every width and already carry the account, transactions, money
+         and sign out, so a bar item repeating that was a second copy in the one place a thumb
+         rests. It was also the item that could sign you out by accident: `data-mirror` resolved
+         to a `display: none` button, and a hidden button still fires its handler on `.click()`. -->
+    <nav class="action-bar" aria-label="Payment and notification actions">
+        <button class="action-bar-item" id="mobile-deposit-button" type="button" data-mirror="account-menu-deposit" disabled>
             <span class="action-bar-icon action-bar-icon-plus" aria-hidden="true">&#43;</span>
             <span class="action-bar-label">Deposit</span>
         </button>
-        <button class="action-bar-item is-primary" id="mobile-withdraw-button" type="button" data-mirror="withdraw-button" disabled>
+        <button class="action-bar-item is-primary" id="mobile-withdraw-button" type="button" data-mirror="account-menu-withdraw" disabled>
             <span class="action-bar-icon action-bar-icon-arrow" aria-hidden="true">&#8593;</span>
             <span class="action-bar-label">Withdraw</span>
+        </button>
+        <!-- The notification bell lives in the action bar on mobile so the dropdown
+             opens from thumb territory. On desktop the header bell is used instead. -->
+        <button type="button" class="action-bar-item notification-bell"
+                id="notification-bell-mobile" aria-label="Notifications" aria-haspopup="dialog" aria-expanded="false" hidden>
+            <span class="notification-icon" aria-hidden="true"></span>
+            <span class="notification-count-mobile" id="notification-count-mobile" hidden>0</span>
+            <span class="action-bar-label">Notifications</span>
         </button>
     </nav>
 
@@ -265,12 +407,17 @@
                 <div class="amount-block">
                     <div class="amount-block-head">
                         <label class="form-label" for="deposit-amount">Amount to add</label>
-                        <button class="max-button" id="deposit-max" type="button">Max</button>
                     </div>
+                    <!-- One group, one box: symbol, number, currency, and the action that fills
+                         the box. Max belonged to the row above the field and read as a control of
+                         its own; inside the field it is the right-hand end of the thing it acts
+                         on. Kept identical to the account page's block, because the script that
+                         drives it is shared. -->
                     <div class="amount-field deposit-amount-field">
                         <span aria-hidden="true">$</span>
-                        <input class="form-control" id="deposit-amount" type="number" min="1" max="5000" step="0.01" value="10.00" inputmode="decimal" required>
+                        <input class="form-control" id="deposit-amount" type="number" min="0.01" max="5000" step="0.01" value="10.00" inputmode="decimal" required>
                         <span class="amount-suffix" aria-hidden="true">USD</span>
+                        <button class="max-button" id="deposit-max" type="button">Max</button>
                     </div>
                     <div class="amount-presets" role="group" aria-label="Quick amount choices">
                         <button type="button" data-deposit-amount="5">$5</button>
@@ -278,12 +425,7 @@
                         <button type="button" data-deposit-amount="25">$25</button>
                         <button type="button" data-deposit-amount="50">$50</button>
                     </div>
-                    <p class="field-hint" id="deposit-amount-hint">Minimum $1.00. Maximum $5,000.00.</p>
-                    <!-- Appears only when the typed amount is under the selected coin's
-                         provider floor. It names a coin that will take the amount as it
-                         stands, because "too small" on its own gives the user nothing to do
-                         when the fix is to pick a different coin rather than type more. -->
-                    <p class="swap-hint" id="deposit-swap-hint" hidden></p>
+                    <p class="field-hint" id="deposit-amount-hint">No minimum set by us. Maximum $5,000.00.</p>
                 </div>
 
                 <span class="form-label" id="deposit-method-label">Payment type</span>
@@ -422,7 +564,7 @@
             <dl class="withdraw-summary" id="withdraw-summary" hidden></dl>
 
             <p id="withdraw-message" class="form-message" role="status"></p>
-            <button class="button button-accent button-wide button-lg" id="withdraw-submit" type="submit">Submit request</button>
+            <button class="button button-coral button-wide button-lg" id="withdraw-submit" type="submit">Submit request</button>
 
             <h3 class="history-title">Recent requests</h3>
             <div id="withdrawal-history" class="receipt-list" aria-live="polite">Loading withdrawal history...</div>
@@ -431,5 +573,64 @@
         <div id="withdraw-confirmation" class="confirmation" hidden></div>
         </div>
     </dialog>
+
+    <!-- Contact support -->
+    <dialog class="dialog dialog-contact" id="contact-dialog" aria-labelledby="contact-title">
+        <div class="dialog-panel">
+            <div class="dialog-heading">
+                <div>
+                    <p class="eyebrow">Support</p>
+                    <h2 id="contact-title">Contact us</h2>
+                </div>
+                <button class="icon-button" type="button" data-close="contact-dialog" aria-label="Close">&times;</button>
+            </div>
+                        <form id="contact-form" novalidate>
+                <!--
+                    The fields scroll; the status line and the button do not.
+
+                    This form is taller than a phone screen -- five fields, a hint under two of
+                    them, and a message box -- and the dialog caps its height to the viewport.
+                    Without this split the whole thing scrolls, which put the "Send message"
+                    button 45-50px below the visible area at every size measured: 360x640,
+                    360x800, and 1280x800 alike. A submit button you have to go looking for is
+                    a submit button people do not press, and on a contact form that means a
+                    support request that is never filed.
+
+                    So the body scrolls and the action row is a sibling below it. The button is
+                    now on screen the moment the dialog opens, at any height, and the status
+                    line that reports the result sits directly above it where it is read.
+                -->
+                <div class="contact-form-body">
+                    <p class="form-note" id="contact-note">We reply by email, usually within one business day. Use the address you can actually read.</p>
+                    <div class="form-field">
+                        <label class="form-label" for="contact-name">Your name</label>
+                        <input class="form-input" type="text" id="contact-name" name="name" required maxlength="200" autocomplete="name">
+                    </div>
+                    <div class="form-field">
+                        <label class="form-label" for="contact-email">Reply-to email</label>
+                        <input class="form-input" type="email" id="contact-email" name="email" required maxlength="254" autocomplete="email" aria-describedby="contact-email-hint">
+                        <p class="field-hint" id="contact-email-hint">Where our answer goes. It is not shared with anyone else.</p>
+                    </div>
+                    <div class="form-field">
+                        <label class="form-label" for="contact-subject">Subject</label>
+                        <input class="form-input" type="text" id="contact-subject" name="subject" required maxlength="200">
+                    </div>
+                    <div class="form-field">
+                        <div class="field-heading">
+                            <label class="form-label" for="contact-message">Message</label>
+                            <span class="field-count" id="contact-count" aria-live="polite"></span>
+                        </div>
+                        <textarea class="form-input" id="contact-message" name="message" rows="6" required maxlength="2000" aria-describedby="contact-count"></textarea>
+                    </div>
+                </div>
+                <div class="contact-form-actions">
+                    <p id="contact-form-message" class="form-message" role="status" aria-live="polite"></p>
+                    <button class="button button-accent button-wide button-lg" id="contact-submit" type="submit">Send message</button>
+                </div>
+            </form>
+        </div>
+    </dialog>
+
+    <script src="/contact.js" defer></script>
 </body>
 </html>

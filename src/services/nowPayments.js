@@ -30,6 +30,7 @@
 
 const { createHmac, timingSafeEqual } = require('node:crypto');
 const undici = require('undici');
+const { realCredential } = require('./credentials');
 const { ProxyAgent } = undici;
 
 const PRODUCTION_BASE_URL = 'https://api.nowpayments.io';
@@ -110,16 +111,31 @@ function getBaseUrl() {
     return (process.env.NOWPAYMENTS_API_BASE_URL || PRODUCTION_BASE_URL).replace(/\/+$/, '');
 }
 
+/**
+ * Placeholder-aware, on purpose.
+ *
+ * A template value in `.env` is a truthy string, so the old truthy check reported the
+ * provider as configured, offered crypto deposits, and then failed at the point where the
+ * money is already owed. A placeholder key now reads as "not configured" and the deposit
+ * path refuses it before an address is ever shown to a customer.
+ */
 function getApiKey() {
-    return process.env.NOWPAYMENTS_API_KEY || '';
+    return realCredential(process.env, 'NOWPAYMENTS_API_KEY') || '';
 }
 
 function isConfigured() {
     return Boolean(getApiKey());
 }
 
+/**
+ * The IPN signing secret, or an empty string when it is missing or still a placeholder.
+ *
+ * Empty rather than a placeholder, because a non-empty placeholder would verify no
+ * callback: an IPN would be accepted or rejected against a value nobody set, which is the
+ * same silent failure as a missing secret but harder to see.
+ */
 function getIpnSecret() {
-    return process.env.NOWPAYMENTS_IPN_SECRET || '';
+    return realCredential(process.env, 'NOWPAYMENTS_IPN_SECRET') || '';
 }
 
 /**
@@ -164,6 +180,19 @@ let cachedProxyUrl = null;
 function payoutProxyDispatcher() {
     const url = String(process.env.FIXIE_URL || '').trim();
     if (!url) return null;
+
+    // Not used outside production. The proxy exists for one reason: NOWPayments whitelists the
+    // payout endpoints by IP, and a serverless host's outbound address moves on every cold
+    // start, so a deployment routes through a proxy with fixed addresses. Running locally
+    // there is nothing to whitelist and nothing to gain from the round trip -- and a proxy
+    // that only works in production is a failure with no upside. `ProxyAgent` builds
+    // successfully for a well-formed URL whether or not anything is listening behind it, so
+    // the constructor cannot catch this: every call simply fails with "fetch failed", which
+    // reads exactly like the provider being down. One check here turns that into a direct
+    // connection, which is what a local run wants.
+    if (getBaseUrl() !== PRODUCTION_BASE_URL) {
+        return null;
+    }
 
     // Rebuild only if the URL changed. In practice it does not change within one
     // process, but this guards against a test that swaps it.
@@ -225,12 +254,19 @@ function rateLimited(method, path, run) {
 
 /** An error that carries the provider's own explanation, which is the useful part. */
 class NowPaymentsError extends Error {
-    constructor(message, { status = 0, providerResponse = null, cause = null } = {}) {
+    constructor(message, { status = 0, providerResponse = null, cause = null, path = null } = {}) {
         super(message);
         this.name = 'NowPaymentsError';
         this.status = status;
         this.providerResponse = providerResponse;
         this.cause = cause;
+        // The endpoint the call was making. Carried because the *stage* a payout failed at is
+        // what decides whether it is safe to give up on: a request that never got past the
+        // token exchange provably sent no money, while the same transport failure at the
+        // submission endpoint leaves it unknown. Without this the two are the same exception
+        // and both have to be treated as the dangerous one, which strands every withdrawal on
+        // a misconfigured proxy.
+        this.path = path;
     }
 
     /**
@@ -346,7 +382,7 @@ async function request(method, path, {
         }));
     } catch (error) {
         if (error instanceof NowPaymentsError) throw error;
-        throw new NowPaymentsError(`NOWPayments request to ${path} could not be completed.`, { cause: error });
+        throw new NowPaymentsError(`NOWPayments request to ${path} could not be completed.`, { cause: error, path });
     }
 
     const payload = await response.json().catch(() => null);
@@ -354,7 +390,8 @@ async function request(method, path, {
     if (!response.ok) {
         const error = new NowPaymentsError(`NOWPayments ${path} returned ${response.status}.`, {
             status: response.status,
-            providerResponse: payload
+            providerResponse: payload,
+            path
         });
         throw error;
     }
@@ -635,7 +672,12 @@ async function createPayment({
 
     const result = await request('POST', '/v1/payment', { body, timeoutMs: 12000 });
 
-    if (!result || !result.payment_id || !result.pay_address || !Number.isFinite(Number(result.pay_amount))) {
+    // `pay_amount` is checked for being a positive figure, not merely a finite one. A payment
+    // quoted at zero cannot be paid, and it is also not a figure any instruction can be built
+    // from, so storing it would leave a deposit whose panel says "send the amount shown" and
+    // shows nothing.
+    const payAmount = Number(result?.pay_amount);
+    if (!result || !result.payment_id || !result.pay_address || !Number.isFinite(payAmount) || payAmount <= 0) {
         throw new NowPaymentsError('NOWPayments returned incomplete payment instructions.', {
             providerResponse: result
         });
@@ -1059,6 +1101,14 @@ async function submitPayoutBatch(entries, { logger = console, ipnCallbackUrl = n
  * and a row wrongly stored as rejected is then protected by the idempotency check in
  * `applyPayoutCallback`, so the real outcome would be ignored when it finally arrives.
  *
+ * One-to-one is enforced across the tiers as well as within one. The duplicate-key rule only
+ * stops two entries competing for one key inside a single tier, so a report consumed by an
+ * earlier tier stayed in the pool for the next one: with three entries and two reported items
+ * whose addresses and amounts were equal, one item satisfied tier one for the entry that also
+ * matched its currency and tier two for the entry that did not, and two withdrawal rows were
+ * written from one provider record. Consumed reports are therefore removed from every later
+ * tier rather than left to compete again.
+ *
  * Positional pairing is deliberately absent. The provider does not document the order of the
  * `withdrawals` array as the order they were sent in, and "assume the order" is exactly the
  * kind of guess that produces a plausible-looking write to the wrong row.
@@ -1069,6 +1119,9 @@ function matchPayoutResults(list, reported) {
 
     // Identity first. Paired with a uniqueness requirement, so a provider that somehow echoed
     // one external id twice resolves to nothing rather than to whichever entry came first.
+    // `consumed` records which reports have already been spoken for, so no later mechanism can
+    // hand the same provider record to a second entry.
+    const consumed = new Set();
     const externalIdOf = (entry) => String(entry?.unique_external_id ?? entry?.uniqueExternalId ?? '').trim();
     const byExternalId = new Map();
     for (let j = 0; j < reported.length; j += 1) {
@@ -1083,6 +1136,7 @@ function matchPayoutResults(list, reported) {
             const j = byExternalId.get(key);
             if (j === null || j === undefined) continue;
             matches[i] = reported[j];
+            consumed.add(j);
         }
     }
     if (matches.every((item) => item !== null)) return matches;
@@ -1129,13 +1183,19 @@ function matchPayoutResults(list, reported) {
         };
 
         const requestedByKey = bucket(open, requested);
-        const answeredByKey = bucket(answered.map((_, index) => index), answered);
+        // Reports an earlier tier already paired are excluded, so the mapping stays one-to-one
+        // however many tiers a pair is found on rather than only within a single tier.
+        const answeredByKey = bucket(
+            answered.map((_, index) => index).filter((index) => !consumed.has(index)),
+            answered
+        );
 
         for (const [value, requestIndex] of requestedByKey) {
             if (requestIndex === null) continue;
             const answerIndex = answeredByKey.get(value);
             if (answerIndex === null || answerIndex === undefined) continue;
             matches[requestIndex] = reported[answerIndex];
+            consumed.add(answerIndex);
         }
     }
 

@@ -8,6 +8,8 @@ const nowPayments = require('../services/nowPayments');
 const { applyPayoutCallback } = require('../services/autoPayouts');
 const { notifyDepositInstructions, notifyDepositCredited, notifyDepositFailed } = require('../services/depositEmails');
 const ipnLog = require('../services/ipnLog');
+const { realCredential, placeholderProblems } = require('../services/credentials');
+const stripeErrors = require('../services/stripeErrors');
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -16,6 +18,16 @@ const ipnLog = require('../services/ipnLog');
 /** App-level deposit bounds, in USD. Per-currency limits layer on top of these. */
 const MIN_DEPOSIT_USD = 1;
 const MAX_DEPOSIT_USD = 5000;
+
+/**
+ * The only lower bound crypto deposits are held to.
+ *
+ * A cent, not a policy. It exists to reject a blank field, a negative and a zero before any
+ * money is written, and nothing more: whether an amount is actually payable is the provider's
+ * call, and it enforces that itself. Setting this to something higher is what made crypto
+ * deposits uncreatable -- see `createDeposit`.
+ */
+const MIN_CRYPTO_DEPOSIT_USD = 0.01;
 
 /**
  * Coins the app is willing to offer, intersected with what the provider reports.
@@ -192,8 +204,55 @@ function ipnBodyFrom(req) {
     }
 }
 
+/** The API key, or null when it is missing or still a placeholder. */
+function getStripeSecretKey() {
+    return realCredential(process.env, 'STRIPE_SECRET_KEY');
+}
+
+/** The webhook signing secret, or null when it is missing or still a placeholder. */
+function getStripeWebhookSecret() {
+    return realCredential(process.env, 'STRIPE_WEBHOOK_SECRET');
+}
+
+/**
+ * Card deposits are offered only when both halves are real and the account has not just
+ * been refused.
+ *
+ * Three conditions, all necessary. Both halves, because the key creates the Checkout session
+ * and the secret verifies the callback that credits it: with only the key a user pays and
+ * nothing credits, with only the secret no session can be created. And not currently
+ * suspended, because Stripe refusing at the account level ("cannot currently make live
+ * charges") is not a per-request fault -- the next request will be refused identically, so
+ * offering the button again only walks another customer into the same wall.
+ */
+function isStripeConfigured() {
+    if (!getStripeSecretKey() || !getStripeWebhookSecret()) return false;
+    if (!stripeErrors.looksLikeSecretKey(getStripeSecretKey())) return false;
+    return !stripeErrors.cardSuspensionReason();
+}
+
+/**
+ * What the operator still has to fix for card deposits to work.
+ *
+ * Naming the specific variable, and saying it is still the example template rather than
+ * merely absent, is the point. "Stripe webhooks are not configured" sent someone to the
+ * dashboard for a secret they had already pasted into `.env`, and the actual answer was
+ * that the value there was the stand-in from the example environment.
+ */
+function stripeConfigurationProblems() {
+    const problems = placeholderProblems(process.env, ['STRIPE_SECRET_KEY', 'STRIPE_WEBHOOK_SECRET']);
+    if (problems.length === 0 && !stripeErrors.looksLikeSecretKey(getStripeSecretKey())) {
+        // Not a placeholder -- just not a secret key. A publishable key or a restricted key
+        // pasted into the secret slot is a different mistake from an unset variable, and
+        // Stripe's own answer for it ("Invalid API Key") does not say so.
+        problems.push('STRIPE_SECRET_KEY is not a Stripe secret key (sk_test_... or sk_live_...).');
+    }
+    return problems;
+}
+
 function getStripeClient() {
-    return process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SECRET_KEY) : null;
+    const key = getStripeSecretKey();
+    return key ? new Stripe(key) : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -239,12 +298,12 @@ async function mapWithConcurrency(items, limit, fn) {
 async function fetchCryptoDepositOptions() {
     const supported = await nowPayments.getSupportedCurrencies();
     const usable = supported.filter((currency) => REVIEWED_DEPOSIT_CURRENCIES.has(currency));
-    // When the intersection is empty we keep the provider's list rather than
-    // refusing crypto entirely: a freshly-enabled account that reports no reviewed
-    // coins is still readable by the form, and the picker simply offers what the
-    // provider does. In practice, the reviewed set is broad enough that this is
-    // only hit on a cold sandbox.
-    const currencies = usable.length > 0 ? usable : supported;
+    // The intersection, never the provider's list on its own. Falling back to `supported`
+    // when the intersection came out empty offered coins this build has not reviewed, and
+    // `createDeposit` refuses exactly those, so the picker could advertise a deposit that the
+    // server then rejected as an unsupported cryptocurrency. An empty list reports
+    // `cryptoAvailable: false`, which is the truth: nothing here can be paid.
+    const currencies = usable;
 
     // The provider's own per-currency window. Absent unless the account is
     // fixed-rate, and absent again if the response shape is not one we recognise.
@@ -276,25 +335,33 @@ async function fetchCryptoDepositOptions() {
         const window = limits[currency];
         const quoted = quotes[index];
 
-        // Two provider sources, and only one of them states its units in USD.
+        // Two provider sources, and the difference between them is units.
         //
         //   * `/v1/currencies?fixed_rate=true` reports a window in fiat for the
-        //     currency itself, so every coin is quoted in the same units. This is
-        //     the trustworthy one.
-        //   * `/v1/min-amount` is per *pair*, and the bare `min_amount` it returns
-        //     is denominated in the coin, not the fiat, *unless* the account is on
-        //     fixed-rate. Reading a coin amount as dollars is exactly how Bitcoin
-        //     Cash ended up advertising an $18.79 floor: 0.05 BCH was read as $0.05
-        //     and then scaled or misreported by the provider's own response.
+        //     currency itself, so every coin is quoted in the same units. Preferred
+        //     when present, because it covers the ceiling as well as the floor.
+        //   * `/v1/min-amount` is per *pair*, and its bare `min_amount` is denominated
+        //     in the coin rather than the fiat -- reading that as dollars is how
+        //     Bitcoin Cash once advertised an $18.79 floor that was really 0.05 BCH.
         //
-        // So the fiat window wins when present, the quoted value is only trusted
-        // on a fixed-rate account, and otherwise the app floor is used and the
-        // real refusal is left to `createPayment`, whose error message is passed
-        // back to the user verbatim.
+        // The `fixedRate` gate this used to carry is the bug. `getMinimumAmount()` has
+        // already done the conversion: it prefers the provider's own `fiat_equivalent`
+        // field, falls back to converting the raw coin amount, and returns null rather
+        // than ever handing back an unconverted number. So its return value is in
+        // `priceCurrency` units on every code path, and conditioning on `fixedRate`
+        // threw away a correctly-converted figure for no reason.
+        //
+        // On a non-fixed-rate account that meant `effectiveMin` was ALWAYS the app's
+        // $1 default, so the options response advertised a $1 minimum for every coin
+        // while the provider's real floor was ignored. Measured against this account:
+        // the provider quotes $18.74 for every coin on every flag combination, and the
+        // form was offering $5 and $10 presets. Every one of them was refused, with a
+        // raw "amountTo is too small" that named no number the user could act on --
+        // which is what "I cannot make a deposit of any amount" actually was.
         let effectiveMin;
         if (window?.min !== null && window?.min !== undefined) {
             effectiveMin = window.min;
-        } else if (fixedRate && quoted !== null) {
+        } else if (quoted !== null) {
             effectiveMin = quoted;
         } else {
             effectiveMin = MIN_DEPOSIT_USD;
@@ -440,8 +507,16 @@ async function providerOptions(req, res) {
         // balance that does not move after a real payment, which reads as a
         // provider fault rather than a callback that could not be delivered.
         const callbacksReachable = publicBaseUrl.ok && isPubliclyReachable(publicBaseUrl.baseUrl);
+        // Why the card button is off, in the customer's own terms. A disabled button with
+        // "Not configured on this deployment" under it is only half true after a provider
+        // refusal: the deployment is configured, the account just cannot take charges, and
+        // "use cryptocurrency instead" is the useful instruction.
+        const cardsOffBecause = stripeConfigurationProblems().length > 0
+            ? 'not configured'
+            : (stripeErrors.cardSuspensionReason() ? 'temporarily unavailable' : null);
         return res.json({
-            stripeAvailable: Boolean(process.env.STRIPE_SECRET_KEY && process.env.STRIPE_WEBHOOK_SECRET),
+            stripeAvailable: isStripeConfigured(),
+            stripeUnavailableBecause: cardsOffBecause,
             cryptoAvailable: crypto.cryptoCurrencies.length > 0,
             callbacksReachable,
             publicBaseUrl: publicBaseUrl.ok ? publicBaseUrl.baseUrl.origin : null,
@@ -462,7 +537,7 @@ async function providerOptions(req, res) {
  * limit. Returns null when the error is not a provider error this function knows
  * how to describe, and the caller falls through to the generic 502.
  */
-function describeProviderRefusal(error) {
+function describeProviderRefusal(error, context = {}) {
     if (!(error instanceof nowPayments.NowPaymentsError)) return null;
 
     if (error.isRateLimited) {
@@ -474,10 +549,20 @@ function describeProviderRefusal(error) {
     }
 
     if (error.providerMessage) {
-        // The provider explains refusals in the body ("Minimum amount is 0.05 BCH,
-        // you have 0.002", "unknown currency"). Those words are more useful than a
-        // generic 502 and they are the only thing that tells the user what number
-        // will work, so they are passed through unchanged.
+        // The provider explains refusals in the body ("unknown currency", "payment method is
+        // not available"). Those words are more useful than a generic 502, so they are passed
+        // through unchanged -- except when the refusal is about the amount, because the two
+        // shapes it arrives in then name a parameter of the provider's API or an amount in the
+        // wrong currency, and neither is something the person can act on. Those are restated in
+        // dollars, from the floor the server already knows or has just looked up.
+        if (isProviderMinimumRefusal(error.providerMessage)) {
+            return {
+                status: 400,
+                error: belowProviderMinimumMessage(context.currency, context.minimumUsd, context.amount),
+                log: `NOWPayments refused the deposit as below its minimum: ${error.message} Provider said: ${error.providerMessage}`
+            };
+        }
+
         return {
             status: 400,
             error: error.providerMessage,
@@ -488,15 +573,105 @@ function describeProviderRefusal(error) {
     return null;
 }
 
+/**
+ * True for a provider refusal that is really "this amount is below the minimum".
+ *
+ * The provider phrases the same refusal three ways depending on where it catches it: as a
+ * validation error naming the request parameter ("amountTo is too small", "priceAmount is too
+ * small"), as a minimum error quoting a coin amount ("Minimum amount is 0.05 BCH"), and as a
+ * plain English sentence. All three are the same fact to the person typing, and neither of the
+ * first two is something they can act on: the first names a field of the provider's API, the
+ * second names an amount in a currency they did not choose.
+ */
+function isProviderMinimumRefusal(message) {
+    if (typeof message !== 'string' || message === '') return false;
+    const text = message.toLowerCase();
+    return /\btoo small\b/.test(text)
+        || /\b(minimum|min)\b[^.]{0,40}\b(amount|less|lower|below)\b/.test(text)
+        || /\b(less|lower)\s+than\b/.test(text)
+        || /\bbelow\b[^.]{0,30}\b(minimum|min)\b/.test(text);
+}
+
+/**
+ * The dollar figure the provider will accept for one coin, or null when nobody can say.
+ *
+ * Two sources, in the order that keeps the user and the server telling the same story.
+ *
+ * The options the picker was built from come first, so a user refused here is refused with the
+ * figure their own form quoted. That figure is only believed when it sits above the app's floor:
+ * a value equal to it means the read found no provider floor, not that the provider's floor is
+ * $1.
+ *
+ * When there is no such figure the provider is asked directly. This is the call the deposit flow
+ * used to leave entirely to `createPayment`, and asking it is the difference between
+ * "amountTo is too small" and a number. The answer is converted to dollars by `getMinimumAmount`
+ * -- a bare `min_amount` from that endpoint is denominated in the coin, and reading it as dollars
+ * is how a $1 floor once became $18.81 -- and is discarded unless it is plausible: a minimum at
+ * or above the app's own ceiling is a units mistake, not a limit.
+ */
+async function providerMinimumForDeposit(currency, options) {
+    // A floor below a cent, or at/above the app ceiling, is not a real limit -- it is either a
+    // units mistake (a coin amount where dollars were expected) or noise. Rejected rather than
+    // shown, because this figure ends up in a user-facing sentence.
+    const plausible = (value) => Number.isFinite(value)
+        && value > MIN_CRYPTO_DEPOSIT_USD
+        && value < MAX_DEPOSIT_USD;
+
+    const reported = Number(options?.minimums?.[currency]);
+    if (plausible(reported)) return reported;
+
+    try {
+        const quoted = await nowPayments.getMinimumAmount('usd', currency, {
+            isFixedRate: nowPayments.fixedRateEnabled(),
+            isFeePaidByUser: nowPayments.feePaidByUserEnabled(),
+        });
+        if (plausible(quoted)) return quoted;
+    } catch (error) {
+        console.warn(`Could not read the ${currency} minimum before the deposit: ${error.message}`);
+    }
+    return null;
+}
+
+/**
+ * The sentence a user is shown instead of the provider's parameter name.
+ *
+ * Three things in it, because each answers a question the raw refusal leaves open: which coin,
+ * what the floor is, and what to do instead. "BTC deposits start at $2.40. That is below the
+ * $1.00 you entered. Raise the amount, or choose a coin with a lower minimum." names a number and
+ * a way forward.
+ *
+ * The floor is the one part that is allowed to be missing. This app no longer pre-checks a
+ * provider minimum, so the refusal arrives only after the provider has answered and the quoted
+ * figure may genuinely be unknown -- on a failed live read, say. The wording then drops the
+ * number rather than inventing one, which is the difference between being unhelpful and lying.
+ */
+function belowProviderMinimumMessage(currency, floor, amount) {
+    const coin = String(currency || '').toUpperCase();
+    const entered = Number.isFinite(amount) && amount > 0
+        ? ` That is below the $${formatUsd(amount)} you entered.`
+        : '';
+    const next = 'Raise the amount, or choose a coin with a lower minimum.';
+    return Number.isFinite(floor)
+        ? `${coin || 'This network'} deposits start at $${formatUsd(floor)}.${entered} ${next}`
+        : `That amount is below what our payment provider accepts for ${coin || 'this network'}.${entered} ${next}`;
+}
+
 async function createDeposit(req, res) {
     const method = String(req.body.method || '').toLowerCase();
     const payCurrency = String(req.body.currency || '').toLowerCase();
-    const amount = parseAmountInRange(req.body.amount, { min: MIN_DEPOSIT_USD, max: MAX_DEPOSIT_USD });
-    if (amount === null) {
-        return res.status(400).json({ error: `Deposit must be between $${formatUsd(MIN_DEPOSIT_USD)} and $${formatUsd(MAX_DEPOSIT_USD)}.` });
-    }
     if (!['stripe', 'crypto'].includes(method)) {
         return res.status(400).json({ error: 'Choose a supported deposit method.' });
+    }
+    // Crypto has no app-level minimum. The provider is the only party that knows what it will
+    // actually accept, and its answer moves per read, per payment method and per network
+    // condition. A hard floor in this file was a guess that quietly blocked deposits the
+    // provider would have taken -- and the user saw a form that would not submit, with nothing
+    // explaining why. `MIN_DEPOSIT_USD` still applies to card deposits, where $1 is a real
+    // network/processing floor rather than an invented one.
+    const floor = method === 'crypto' ? MIN_CRYPTO_DEPOSIT_USD : MIN_DEPOSIT_USD;
+    const amount = parseAmountInRange(req.body.amount, { min: floor, max: MAX_DEPOSIT_USD });
+    if (amount === null) {
+        return res.status(400).json({ error: `Deposit must be between $${formatUsd(floor)} and $${formatUsd(MAX_DEPOSIT_USD)}.` });
     }
     if (method === 'crypto' && !REVIEWED_DEPOSIT_CURRENCIES.has(payCurrency)) {
         return res.status(400).json({ error: 'Choose a supported cryptocurrency.' });
@@ -508,7 +683,17 @@ async function createDeposit(req, res) {
     }
     const appBaseUrl = publicBaseUrl.baseUrl;
 
-    if (method === 'stripe' && (!process.env.STRIPE_SECRET_KEY || !process.env.STRIPE_WEBHOOK_SECRET)) {
+    if (method === 'stripe' && !isStripeConfigured()) {
+        // Checked here, before the INSERT, for the same reason it is checked above: a
+        // request that is going to be refused should not leave a deposit row behind for an
+        // operator to reconcile by hand. `stripeAvailable` already folds in the
+        // suspension, so a card account Stripe refused moments ago is refused here too, with
+        // the same wording, rather than at the provider.
+        if (stripeErrors.cardSuspensionReason()) {
+            return res.status(503).json({
+                error: 'Card deposits are unavailable right now. You can deposit with cryptocurrency instead.'
+            });
+        }
         return res.status(503).json({ error: 'Card deposits are unavailable until Stripe API and webhook credentials are configured.' });
     }
     if (method === 'crypto' && (!nowPayments.isConfigured() || !nowPayments.getIpnSecret())) {
@@ -530,6 +715,11 @@ async function createDeposit(req, res) {
     // refusal is answered with the provider's own message, which names the exact
     // number that will work, rather than a generic failure.
     let cryptoOptions = null;
+    // The provider's floor for the chosen coin, resolved once here and reused by the refusal
+    // message below if the provider still refuses. Declared out here because the two live on
+    // opposite sides of the try block: the pre-check reads it, and the catch needs it to
+    // translate a refusal that arrives despite the check.
+    let providerMinimum = null;
     if (method === 'crypto') {
         try {
             cryptoOptions = await getCryptoDepositOptions();
@@ -552,6 +742,28 @@ async function createDeposit(req, res) {
                 error: `The maximum deposit in ${payCurrency.toUpperCase()} is $${ceiling.toFixed(2)}.`,
             });
         }
+
+        // The floor is NOT checked here. This used to pre-check it against
+        // `providerMinimumForDeposit()` and refuse the deposit before the provider was
+        // contacted, which the user reported as deposits being impossible to create at all.
+        //
+        // It is worth saying why that check was wrong even on its own terms. A provider's
+        // published minimum is not a promise about what it will accept right now: it varies by
+        // payment method, by the account's rate settings, and by network conditions, and the
+        // same coin can quote differently on two consecutive reads. Turning a fluctuating
+        // advisory number into a hard client-side gate means the app refuses payments the
+        // provider would have taken -- and refuses them silently, with a form that will not
+        // submit and no way for the user to find out why.
+        //
+        // The provider is the authority on whether an amount is payable, and it enforces that
+        // itself. What this file still does is translate its refusal: `isProviderMinimumRefusal()`
+        // and `belowProviderMinimumMessage()` turn "amountTo is too small" into a sentence with
+        // a number in it and something to do about it. That is the useful part -- it keeps the
+        // actionable error -- without pretending to know the answer before asking.
+        const floor = await providerMinimumForDeposit(payCurrency, cryptoOptions);
+        providerMinimum = floor;
+        // Recorded on the deposit row either way, so support can see what the provider quoted
+        // for the attempt if it does come back refusing.
     }
 
     let deposit;
@@ -591,6 +803,12 @@ async function createDeposit(req, res) {
                 'UPDATE deposits SET provider_payment_id = $1, checkout_url = $2, updated_at = NOW() WHERE id = $3',
                 [session.id, session.url, deposit.id]
             );
+
+            // A session that was created is proof the account is taking charges after all,
+            // so a suspension left over from an earlier refusal is stale and is cleared.
+            // Without this, an account-level failure would keep cards hidden for the whole
+            // window even after the underlying problem was fixed.
+            stripeErrors.clearSuspension();
 
             return res.status(201).json({
                 depositId: deposit.id,
@@ -681,6 +899,36 @@ async function createDeposit(req, res) {
             expiresAt: payment.expiration_estimate_date || null,
         });
     } catch (error) {
+        // Stripe first. It has its own classification -- account-level refusals suspend
+        // cards, rate limits do not -- and without this the "cannot currently make live
+        // charges" answer arrived as a generic 502 with the card button still lit, so every
+        // customer met the same wall and nothing on the page said why.
+        if (error?.type && String(error.type).startsWith('Stripe')) {
+            const refusal = stripeErrors.describeStripeFailure(error);
+            if (refusal.suspends) {
+                stripeErrors.suspendCards(refusal.log);
+                await pool.query(
+                    `UPDATE deposits SET status = 'failed', updated_at = NOW() WHERE id = $1 AND status = 'pending'`,
+                    [deposit.id]
+                ).catch((cleanupError) => {
+                    console.error(`Could not mark deposit ${deposit.id} failed after a Stripe refusal:`, cleanupError.message);
+                });
+                return res.status(refusal.status).json({ error: refusal.error });
+            }
+            // Not suspending: the account is fine, this request was not. Still failed --
+            // no Checkout session exists, so no webhook can ever arrive for it.
+            if (deposit?.id) {
+                await pool.query(
+                    `UPDATE deposits SET status = 'failed', updated_at = NOW() WHERE id = $1 AND status = 'pending'`,
+                    [deposit.id]
+                ).catch((cleanupError) => {
+                    console.error(`Could not mark deposit ${deposit.id} failed after a Stripe error:`, cleanupError.message);
+                });
+            }
+            console.error(refusal.log);
+            return res.status(refusal.status).json({ error: refusal.error });
+        }
+
         // A rate limit is not the customer's fault and the request never reached the
         // payment system, so the deposit row is left `pending` for the orphan sweep
         // to close rather than being failed in front of a user who can simply retry.
@@ -697,7 +945,11 @@ async function createDeposit(req, res) {
             });
         }
 
-        const refusal = describeProviderRefusal(error);
+        const refusal = describeProviderRefusal(error, {
+            currency: payCurrency,
+            amount,
+            minimumUsd: providerMinimum
+        });
         if (refusal) {
             console.error(refusal.log);
             return res.status(refusal.status).json({ error: refusal.error });
@@ -754,14 +1006,21 @@ async function nowPaymentsIpn(req, res) {
         // plus a ledger row inside one transaction.
         try {
             const applied = await applyPayoutCallback(ipn);
-            if (!applied.ok) {
+            // `ok` only means the body was a well-formed payout callback. A batch this database
+            // has no row for resolves to an application count of zero, which is the same
+            // situation as `!applied.ok` and has to read the same way here: reported as
+            // "applied to withdrawal null", the diagnostics log -- the one thing that answers
+            // "is the provider sending, or are we ignoring it?" -- would be claiming a write
+            // that never happened.
+            if (!applied.ok || !applied.withdrawalId) {
                 // Signed, well-formed, and about a batch this database has no record of. That
                 // is a real configuration or history problem, but answering 4xx would put the
                 // callback on the provider's retry schedule forever. It is recorded as
                 // accepted and left visible in the diagnostics instead.
                 ipnLog.record({
                     outcome: 'accepted',
-                    detail: `Payout callback ignored: ${applied.reason}${applied.batchId ? ` (${applied.batchId})` : ''}`
+                    detail: `Payout callback ignored: ${applied.reason || 'no matching withdrawal'}` +
+                        `${applied.batchId ? ` (${applied.batchId})` : ''}`
                 });
                 return res.status(200).send('OK');
             }
@@ -957,14 +1216,30 @@ async function nowPaymentsIpn(req, res) {
 
 async function stripeWebhook(req, res) {
     const stripe = getStripeClient();
-    if (!stripe || !process.env.STRIPE_WEBHOOK_SECRET) {
+    // The two halves are reported separately. "Not configured" sent an operator to the
+    // dashboard for a secret they had already pasted into `.env` and could not tell whether
+    // it was the key or the signing secret that was wrong, or whether a placeholder was
+    // still sitting in one of them. Stripe retries a 503, so a temporarily unconfigured
+    // deployment recovers the events itself once the fix is deployed.
+    const problems = stripeConfigurationProblems();
+    if (problems.length > 0) {
+        console.error(`Stripe webhook received but the app is not configured: ${problems.join(' ')}`);
+        return res.status(503).send(`Stripe webhooks are not configured. ${problems.join(' ')}`);
+    }
+    if (!stripe) {
         return res.status(503).send('Stripe webhooks are not configured.');
     }
 
+    const webhookSecret = getStripeWebhookSecret();
+
     let event;
     try {
-        event = stripe.webhooks.constructEvent(req.body, req.get('stripe-signature'), process.env.STRIPE_WEBHOOK_SECRET);
+        event = stripe.webhooks.constructEvent(req.body, req.get('stripe-signature'), webhookSecret);
     } catch (error) {
+        // A signature that will not verify is either a wrong secret or something forging a
+        // callback. Neither is safe to act on, and the body of the error names the
+        // difference: Stripe's own message says which.
+        console.error(`Stripe webhook signature verification failed: ${error.message}`);
         return res.status(400).send(`Invalid Stripe signature: ${error.message}`);
     }
 
@@ -1144,4 +1419,15 @@ module.exports = paymentController;
 // route can import them without pulling in the whole object.
 module.exports.resetCryptoDepositOptionsCache = resetCryptoDepositOptionsCache;
 module.exports.buildPaymentUri = buildPaymentUri;
+module.exports.isStripeConfigured = isStripeConfigured;
+module.exports.stripeConfigurationProblems = stripeConfigurationProblems;
+module.exports.resetStripeCardSuspension = stripeErrors.resetSuspension;
+// Exported for the tests that pin the "no minimum of our own" contract. The two message helpers
+// are exported because they are the part that has to keep working now that nothing gates on the
+// figure up front: the provider is the only thing enforcing a floor, so its refusal is the only
+// place a user learns one exists, and these two functions are all that stands between them and
+// the string "amountTo is too small".
+module.exports.MIN_CRYPTO_DEPOSIT_USD = MIN_CRYPTO_DEPOSIT_USD;
+module.exports.isProviderMinimumRefusal = isProviderMinimumRefusal;
+module.exports.belowProviderMinimumMessage = belowProviderMinimumMessage;
 module.exports.__private = { decimalToBaseUnits, mapWithConcurrency };

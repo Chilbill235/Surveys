@@ -54,11 +54,25 @@ function escapeHtml(value) {
         .replace(/'/g, '&#39;');
 }
 
-/** Escapes a URL for an attribute, and refuses anything that is not http(s). */
+/**
+ * Escapes a URL for an attribute, and refuses anything that is not a scheme we send.
+ *
+ * `mailto:` is allowed alongside http(s) because the contact form's only action is to reply
+ * to the person who wrote, and a "Reply to this message" link that renders as nothing at all
+ * is worse than the plain text alternative.
+ *
+ * Restricted to one bare address with the ordinary characters an address is made of. A query
+ * string is refused, because `?subject=` and `?body=` are what turn a reply link into a message
+ * the recipient's client pre-fills -- the sender of a contact form has no business deciding
+ * what the reply says, and a `body` parameter is also a way to put unescaped text into
+ * another person's send box. A `/` is refused for the same reason: a path is how a form of
+ * the above would smuggle anything past a check that only looked for `?`.
+ */
 function safeUrl(value) {
     const raw = String(value ?? '').trim();
-    if (!/^https?:\/\//i.test(raw)) return null;
-    return escapeHtml(raw);
+    if (/^https?:\/\//i.test(raw)) return escapeHtml(raw);
+    if (/^mailto:[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/i.test(raw)) return escapeHtml(raw);
+    return null;
 }
 
 /**
@@ -93,7 +107,11 @@ function brandGifUrl() {
  * `blocks` is an ordered list of sections rather than an HTML string, so a caller cannot
  * accidentally emit unbalanced markup and each section is styled in one place. Supported
  * section types are `code` (the verification code), `details` (a two-column fact list),
- * `callout` (a coloured note), and `list` (bullets).
+ * `callout` (a coloured note), `list` (bullets), `link` (a labelled URL) and `paragraph`.
+ *
+ * `action` is the primary button. It is not a substitute for a `link` block: buttons are
+ * stripped by some clients and some gateways, and every message that has a button also needs
+ * the same URL written out in full for the readers it did not survive.
  */
 function renderEmail({
     brand = 'RewardZone',
@@ -322,6 +340,28 @@ function renderBlock(block) {
         </td></tr>`;
     }
 
+    if (block.type === 'link') {
+        // A link that looks like a link.
+        //
+        // Every message that carries a URL also needs it to survive a client that strips the
+        // button or drops the whole image, and that copy is the one the reader pastes into a
+        // browser. It used to be a bare URL in the footnote: same colour as the muted text
+        // around it, no underline, and -- because some clients strip the scheme from a link
+        // they do not recognise -- often displayed as `revu-gamma.vercel.app/...` with the
+        // part that actually matters, `https://`, missing. So the label and the URL are
+        // shown together, the URL is the anchor text, and it is styled as a link in every
+        // client including the ones with no CSS support at all.
+        const href = safeUrl(block.url);
+        if (!href) return '';
+        const shown = escapeHtml(block.url);
+        return `<tr><td style="padding:0 0 16px 0">
+            <p class="ink-soft" style="margin:0;font-family:${stack()};font-size:15px;line-height:24px;color:${BRAND.inkSoft}">
+                ${block.label ? `${escapeHtml(block.label)}<br>` : ''}
+                <a href="${href}" style="color:${BRAND.accent};font-weight:600;text-decoration:underline;word-break:break-all">${shown}</a>
+            </p>
+        </td></tr>`;
+    }
+
     return '';
 }
 
@@ -350,6 +390,12 @@ function renderEmailText({ intro = '', blocks = [], action = null, footnote = ''
             if ((block.items || []).length) lines.push('');
         } else if (block.type === 'paragraph') {
             lines.push(block.text, '');
+        } else if (block.type === 'link') {
+            // The full URL, on its own line, with nothing elided. This is the copy the reader
+            // pastes when the button does not work, so every part of it has to be there --
+            // including the scheme, which is the part a shortened or hand-typed version loses.
+            if (block.label) lines.push(block.label);
+            lines.push(block.url, '');
         }
     }
 

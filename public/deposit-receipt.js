@@ -13,6 +13,21 @@
  */
 
 const sessionKey = 'offerNetworkSessionToken';
+
+/**
+ * A deposit receipt is one person's money, so the page is gated like the account pages.
+ *
+ * The gate was already going to send a signed-out visitor to sign in; what is worth stating
+ * here is that the fallback below -- the "Sign in to view this deposit" panel -- is now only
+ * reachable if the gate script is missing or broken. It is kept because a page that renders
+ * an empty shell with no explanation is worse than one that says what is needed, and because
+ * the page is a direct-navigation target that someone may have bookmarked with a session that
+ * has since been revoked.
+ */
+function requireSession() {
+    if (window.RewardZoneSession && !window.RewardZoneSession.enforce()) return false;
+    return Boolean(sessionStorage.getItem(sessionKey));
+}
 const terminalStatuses = new Set(['confirmed', 'paid', 'failed', 'expired', 'cancelled', 'refunded']);
 
 let pollTimer;
@@ -51,15 +66,19 @@ function statusLabel(status) {
 }
 
 function setMessage(title, lead, state) {
-    document.getElementById('receipt-heading').textContent = title;
-    document.getElementById('receipt-lead').textContent = lead;
+    const heading = document.getElementById('receipt-heading');
+    if (heading) heading.textContent = title;
+    const leadEl = document.getElementById('receipt-lead');
+    if (leadEl) leadEl.textContent = lead;
     const card = document.getElementById('receipt-card');
-    card.dataset.state = state;
-    document.getElementById('receipt-mark').dataset.state = state;
+    if (card) card.dataset.state = state;
+    const mark = document.getElementById('receipt-mark');
+    if (mark) mark.dataset.state = state;
 }
 
 function renderFacts(deposit) {
     const facts = document.getElementById('receipt-facts');
+    if (!facts) return;
     const rows = [
         ['Amount', `${formatMoney(deposit.amount)} ${deposit.currency_code || 'USD'}`]
     ];
@@ -98,11 +117,20 @@ function stopPolling() {
     pollTimer = undefined;
 }
 
+/** Returns the receipt card element, or null if the page shell is missing. */
+function getReceiptCard() {
+    return document.getElementById('receipt-card');
+}
+
 async function load(showFooter) {
+    if (!requireSession()) return;
+    const card = getReceiptCard();
+    if (!card) return;
+
     const id = depositIdFromLocation();
     if (!id) {
         setMessage('Deposit not found', 'That link does not point at a deposit.', 'failed');
-        document.getElementById('receipt-card').setAttribute('aria-busy', 'false');
+        card.setAttribute('aria-busy', 'false');
         return;
     }
 
@@ -112,10 +140,11 @@ async function load(showFooter) {
             'Sign in to view this deposit',
             'Deposit receipts belong to your account, so this page needs you signed in on this device.',
             'pending'
-        );
-        document.getElementById('receipt-card').setAttribute('aria-busy', 'false');
-        document.getElementById('receipt-actions').hidden = false;
-        document.getElementById('receipt-copy-link').hidden = true;
+        );        card.setAttribute('aria-busy', 'false');
+        const actions = document.getElementById('receipt-actions');
+        if (actions) actions.hidden = false;
+        const copyLink = document.getElementById('receipt-copy-link');
+        if (copyLink) copyLink.hidden = true;
         return;
     }
 
@@ -126,25 +155,34 @@ async function load(showFooter) {
         });
         if (response.status === 404) {
             setMessage('Deposit not found', 'No deposit with that reference belongs to your account.', 'failed');
-            document.getElementById('receipt-card').setAttribute('aria-busy', 'false');
+            card.setAttribute('aria-busy', 'false');
             return;
         }
         if (response.status === 401) {
+            // The token existed a moment ago and has stopped working, which is the same
+            // state the gate refuses. Sending the visitor to sign in and back to this receipt
+            // is the useful answer; a panel telling them it expired leaves them holding a
+            // link they cannot open.
+            if (window.RewardZoneSession) {
+                window.RewardZoneSession.goToLogin(window.RewardZoneSession.currentReturnPath());
+                return;
+            }
             setMessage('Session expired', 'Sign in again to view this deposit.', 'pending');
-            document.getElementById('receipt-card').setAttribute('aria-busy', 'false');
+            card.setAttribute('aria-busy', 'false');
             return;
         }
         if (!response.ok) throw new Error('Could not load the deposit.');
         deposit = await response.json();
     } catch (error) {
         setMessage('Could not load this deposit', error.message, 'failed');
-        document.getElementById('receipt-card').setAttribute('aria-busy', 'false');
+        card.setAttribute('aria-busy', 'false');
         return;
     }
 
-    document.getElementById('receipt-card').setAttribute('aria-busy', 'false');
+    card.setAttribute('aria-busy', 'false');
     renderFacts(deposit);
-    document.getElementById('receipt-actions').hidden = false;
+    const actions = document.getElementById('receipt-actions');
+    if (actions) actions.hidden = false;
 
     const status = String(deposit.status || '').toLowerCase();
     if (status === 'confirmed' || status === 'paid') {
@@ -188,6 +226,7 @@ async function load(showFooter) {
 
 function setFootnote(text) {
     const footnote = document.getElementById('receipt-footnote');
+    if (!footnote) return;
     if (!text) {
         footnote.hidden = true;
         return;
@@ -198,6 +237,7 @@ function setFootnote(text) {
 
 function wireCopyLink() {
     const copy = document.getElementById('receipt-copy-link');
+    if (!copy) return;
     copy.addEventListener('click', async (event) => {
         // The link is a real navigation target, so it must stay a real link for
         // middle-click, right-click and keyboard users. The click handler only takes over

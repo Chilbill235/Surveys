@@ -505,68 +505,90 @@ function handlePayoutPreflight(req, res) {
 async function handlePayoutRun(req, res) {
     if (!enforceAccess(req, res)) return;
 
-    const preflight = autoPayouts.preflight();
-    if (!preflight.ready) {
-        // Reported as 409 rather than attempted. A run without the IPN secret would send
-        // money the app could never learn had arrived, and one without credentials would fail
-        // after the rows had already been claimed.
-        return res.status(409).json({
-            ok: false,
-            error: 'Automatic payouts are not ready to run.',
-            preflight
+    // Every other async handler here is wrapped, and this one has to be too. Express 4 does
+    // not attach a rejection handler to a handler's returned promise, so a throw below
+    // escapes as an unhandled rejection: on the Node this app runs, that terminates the
+    // process rather than failing one request, taking deposits and payouts down with it.
+    //
+    // The throws are not hypothetical. `claimPayoutCandidates` rethrows a failed transaction
+    // and the queue listing is an ordinary query, so a dropped database connection is enough.
+    // `submitClaimedPayouts` swallows provider failures by design, but the writes that record
+    // or release a claim are not inside that protection, so it can reject after the provider
+    // has already taken the batch.
+    try {
+        const preflight = autoPayouts.preflight();
+        if (!preflight.ready) {
+            // Reported as 409 rather than attempted. A run without the IPN secret would send
+            // money the app could never learn had arrived, and one without credentials would
+            // fail after the rows had already been claimed.
+            return res.status(409).json({
+                ok: false,
+                error: 'Automatic payouts are not ready to run.',
+                preflight
+            });
+        }
+
+        const dryRun = req.body?.dryRun !== false;
+        const limit = Math.min(Math.max(Number(req.body?.limit) || 10, 1), 50);
+
+        if (dryRun) {
+            // Claims nothing, so this is a count of what is waiting rather than a preview of
+            // specific rows: the real candidate list depends on the claim, and claiming would
+            // hold rows the operator then has to release.
+            const pending = await listCryptoPayoutQueue(limit);
+            return res.json({
+                ok: true,
+                dryRun: true,
+                preflight,
+                queued: pending.length,
+                withdrawals: pending,
+                hint: 'Send with {"dryRun": false} to claim and send these.'
+            });
+        }
+
+        const { claimed, skipped } = await autoPayouts.claimPayoutCandidates({
+            limit,
+            convertToCoin: autoPayouts.usdToCoin
         });
-    }
+        const outcome = await autoPayouts.submitClaimedPayouts(claimed);
 
-    const dryRun = req.body?.dryRun !== false;
-    const limit = Math.min(Math.max(Number(req.body?.limit) || 10, 1), 50);
+        // One line per withdrawal, so a run that reports only a count cannot leave an operator
+        // wondering whether a silent failure left a user waiting.
+        console.log(`Payout run: ${claimed.length} claimed, ${outcome.submitted} submitted, ` +
+            `${outcome.released} released, ${outcome.uncertain} uncertain` +
+            (outcome.error ? `, error: ${outcome.error}` : ''));
 
-    if (dryRun) {
-        // Claims nothing, so this is a count of what is waiting rather than a preview of
-        // specific rows: the real candidate list depends on the claim, and claiming would
-        // hold rows the operator then has to release.
-        const pending = await listCryptoPayoutQueue(limit);
         return res.json({
             ok: true,
-            dryRun: true,
+            dryRun: false,
             preflight,
-            queued: pending.length,
-            withdrawals: pending,
-            hint: 'Send with {"dryRun": false} to claim and send these.'
+            claimed: claimed.length,
+            submitted: outcome.submitted,
+            batchId: outcome.batchId,
+            // The number that matters most: rows whose fate the provider has not confirmed.
+            // They stay claimed on purpose and are listed for the operator to reconcile.
+            uncertain: outcome.uncertain,
+            skipped,
+            // Per-withdrawal verdict, so the operator can see which rows were sent, released,
+            // or held -- and why.
+            outcomes: outcome.outcomes || [],
+            // The provider's own words, when it refused. A bare "NOWPayments /v1/payout returned
+            // 400." says the batch was refused and nothing else; the useful part is the sentence
+            // naming what would work, which is exactly what an operator needs to fix the row.
+            ...(outcome.providerMessage ? { providerMessage: outcome.providerMessage } : {}),
+            ...(outcome.error ? { error: outcome.error } : {})
+        });
+    } catch (error) {
+        // Not a clean refusal. A failure after the claim may have left rows held, and the
+        // operator has to be told that, because "check the dashboard" is the only correct
+        // next step and nothing else in the response would say so.
+        console.error('Automatic payout run failed:', error.message);
+        return res.status(500).json({
+            ok: false,
+            error: 'The payout run could not complete.',
+            detail: 'Any withdrawals already claimed may still be held. Check `npm run withdrawals -- list` before running again.',
         });
     }
-
-    const { claimed, skipped } = await autoPayouts.claimPayoutCandidates({
-        limit,
-        convertToCoin: autoPayouts.usdToCoin
-    });
-    const outcome = await autoPayouts.submitClaimedPayouts(claimed);
-
-    // One line per withdrawal, so a run that reports only a count cannot leave an operator
-    // wondering whether a silent failure left a user waiting.
-    console.log(`Payout run: ${claimed.length} claimed, ${outcome.submitted} submitted, ` +
-        `${outcome.released} released, ${outcome.uncertain} uncertain` +
-        (outcome.error ? `, error: ${outcome.error}` : ''));
-
-    return res.json({
-        ok: true,
-        dryRun: false,
-        preflight,
-        claimed: claimed.length,
-        submitted: outcome.submitted,
-        batchId: outcome.batchId,
-        // The number that matters most: rows whose fate the provider has not confirmed.
-        // They stay claimed on purpose and are listed for the operator to reconcile.
-        uncertain: outcome.uncertain,
-        skipped,
-        // Per-withdrawal verdict, so the operator can see which rows were sent, released,
-        // or held -- and why.
-        outcomes: outcome.outcomes || [],
-        // The provider's own words, when it refused. A bare "NOWPayments /v1/payout returned
-        // 400." says the batch was refused and nothing else; the useful part is the sentence
-        // naming what would work, which is exactly what an operator needs to fix the row.
-        ...(outcome.providerMessage ? { providerMessage: outcome.providerMessage } : {}),
-        ...(outcome.error ? { error: outcome.error } : {})
-    });
 }
 
 /** The crypto withdrawals currently waiting to be sent, for the dry run. */
@@ -585,8 +607,11 @@ async function listCryptoPayoutQueue(limit) {
     return result.rows;
 }
 
-registerMethod(MAINTENANCE_METHODS.payoutPreflight, ['GET']);
-registerMethod(MAINTENANCE_METHODS.payoutRun, ['POST']);
+// No second registration for the payout paths: they were declared with the block above, and
+// re-declaring `payoutPreflight` here with `['GET']` would contradict the route registered on
+// GET *and* POST. The registry unions overlapping patterns, so today it only widens the entry
+// back out -- but the whole point of the table is that the verb list cannot drift from the
+// routes, and a narrower second declaration is exactly that drift waiting to be tightened.
 
 // ---------------------------------------------------------------------------
 // Exports

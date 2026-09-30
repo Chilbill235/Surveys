@@ -20,10 +20,29 @@
 const MAX_ENTRIES = 40;
 const RETENTION_MS = 6 * 60 * 60 * 1000;
 
+/**
+ * Bounds on what one record may hold.
+ *
+ * The promise this module makes -- it never records a signature, a secret, or a full
+ * address -- depends on every caller, and the values here come from a provider's body.
+ * Truncating on the way in makes the promise structural instead of conventional, and
+ * keeps one verbose provider message from filling the whole tail.
+ */
+const MAX_DETAIL_LENGTH = 240;
+const MAX_IDENTIFIER_LENGTH = 128;
+const MAX_STATUS_LENGTH = 32;
+
 /** @type {Array<{at: string, outcome: string, detail: string, paymentId: string|null, orderId: string|null, status: string|null}>} */
 const entries = [];
 let lastReceivedAt = null;
 let totals = { received: 0, accepted: 0, refused: 0 };
+
+/** Coerces one stored field to a bounded string, or null when there is nothing to say. */
+function recordText(value, maxLength) {
+    if (value === null || value === undefined) return null;
+    const text = String(value).slice(0, maxLength);
+    return text === '' ? null : text;
+}
 
 /**
  * Records the outcome of one callback.
@@ -42,7 +61,14 @@ function record({ outcome, detail, paymentId = null, orderId = null, status = nu
     // operator most needs to investigate.
     lastReceivedAt = at;
 
-    entries.push({ at, outcome, detail, paymentId, orderId, status });
+    entries.push({
+        at,
+        outcome: String(outcome),
+        detail: recordText(detail, MAX_DETAIL_LENGTH),
+        paymentId: recordText(paymentId, MAX_IDENTIFIER_LENGTH),
+        orderId: recordText(orderId, MAX_IDENTIFIER_LENGTH),
+        status: recordText(status, MAX_STATUS_LENGTH)
+    });
     prune(at);
 }
 

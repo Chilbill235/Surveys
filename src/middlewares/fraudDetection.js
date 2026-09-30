@@ -166,6 +166,15 @@ function normaliseAddress(value) {
  */
 const PROXY_CACHE_MAX = 500;
 const PROXY_CACHE_TTL_MS = 5 * 60 * 1000;
+/**
+ * How long a verdict the provider could not give is kept.
+ *
+ * A real verdict is worth five minutes of not asking again. "Could not check" is not a
+ * verdict at all, and caching it for the full five minutes turns a ten-second provider
+ * outage into five minutes during which every click from that address is waved through with
+ * a fraud row written against it.
+ */
+const PROXY_CACHE_FAILURE_TTL_MS = 30 * 1000;
 const proxyCache = new Map();
 
 function cacheGet(ip) {
@@ -178,12 +187,12 @@ function cacheGet(ip) {
     return entry.value;
 }
 
-function cacheSet(ip, value) {
+function cacheSet(ip, value, ttlMs = PROXY_CACHE_TTL_MS) {
     if (proxyCache.size >= PROXY_CACHE_MAX) {
         const oldest = proxyCache.keys().next().value;
         if (oldest !== undefined) proxyCache.delete(oldest);
     }
-    proxyCache.set(ip, { value, expiresAt: Date.now() + PROXY_CACHE_TTL_MS });
+    proxyCache.set(ip, { value, expiresAt: Date.now() + ttlMs });
 }
 
 /** Exposed so a test or a configuration change can start from a clean slate. */
@@ -279,9 +288,13 @@ async function lookupProxy(ipAddress) {
     if (cached) return { ...cached, cached: true };
 
     const verdict = await checkProxyVerdict(ipAddress, process.env.PROXYCHECK_KEY);
-    // Only cache a real verdict. A failure is cached too, but under a shorter TTL so a
+    // Only cache a real verdict for long. A failure is cached too, but under a shorter TTL so a
     // brief outage does not exempt the address for the full five minutes.
-    cacheSet(ipAddress, verdict);
+    cacheSet(
+        ipAddress,
+        verdict,
+        verdict.verdict === 'unknown' ? PROXY_CACHE_FAILURE_TTL_MS : PROXY_CACHE_TTL_MS
+    );
     return { ...verdict, cached: false };
 }
 
@@ -436,6 +449,9 @@ async function fraudDetection(req, res, next) {
 
 module.exports = fraudDetection;
 module.exports.proxyCheckRequired = proxyCheckRequired;
+// Exported because the click that this middleware counts has to be *stored* in the same
+// normalised form, or the count and the record describe two different clients.
+module.exports.normaliseAddress = normaliseAddress;
 // Exposed for the test suite, which needs to drive one check and inspect the verdict
 // without standing up a database, and for a configuration change that should not have to
 // wait out the cache TTL.

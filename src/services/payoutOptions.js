@@ -189,7 +189,12 @@ function isValidCryptoAddress(assetCode, network, address) {
     if (!resolvedNetwork) return false;
 
     const pattern = resolvedNetwork.addressPattern || findDestination(assetCode)?.addressPattern;
-    if (!pattern) return true;
+    // Fails closed. Every asset in the table above defines a pattern, so this is unreachable
+    // today and exists for the next asset someone adds and forgets. "This build has no rule
+    // for the destination" is not the same statement as "this address is fine", and the
+    // balance is already debited by the time an address is stored -- an address that cannot
+    // be checked is an address that is paid late or not at all.
+    if (!pattern) return false;
 
     return pattern.test(String(address).trim());
 }

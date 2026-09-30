@@ -11,11 +11,30 @@ certs/
 *.pem
 *.crt
 
-# One-off scripts from debugging sessions
-test.js
-check-*.js
-run-cleanup.js
+# One-off scripts from debugging sessions.
+#
+# These three patterns are anchored to the repository root on purpose. Unanchored, `check-*.js`
+# also matched `scripts/check-frontend.js`, `scripts/check-responsive.js`,
+# `scripts/check-contrast.js` and `scripts/check-a11y.js`, which are real source files wired
+# into `npm run check`. The first three were already tracked so they kept working, but
+# `check-a11y.js` was never tracked at all: a fresh clone got three of the four checks, and
+# `npm run check` died on `Cannot find module`. Nothing fails loudly when a source file is
+# silently ignored, so the pattern has to stay narrow enough to only catch the scratch files.
+/test.js
+/ipn-debug.js
+/check-*.js
+/run-cleanup.js
 cleanup-test-data.sql
+
+# Browser probes and one-off verification scripts. The `.tmp.js` suffix is the marker for these:
+# they are written, run against a live dev server, and deleted, and the ones that survive are
+# dead weight in a tree that has 20-odd of them. Anchored to `scripts/` because the suffix is
+# generic enough to be a legitimate filename elsewhere.
+#
+# `node --test test/` runs whatever is in `test/`, so the suffix cannot be relied on there to
+# keep a probe from being picked up as a suite -- the tests have to live in `test/` and be named
+# for what they assert.
+scripts/*.tmp.js
 
 # Build and cache
 dist/

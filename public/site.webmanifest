@@ -1,12 +1,28 @@
 {
+  "id": "/",
   "name": "RewardZone",
   "short_name": "RewardZone",
   "description": "Browse available offers and track your rewards.",
-  "start_url": "/",
+  "start_url": "/?source=pwa",
   "scope": "/",
   "display": "standalone",
+  "display_override": [
+    "window-controls-overlay",
+    "standalone",
+    "minimal-ui",
+    "browser"
+  ],
+  "orientation": "any",
   "background_color": "#f5f2ea",
   "theme_color": "#2449d8",
+  "lang": "en",
+  "dir": "ltr",
+  "categories": [
+    "shopping",
+    "finance",
+    "lifestyle"
+  ],
+  "prefer_related_applications": false,
   "icons": [
     {
       "src": "/icon-192.png",
@@ -25,6 +41,34 @@
       "sizes": "512x512",
       "type": "image/png",
       "purpose": "maskable"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "Browse offers",
+      "short_name": "Offers",
+      "description": "See all available offers",
+      "url": "/offers?source=shortcut",
+      "icons": [
+        {
+          "src": "/icon-192.png",
+          "sizes": "192x192",
+          "type": "image/png"
+        }
+      ]
+    },
+    {
+      "name": "My rewards",
+      "short_name": "Rewards",
+      "description": "View your reward balance and history",
+      "url": "/account?source=shortcut",
+      "icons": [
+        {
+          "src": "/icon-192.png",
+          "sizes": "192x192",
+          "type": "image/png"
+        }
+      ]
     }
   ]
 }

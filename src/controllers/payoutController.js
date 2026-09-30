@@ -665,7 +665,13 @@ async function sendWithdrawalCode(req, res) {
         if (!delivery.sent) {
             // The row exists but nothing was sent, so a code the user never receives would
             // otherwise be waiting to be guessed. Cleared rather than left to expire.
-            await withdrawalCode.clearWithdrawalCode(userId).catch(() => {});
+            //
+            // If the delete itself fails, that code is still live: unconsumed, unexpired, and
+            // worth five guesses to anyone trying. The user is told 503 either way, so the
+            // request outcome does not change -- but the two states are not the same and the
+            // operator has to be able to tell them apart. The old `.catch(() => {})` made a
+            // surviving code indistinguishable from a cleared one.
+            await clearDeliveredCodeOrWarn(userId, 'delivery failed');
             console.error(`Withdrawal confirmation email was not delivered (${delivery.reason}).`);
             return res.status(503).json({ error: 'Could not email a confirmation code right now.' });
         }
@@ -679,8 +685,32 @@ async function sendWithdrawalCode(req, res) {
         // Same reasoning as the undelivered case above: the code may well have been written
         // before the failure, and a code the user never received is still five guesses for
         // whoever is guessing.
-        await withdrawalCode.clearWithdrawalCode(userId).catch(() => {});
+        await clearDeliveredCodeOrWarn(userId, 'request threw');
         return res.status(503).json({ error: 'Could not email a confirmation code right now.' });
+    }
+}
+
+/**
+ * Deletes an undelivered withdrawal code, and says so loudly if the delete did not happen.
+ *
+ * Exists because the failure being guarded is not visible anywhere else. The user is told
+ * 503 either way, the request looks identical, and the code row is the only evidence that a
+ * live six-digit code now exists for a message nobody received. A silent `.catch` made that
+ * survivable: the row expired eventually, and in the meantime it was a valid, guessable
+ * credential belonging to a user who has been told nothing was sent.
+ *
+ * The caller does not get a boolean because it cannot act on one -- the response is 503
+ * regardless. This is a reporting obligation, not a control flow one.
+ */
+async function clearDeliveredCodeOrWarn(userId, context) {
+    try {
+        await withdrawalCode.clearWithdrawalCode(userId);
+    } catch (error) {
+        console.error(
+            `SECURITY: withdrawal code for user ${userId} was NOT cleared after the ${context} `
+            + `(${error.message}). It stays valid until it expires and can be spent; it should be `
+            + 'deleted by hand.'
+        );
     }
 }
 
@@ -836,6 +866,18 @@ async function requestWithdrawal(req, res) {
         );
 
         await client.query('COMMIT');
+
+        // The transaction is finished and this handler has no further use for the connection.
+        // It is handed back here rather than left to the `finally` below, because the automatic
+        // payout below is two provider calls -- a batch create and a 2FA verification, each with
+        // its own multi-second timeout -- and the dispatch takes a connection of its own while it
+        // claims the row. Holding this one across all of that costs the pool a connection for up
+        // to a minute per withdrawal, and the pool is what every other request in the app reads
+        // and writes through: enough concurrent withdrawals and the whole API stalls behind
+        // requests that are only waiting on NOWPayments. `client` is cleared so the `catch` and
+        // `finally` below do not release it a second time.
+        client.release();
+        client = null;
 
         // The withdrawal is now real and the balance is debited, so the payout is attempted
         // from here rather than waiting for a scheduled run: the user asked to be paid, and

@@ -37,37 +37,146 @@
     <link rel="icon" href="/icon-192.png" sizes="192x192" type="image/png">
     <link rel="apple-touch-icon" href="/apple-touch-icon.png">
     <link rel="manifest" href="/site.webmanifest">
+    <!-- clock.js first: it builds #topbar-clock and #live-indicator into the header, and the
+         scripts below look them up once the DOM is ready. Deferred scripts run in document
+         order, so putting it ahead of them is what makes those lookups resolve. -->
+    <script src="/clock.js" defer></script>
+    <!--
+        app.js loads here now. It is what reads the session and paints the header's account
+        cluster -- the name, the picture, the notification bell and the menu -- and until this
+        was added the landing page was the one page that could not tell a signed-in visitor
+        they were signed in. It is the same script every other page loads, against the same
+        markup, so there is one header to keep correct rather than two.
+
+        It is also what starts the live-sync loop, which is why the balance in the header and the
+        freshness line on the account page are current without a reload.
+
+        Everything it touches on this page it also touches on Offers, and it null-checks each
+        one, so the parts of it belonging to the offers list are simply not found here.
+    -->
+    <script src="/session-gate.js" defer></script>
+    <script src="/app.js" defer></script>
     <script src="/home.js" defer></script>
 </head>
-<body>
-    <a class="skip-link" href="#main">Skip to main content</a>
+    <body>
+        <a class="skip-link" href="#main">Skip to main content</a>
+
+        <div class="toast-region" id="toast-region" aria-live="polite"></div>
 
     <header class="topbar">
         <a class="brand" href="/" aria-label="RewardZone home">
             <!--
                 The animated mark, the same asset every other page uses.
-
-                This was an inline SVG letter "R" standing in for it, on the grounds that
-                `<img src="/brand.gif">` 404s. It does not 404 -- the file is served with every
-                page and the other four all reference it -- so the home page was the only one
-                showing a different brand mark to everyone who landed on it. An inline SVG cannot
-                404, but neither can it animate, and the point of the asset is the animation.
+                ...
             -->
             <img class="brand-mark" src="/brand.gif" alt="" width="36" height="36">
-            <span>reward<span class="brand-light">zone</span></span>
+            <span>reward<span class="brand-light">zone</span><span class="brand-tm" aria-hidden="true">&#8482;</span></span>
         </a>
 
+        <!--
+            The clock is not in this markup. `clock.js` injects it into every page that has a
+            header, immediately before the wordmark, so it lands in the header's left cell
+            without this file having to say so. Twelve copies of the same five lines would be
+            twelve copies to keep in step, and the header would drift out of alignment the
+            first time one of them was missed.
+        -->
         <nav class="home-nav" aria-label="Main navigation">
             <a class="home-nav-link" href="#home-faq">FAQ</a>
-            <a class="home-nav-link" href="/offers">Browse offers</a>
-            <a class="button button-accent" href="/offers">Start earning</a>
         </nav>
+
+        <!--
+            The account cluster, identical to the one on Offers and on the account page.
+
+            This page did not have one, and that was not a deliberate simplification. `app.js` --
+            which is what reads the session and paints the identity, the notification bell and the
+            account menu -- was not loaded here at all, so the landing page showed the same
+            header to a signed-in visitor as to a stranger: no name, no picture, no bell, and on
+            a phone a plain "Account" link sitting in the middle of the header rather than at the
+            right-hand end of it. The first thing a returning visitor sees was the one page that
+            could not tell them they were signed in.
+
+            So `app.js` loads here now and the cluster is the same markup, which means one
+            header layout to keep correct rather than three. Every element the cluster needs is
+            `hidden` until the session resolves, so a signed-out visitor sees the brand, the nav
+            and "Connect account" and nothing else -- the same as on every other page.
+
+            The old in-nav `.home-mobile-account` button is gone. It was a link to `/account`
+            living inside the `<nav>`, so on a phone it sat in the header's centre column,
+            48px short of the right edge at 320px and 238px short at 720px. A button that is
+            supposed to be in the corner cannot live in the middle of the navigation.
+        -->
+        <div class="account-tools">
+            <img class="account-avatar" id="account-avatar" src="/brand.gif" alt="" width="34" height="34" hidden>
+            <div class="account-menu" id="account-menu" hidden>
+                <button type="button" class="account-menu-trigger" id="account-menu-trigger"
+                        aria-haspopup="menu" aria-expanded="false" aria-controls="account-menu-panel">
+                    <img class="account-menu-avatar" id="account-menu-avatar" src="/brand.gif" alt="" width="38" height="38">
+                    <span class="account-menu-identity">
+                        <span class="account-menu-name" id="account-menu-name">Your account</span>
+                        <span class="account-menu-email" id="account-menu-email"></span>
+                    </span>
+                    <span class="account-menu-caret" aria-hidden="true"></span>
+                </button>
+                <div class="account-menu-panel" id="account-menu-panel" role="menu" aria-labelledby="account-menu-name" hidden>
+                    <div class="account-menu-header">
+                        <img class="account-menu-avatar-lg" id="account-menu-avatar-lg" src="/brand.gif" alt="" width="56" height="56">
+                        <div class="account-menu-header-text">
+                            <p class="account-menu-header-name" id="account-menu-header-name">Your account</p>
+                            <p class="account-menu-header-email" id="account-menu-header-email"></p>
+                        </div>
+                    </div>
+                    <a class="account-menu-item" id="account-menu-profile" href="/account#profile-settings" role="menuitem">Profile &amp; settings</a>
+                    <a class="account-menu-item" id="account-menu-history" href="/account#history" role="menuitem">Transactions</a>
+                    <button type="button" class="account-menu-item" id="account-menu-deposit" role="menuitem">Add funds</button>
+                    <button type="button" class="account-menu-item" id="account-menu-withdraw" role="menuitem">Withdraw</button>
+                    <div class="account-menu-divider" role="separator"></div>
+                    <button type="button" class="account-menu-item is-danger" id="account-menu-signout" role="menuitem">Sign out</button>
+                </div>
+            </div>
+            <div class="notification-popover" id="notification-popover">
+                <button type="button" class="button button-ghost button-square notification-bell"
+                        id="notification-bell" aria-label="Notifications" aria-haspopup="dialog" aria-expanded="false" hidden>
+                    <span class="notification-icon" aria-hidden="true"></span>
+                    <span class="notification-count" id="notification-count" hidden>0</span>
+                </button>
+                <div class="notification-dropdown" id="notification-dropdown" hidden role="dialog" aria-labelledby="notification-title" aria-modal="false">
+                    <div class="notification-header">
+                        <h3 id="notification-title">Notifications</h3>
+                        <button type="button" class="link-button notification-mark-all" id="notification-mark-all" aria-label="Mark all as read">Mark all read</button>
+                          <button type="button" class="link-button notification-clear-all" id="notification-clear-all" aria-label="Clear all notifications">Clear all</button>
+                    </div>
+                    <div class="notification-list" id="notification-list">
+                        <p class="notification-empty">No new notifications.</p>
+                    </div>
+                </div>
+            </div>
+            <button class="button button-light header-action" id="account-button" type="button">Connect account</button>
+        </div>
     </header>
 
     <main class="home-shell" id="main">
+        <!--
+            The hero.
+
+            Two columns: copy on the left, the floating reward chips on the right, as it always
+            was. It was briefly centred, and then the clock was moved in here, directly under
+            the RewardZone wordmark, in space that was already blank on the page. It has since
+            gone back to the header, where the other eleven pages have it, and where a reader
+            on any page can find it in the same place.
+
+            That is the whole reason for the move. The clock is not a thing you came here for,
+            and the two thirds of the page that are a scroll away from this hero had no way to
+            know what time it was. In the header it is on every screen of the site, and the
+            hero goes back to being the headline, the claim, and the two buttons.
+
+            The chips are unchanged and stay in their own column. A layout that has no room for
+            a second column should not have a decoration floating in the margins, which is what
+            the centred version did with them.
+        -->
         <section class="home-hero" aria-labelledby="home-title">
             <div class="home-hero-copy">
-                <p class="eyebrow"><span class="eyebrow-dot" aria-hidden="true"></span> RewardZone</p>
+                <p class="eyebrow"><span class="eyebrow-dot" aria-hidden="true"></span> RewardZone&trade;</p>
+
                 <h1 id="home-title" class="display">Make every offer count.</h1>
                 <p class="home-copy">
                     Complete surveys and offers from real partners, track your balance from one
@@ -113,6 +222,7 @@
                     <span class="hero-chip-value">$25.00</span>
                 </div>
             </div>
+
         </section>
 
         <section class="home-stats" aria-label="Platform summary" aria-live="polite" role="status">
@@ -167,7 +277,7 @@
             </ul>
         </section>
 
-        <section class="home-steps" aria-labelledby="home-steps-title">
+        <section class="home-steps" id="home-steps" aria-labelledby="home-steps-title">
             <div class="home-section-heading">
                 <div>
                     <p class="eyebrow">How it works</p>
@@ -360,12 +470,20 @@
                     sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox"
                     title="Donate to RewardZone with cryptocurrency"
                 ></iframe>
-                <p class="home-support-fallback">
-                    If the donation form does not load,
-                    <a href="/offers">browse the offer catalog</a> instead,
-                    or reach out to us directly and we will take the donation another way.
-                </p>
             </div>
+
+            <!--
+                Outside the black panel on purpose. This sentence is what someone reads when the
+                provider's script is blocked, an ad blocker is on, or the network is bad, so it
+                has to be on the light card where `--muted` is actually a legible colour -- inside
+                the panel that same grey was a dark grey on black, which is the one thing the
+                fallback cannot be.
+            -->
+            <p class="home-support-fallback">
+                If the donation form does not load,
+                <a href="/offers">browse the offer catalog</a> instead,
+                or reach out to us directly and we will take the donation another way.
+            </p>
         </section>
     </main>
 
@@ -374,33 +492,66 @@
         is judged partly by whether the boring pages exist: terms, privacy, contact.
         A user who cannot find those assumes the worst.
     -->
-    <footer class="site-footer site-footer-wide">
+    <!--
+        The footer.
+
+        One column, top to bottom, at every width. It used to be a three-column grid on
+        desktop, which put Product / Account / Legal side by side as parallel reading
+        columns. That reads well on paper and badly on a screen: a visitor looking for the
+        Privacy Policy has to work out which of three columns it is in and scan all three
+        headings to find out, because there is no relationship between the columns and no
+        order to them. Stacked, the page has one reading order, the same on every device, and
+        the answer to "where is Terms" is "further down", which is a thing people can do.
+
+        The sections are real links to pages that exist, not aspirational links to a
+        different product. Every href here resolves, because a dead legal link is worse than
+        a missing one -- it implies the document exists and cannot be read.
+    -->
+    <!--
+        The footer, identical on every page.
+
+        One column, top to bottom, at every width. The previous layout put Product / Help /
+        Legal side by side as parallel columns on desktop, which reads fine on paper and badly
+        on a screen: someone looking for the Privacy Policy has to guess which of three columns
+        holds it and then check the other two headings to be sure. Stacked, the page has one
+        reading order that is the same on every device, and "the legal links are further down"
+        is an answer a visitor can act on without a strategy.
+
+        Every href resolves. That is checked, not assumed: a legal link that goes nowhere is
+        worse than a missing one, because it implies the document exists and cannot be read.
+    -->
+    <footer class="site-footer">
         <div class="site-footer-brand">
             <span class="site-footer-meta">
                 <span class="footer-mark" aria-hidden="true"></span>
-                RewardZone
+                RewardZone&trade;
             </span>
             <p class="site-footer-tagline">Free to join. Payouts from $1.00. No fees.</p>
+            <p class="site-footer-copy">&copy; <span data-current-year>2026</span> RewardZone. All rights reserved.</p>
         </div>
 
-        <nav class="site-footer-column" aria-label="Product">
+        <nav class="site-footer-group" aria-label="Product">
             <h2 class="site-footer-heading">Product</h2>
             <a href="/">Home</a>
             <a href="/offers">Offers</a>
-            <a href="#home-faq">FAQ</a>
+            <a href="/account">Your account</a>
+            <a href="/#home-faq">Frequently asked questions</a>
         </nav>
 
-        <nav class="site-footer-column" aria-label="Account">
-            <h2 class="site-footer-heading">Account</h2>
-            <a href="/offers">Sign in</a>
-            <a href="/reset-password">Reset password</a>
+        <nav class="site-footer-group" aria-label="Help">
+            <h2 class="site-footer-heading">Help</h2>
+            <a href="/account">Sign in or create an account</a>
+            <a href="/reset-password">Reset your password</a>
+            <a href="#" data-helpdesk-trigger>Help desk</a>
+            <a href="#" data-contact-trigger>Contact support</a>
         </nav>
 
-        <nav class="site-footer-column" aria-label="Legal">
+        <nav class="site-footer-group" aria-label="Legal">
             <h2 class="site-footer-heading">Legal</h2>
-            <a href="/terms">Terms</a>
-            <a href="/privacy">Privacy</a>
-            <a href="/contact">Contact</a>
+            <a href="/terms">Terms of service</a>
+            <a href="/privacy">Privacy policy</a>
+            <a href="/cookies">Cookie policy</a>
+            <a href="/aml">AML and KYC policy</a>
         </nav>
     </footer>
 
@@ -433,5 +584,67 @@
             </p>
         </div>
     </noscript>
+
+    <!-- Contact support -->
+    <dialog class="dialog dialog-contact" id="contact-dialog" aria-labelledby="contact-title">
+        <div class="dialog-panel">
+            <div class="dialog-heading">
+                <div>
+                    <p class="eyebrow">Support</p>
+                    <h2 id="contact-title">Contact us</h2>
+                </div>
+                <button class="icon-button" type="button" data-close="contact-dialog" aria-label="Close">&times;</button>
+            </div>
+                        <form id="contact-form" novalidate>
+                <!--
+                    The fields scroll; the status line and the button do not.
+
+                    This form is taller than a phone screen -- five fields, a hint under two of
+                    them, and a message box -- and the dialog caps its height to the viewport.
+                    Without this split the whole thing scrolls, which put the "Send message"
+                    button 45-50px below the visible area at every size measured: 360x640,
+                    360x800, and 1280x800 alike. A submit button you have to go looking for is
+                    a submit button people do not press, and on a contact form that means a
+                    support request that is never filed.
+
+                    So the body scrolls and the action row is a sibling below it. The button is
+                    now on screen the moment the dialog opens, at any height, and the status
+                    line that reports the result sits directly above it where it is read.
+                -->
+                <div class="contact-form-body">
+                    <p class="form-note" id="contact-note">We reply by email, usually within one business day. Use the address you can actually read.</p>
+                    <div class="form-field">
+                        <label class="form-label" for="contact-name">Your name</label>
+                        <input class="form-input" type="text" id="contact-name" name="name" required maxlength="200" autocomplete="name">
+                    </div>
+                    <div class="form-field">
+                        <label class="form-label" for="contact-email">Reply-to email</label>
+                        <input class="form-input" type="email" id="contact-email" name="email" required maxlength="254" autocomplete="email" aria-describedby="contact-email-hint">
+                        <p class="field-hint" id="contact-email-hint">Where our answer goes. It is not shared with anyone else.</p>
+                    </div>
+                    <div class="form-field">
+                        <label class="form-label" for="contact-subject">Subject</label>
+                        <input class="form-input" type="text" id="contact-subject" name="subject" required maxlength="200">
+                    </div>
+                    <div class="form-field">
+                        <div class="field-heading">
+                            <label class="form-label" for="contact-message">Message</label>
+                            <span class="field-count" id="contact-count" aria-live="polite"></span>
+                        </div>
+                        <textarea class="form-input" id="contact-message" name="message" rows="6" required maxlength="2000" aria-describedby="contact-count"></textarea>
+                    </div>
+                </div>
+                <div class="contact-form-actions">
+                    <p id="contact-form-message" class="form-message" role="status" aria-live="polite"></p>
+                    <button class="button button-accent button-wide button-lg" id="contact-submit" type="submit">Send message</button>
+                </div>
+            </form>
+        </div>
+    </dialog>
+
+    <script src="/helpdesk.js" defer></script>
+
+
+    <script src="/contact.js" defer></script>
 </body>
 </html>

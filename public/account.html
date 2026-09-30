@@ -1,0 +1,797 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="theme-color" content="#131c4a" media="(prefers-color-scheme: dark)">
+    <meta name="theme-color" content="#2449d8" media="(prefers-color-scheme: light)">
+    <meta name="robots" content="noindex">
+    <meta name="description" content="Your RewardZone account dashboard. View your balance, deposit, withdraw, and transaction history.">
+    <title>Account | RewardZone</title>
+    <link rel="stylesheet" href="/style.css">
+    <link rel="icon" href="/favicon.ico" sizes="any">
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+    <link rel="icon" href="/favicon-32.png" sizes="32x32" type="image/png">
+    <link rel="icon" href="/icon-192.png" sizes="192x192" type="image/png">
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+    <link rel="manifest" href="/site.webmanifest">
+    <!-- clock.js first: it builds #topbar-clock and #live-indicator into the header, and the
+         scripts below look them up once the DOM is ready. Deferred scripts run in document
+         order, so putting it ahead of them is what makes those lookups resolve. -->
+    <script src="/clock.js" defer></script>
+    <script src="/session-gate.js" defer></script>
+    <script src="/app.js" defer></script>
+    <script src="/helpdesk.js" defer></script>
+    <script src="/history.js" defer></script>
+    <script src="/passkey-shared.js" defer></script>
+    <script src="/account-passkeys.js" defer></script>
+</head>
+<!-- Gated, and separate from the sign-in page on purpose. A signed-out visitor here is sent to
+     `/login`, which is its own page with no account content behind it. This dialog remains for
+     the signed-out case that is genuinely a choice rather than a dead end: clicking "Connect
+     account" in the header of a page that *is* reachable signed out. There the account page is
+     legitimately on screen and the dialog is a layer over it, which is what a dialog is for. -->
+<body class="has-action-bar" data-requires-session="true">
+    <div class="toast-region" id="toast-region" aria-live="polite"></div>
+    <header class="topbar">
+        <a class="brand" href="/" aria-label="RewardZone home">
+            <img class="brand-mark" src="/brand.gif" alt="" width="36" height="36">
+            <span>reward<span class="brand-light">zone</span><span class="brand-tm" aria-hidden="true">&#8482;</span></span>
+        </a>
+        <nav class="header-nav">
+            <a class="header-nav-link" href="/offers">Offers</a>
+            <a class="header-nav-link" href="/account" aria-current="page">Account</a>
+        </nav>
+        <div class="account-tools">
+            <!--
+                The header's account cluster, left to right: who you are, then what is new, then
+                the one action a signed-out visitor has.
+
+                The order is the point. The identity comes first because it answers "who am I"
+                before anything else, the bell sits to the right of it rather than to the left
+                -- it used to be the first child of this row, which put the notifications panel
+                flush against the far edge of a cluster it had nothing to do with -- and
+                "Connect account" last, because it is the only thing here a signed-in visitor
+                cannot use and it should not be sitting between the two things they can.
+
+                No Deposit or Withdraw in the header. They were here as a second copy of the
+                pair in the balance card at the top of this page, which put two sets of the
+                same two buttons on one screen, at two different sizes, in two different
+                places -- and at 860px the header copy is the one that loses its width. The
+                card's pair is the primary call to action on this page, the account menu carries
+                the same two, and the narrow action bar mirrors them. Four copies of a money
+                button is a lot of places to be wrong. Every write in app.js already
+                null-checks `#deposit-button` / `#withdraw-button`, so their absence is not a
+                fault.
+
+                The balance is not repeated here either: the balance card at the top of the
+                page body owns both figures, so a second copy in the header only invited the
+                two to disagree.
+            -->
+            <img class="account-avatar" id="account-avatar" src="/brand.gif" alt="" width="34" height="34" hidden>
+            <!-- The account menu.
+                 Sign-out lives here rather than in the header row, for two reasons. It is a
+                 destructive action that a signed-in user reaches perhaps once a session, and
+                 giving it permanent space in the header gives it the same visual weight as the
+                 two things people actually came to do. And the identity it hangs off -- the
+                 picture and the name -- is the answer to "who am I and how do I get out of
+                 here", which belongs together rather than split across an icon and a separate
+                 button.
+                 `#account-button` below is the signed-out path only, so exactly one sign-out
+                 control exists on this page at any moment. -->
+            <div class="account-menu" id="account-menu" hidden>
+                <button type="button" class="account-menu-trigger" id="account-menu-trigger"
+                        aria-haspopup="menu" aria-expanded="false" aria-controls="account-menu-panel">
+                    <img class="account-menu-avatar" id="account-menu-avatar" src="/brand.gif" alt="" width="38" height="38">
+                    <span class="account-menu-identity">
+                        <span class="account-menu-name" id="account-menu-name">Your account</span>
+                        <span class="account-menu-email" id="account-menu-email"></span>
+                    </span>
+                    <span class="account-menu-caret" aria-hidden="true"></span>
+                </button>
+                <div class="account-menu-panel" id="account-menu-panel" role="menu" aria-labelledby="account-menu-name" hidden>
+                    <div class="account-menu-header">
+                        <img class="account-menu-avatar-lg" id="account-menu-avatar-lg" src="/brand.gif" alt="" width="56" height="56">
+                        <div class="account-menu-header-text">
+                            <p class="account-menu-header-name" id="account-menu-header-name">Your account</p>
+                            <p class="account-menu-header-email" id="account-menu-header-email"></p>
+                        </div>
+                    </div>
+                        <a class="account-menu-item" id="account-menu-offers" href="/offers" role="menuitem">Offers</a>
+                    <a class="account-menu-item" id="account-menu-profile" href="#profile-settings" role="menuitem">Profile &amp; settings</a>
+                    <a class="account-menu-item" id="account-menu-history" href="#history" role="menuitem">Transactions</a>
+                    <button type="button" class="account-menu-item" id="account-menu-deposit" role="menuitem">Add funds</button>
+                    <button type="button" class="account-menu-item" id="account-menu-withdraw" role="menuitem">Withdraw</button>
+                    <div class="account-menu-divider" role="separator"></div>
+                    <button type="button" class="account-menu-item is-danger" id="account-menu-signout" role="menuitem">Sign out</button>
+                </div>
+            </div>
+            <!-- The bell, to the right of the identity.
+                 `.notification-popover` is the positioning context and the panel hangs off
+                 `right: 0` of it, so wherever this sits is where the panel's right edge
+                 lands. Last-but-one in the row puts it under the control that opened it, at
+                 the right-hand end of the header, which is where a notifications panel is
+                 expected to be. -->
+            <div class="notification-popover" id="notification-popover">
+                <button type="button" class="button button-ghost button-square notification-bell"
+                        id="notification-bell" aria-label="Notifications" aria-haspopup="dialog" aria-expanded="false" hidden>
+                    <span class="notification-icon" aria-hidden="true"></span>
+                    <span class="notification-count" id="notification-count" hidden>0</span>
+                </button>
+                <div class="notification-dropdown" id="notification-dropdown" hidden role="dialog" aria-labelledby="notification-title" aria-modal="false">
+                    <div class="notification-header">
+                        <h3 id="notification-title">Notifications</h3>
+                        <button type="button" class="link-button notification-mark-all" id="notification-mark-all" aria-label="Mark all as read">Mark all read</button>
+                          <button type="button" class="link-button notification-clear-all" id="notification-clear-all" aria-label="Clear all notifications">Clear all</button>
+                    </div>
+                    <div class="notification-list" id="notification-list">
+                        <p class="notification-empty">No new notifications.</p>
+                    </div>
+                </div>
+            </div>
+            <button class="button button-light header-action" id="account-button" type="button">Connect account</button>
+        </div>
+    </header>
+
+    <main class="page-shell">
+        <section id="account-dashboard" class="account-dashboard" aria-label="Account dashboard">
+            <div class="account-balance-card">
+<div class="account-balance-block">
+                    <p class="account-greeting" id="account-greeting" hidden></p>
+                    <span class="account-balance-label">Available balance</span>
+                    <!--
+                        `is-updated` is added by `noteBalanceChange()` for about a second and a
+                        half whenever the figure changes, and is what the highlight and the pulse
+                        animate off. It lives on the figure rather than on the card so the CSS can
+                        target one element, and so the class means "this number changed" and
+                        nothing else.
+                    -->
+                    <strong id="account-balance-main" class="account-balance-main">--</strong>
+                    <span class="account-demo-balance">Test-only balance <strong id="account-demo-balance">--</strong></span>
+                    <!--
+                        How fresh this figure is, as opposed to whether the connection is up.
+
+                        The header's `#live-indicator` answers the second question -- "Live",
+                        "Waiting for payment...", "Connection lost". This answers the first: is
+                        the number above the one your account actually holds? Those are different
+                        facts and collapsing them into one indicator means either the freshness
+                        is never stated or the connection state is stated twice.
+
+                        `aria-live="polite"` and no per-second writes: the text changes when the
+                        balance changes and once a minute after that, so a screen reader is told
+                        that the money moved without being interrupted about it.
+                    -->
+                    <p class="account-freshness" id="account-freshness" aria-live="polite">
+                        <span class="account-freshness-dot" aria-hidden="true"></span>
+                        <span id="account-freshness-text">Checking your balance</span>
+                    </p>
+                    <!-- The live-sync status is not in this card. `clock.js` puts it in the
+                         topbar, in the same place on every page, rather than in whichever page
+                         happened to have a balance card -- which had it in three places at three
+                         different heights, and not at all on the homepage. `#live-indicator` is
+                         what `paintLiveIndicator()` looks for, and it finds the one in the
+                         header. -->
+</div>
+                <!--
+                    Deposit and Withdraw, in the card, on every width.
+
+                    They were taken out of this card on the grounds that a row of two big buttons
+                    made it read as a checkout, and the copy was moved into the header's account
+                    menu and the fixed action bar at the foot of the page. That was the wrong
+                    trade in both directions: the page whose job is moving money was left with no
+                    money control on it at all above the fold, and a phone then showed the same
+                    pair twice -- once here and once in the bar -- which is the duplication worth
+                    removing rather than this.
+
+                    So the card owns the pair, on this page and on the offers page, and the bar
+                    does not carry a copy. The header's account menu keeps "Add funds" and
+                    "Withdraw" because it is the only money path on the pages that have no
+                    balance card at all -- the home page -- and a dropdown is not a second pair
+                    on screen.
+                -->
+                <div class="account-balance-actions">
+                    <button class="button button-accent button-lg" id="account-deposit-btn" type="button" disabled>Deposit</button>
+                    <button class="button button-light button-lg" id="account-withdraw-btn" type="button" disabled>Withdraw</button>
+                </div>
+            </div>
+
+            <!--
+                Profile. Directly under the balance and above the transactions.
+
+                It used to be the first card inside Settings, at the very bottom of the page.
+                That is a defensible filing system and a bad interface: setting a display name
+                is a thing you do once, but every visit afterwards means scrolling past the
+                entire transaction list to reach the control, and scrolling back down to find
+                the save button and the status message that tells you whether it worked. The
+                status line is the part that suffers most, because it appears exactly where
+                the user is no longer looking.
+
+                Putting it here fixes both. It is the first thing below the balance, so it is
+                visible on a phone without scrolling at all, and the save button and its
+                status message are on screen at the same time as the field they belong to.
+            -->
+            <div class="account-profile" id="profile-settings">
+                <div class="account-profile-identity">
+                    <img class="profile-avatar-preview account-profile-avatar" id="profile-avatar-preview" src="/brand.gif" alt="" width="72" height="72">
+                    <div class="account-profile-text">
+                        <p class="eyebrow">Profile</p>
+                        <h2 class="section-title" id="profile-heading">Your account</h2>
+                        <p class="body-text is-muted">The name and picture below appear in your account menu. Only you see them, and neither affects your sign-in or your balance.</p>
+                    </div>
+                </div>
+
+                <div class="profile-editor">
+                    <div class="profile-avatar-actions">
+                        <label class="button button-ghost" for="profile-avatar-input">Choose picture</label>
+                        <input type="file" id="profile-avatar-input" accept="image/*" hidden>
+                        <button type="button" class="link-button" id="profile-avatar-remove" hidden>Remove picture</button>
+                        <p class="field-hint" id="profile-avatar-hint">PNG, JPEG, GIF, WebP, AVIF, or BMP, up to 10&nbsp;MB. It is cropped square and shrunk before it is sent, and only you can see it.</p>
+                    </div>
+                    <label class="form-label" for="profile-display-name">Display name</label>
+                    <input class="form-control" id="profile-display-name" type="text" maxlength="60" placeholder="Your name" autocomplete="nickname" aria-describedby="profile-display-name-hint">
+                    <p class="field-hint" id="profile-display-name-hint">Up to 60 characters. Shown in your account menu and at the top of this page.</p>
+                    <div class="profile-actions">
+                        <button class="button button-accent" id="profile-save" type="button" disabled>Save profile</button>
+                    </div>
+                    <p class="account-setting-status" id="profile-status" role="status" aria-live="polite"></p>
+                </div>
+            </div>
+
+            <div class="account-history" id="history">
+                <div class="home-section-heading">
+                    <div>
+                        <p class="eyebrow">Transactions</p>
+                        <h2 class="section-title">History</h2>
+                    </div>
+                </div>
+
+                <p id="history-intro" class="body-text">
+                    Every deposit, withdrawal, and reward credited to your balance, in order.
+                </p>
+
+                <div class="history-filters" role="tablist" aria-label="Filter by type">
+                    <button type="button" class="history-filter-button is-active" data-filter="all" aria-selected="true">All</button>
+                    <button type="button" class="history-filter-button" data-filter="deposit" aria-selected="false">Deposits</button>
+                    <button type="button" class="history-filter-button" data-filter="withdrawal" aria-selected="false">Withdrawals</button>
+                    <button type="button" class="history-filter-button" data-filter="conversion" aria-selected="false">Rewards</button>
+                    <button type="button" class="history-filter-button" data-filter="refund" aria-selected="false">Refunds</button>
+                </div>
+
+                <div id="history-container">
+                    <p id="history-loading" class="body-text">Loading your history&hellip;</p>
+                    <p id="history-error" class="body-text is-error" hidden>Could not load your history.</p>
+                    <div id="history-list" hidden></div>
+                    <!-- Two different states share this block, and the copy is swapped between
+                         them by `history.js`. "Your account has no transactions" and "your
+                         deposits tab is empty" are not the same message: the first is answered
+                         by depositing or completing an offer, the second by changing the
+                         filter. Showing the same text for both sends a user with a full history
+                         to a page that cannot help them, which reads as a bug rather than as an
+                         empty tab. -->
+                    <div id="history-list-empty" class="history-list-empty" hidden>
+                        <div class="history-empty-mark" aria-hidden="true"></div>
+                        <p class="history-empty-title" id="history-empty-title">No transactions yet</p>
+                        <p class="history-empty-copy" id="history-empty-copy">Deposits, withdrawals, and rewards all land here. Complete an offer to start earning, or add funds to see a deposit receipt.</p>
+                        <div class="history-empty-actions">
+                            <a class="button button-accent" id="history-empty-primary" href="/offers">Browse offers</a>
+                            <a class="button button-light" id="history-empty-secondary" href="/account" hidden>Add funds</a>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="account-settings">
+                <div class="home-section-heading">
+                    <div>
+                        <p class="eyebrow">Account</p>
+                        <h2 class="section-title">Security, email, and your data</h2>
+                    </div>
+                </div>
+                <div class="account-settings-grid">
+                    <div class="account-setting-card">
+                        <h3 class="account-setting-title">Password</h3>
+                        <p class="body-text is-muted">We cannot show your password, so changing it means proving your address. We email a link that signs you out everywhere and lets you set a new one.</p>
+                        <button type="button" class="button button-ghost" id="account-password-btn">Change password</button>
+                    </div>
+                    <!--
+                        Passkeys. The private key is created by the device and never leaves it,
+                        so this is worth more than a saved password: there is nothing here to
+                        steal, and the sign-in cannot be phished because the credential is
+                        bound to this origin. It sits next to the password rather than under it
+                        because they are alternatives, not a sequence.
+
+                        The whole card is hidden by `passkeys.js` on a browser with no WebAuthn
+                        support, rather than rendered with a disabled button -- a permanently
+                        greyed-out control is an invitation to click something that was never
+                        going to work.
+                    -->
+                    <div class="account-setting-card" id="passkey-card" hidden>
+                        <h3 class="account-setting-title">Passkeys</h3>
+                        <p class="body-text is-muted">Sign in with Face ID, Touch ID, or your device screen lock instead of a password. The key stays on the device, so there is nothing for anyone to steal or for a fake site to ask you for.</p>
+
+                        <!-- Why this is here at all.
+                             The card used to be revealed only after a successful list request and
+                             a `PublicKeyCredential` check, so on an iPhone that could not use a
+                             passkey it simply never appeared. A control that vanishes is
+                             indistinguishable from a feature that does not exist, and on iOS
+                             that is the common case: Face ID has to be enrolled, and Safari has
+                             to be 16.4 or newer. This notice states the situation instead of
+                             hiding it, and `account-passkeys.js` fills in the specific reason
+                             and the fix. `hidden` because a device that genuinely has no
+                             WebAuthn should not see it at all. -->
+                        <div class="passkey-notice" id="passkey-notice" hidden>
+                            <p class="passkey-notice-title" id="passkey-notice-title"></p>
+                            <p class="passkey-notice-body" id="passkey-notice-body"></p>
+                        </div>
+
+                        <button type="button" class="button button-ghost" id="passkey-add">Add this device</button>
+                        <p class="account-setting-status" id="passkey-status" role="status" aria-live="polite"></p>
+                        <ul class="passkey-list" id="passkey-list"></ul>
+
+                        <!-- Setup instructions.
+                             These are static rather than generated because they are the same on
+                             every device, and because the moment someone needs them is the
+                             moment they are looking at a button that did nothing. -->
+                        <details class="passkey-help" id="passkey-help">
+                            <summary class="passkey-help-summary">How to set up Face ID or Touch ID</summary>
+                            <div class="passkey-help-body">
+                                <p class="passkey-help-intro">Passkeys need your device's biometric lock switched on first. If you have never set it up, here is what it takes.</p>
+                                <ol class="passkey-help-steps">
+                                    <li>On your iPhone, open <strong>Settings</strong> and choose <strong>Face ID &amp; Passcode</strong>.</li>
+                                    <li>Tap <strong>Set Up Face ID</strong> and follow the prompts. You will need the passcode you use to unlock the phone.</li>
+                                    <li>If Face ID is already on, skip this. You can check by unlocking the phone and looking for the Face ID symbol.</li>
+                                    <li>Open this site in <strong>Safari</strong> and go to your account settings.</li>
+                                    <li>Press <strong>Add this device</strong>. Your phone shows the Face ID sheet; look at the screen and it is done.</li>
+                                </ol>
+                                <p class="passkey-help-note">On an Android phone the same button uses your fingerprint or face unlock, and the wording says "screen lock" instead.</p>
+                                <p class="passkey-help-note">If the button does nothing at all, check that you are in Safari and not inside another app's browser. Instagram, Facebook and some email apps open pages in a stripped-down viewer where Face ID is not available, and passkeys cannot be created there.</p>
+                            </div>
+                        </details>
+                    </div>
+                    <!-- Sessions. "Sign out" in the account menu only closes this browser tab,
+                         because the token lives in sessionStorage. On a shared or borrowed
+                         device the previous user reopens the page and is still signed in. This
+                         ends every session on the account, which is the control that actually
+                         matches what someone worries about when they ask for it. -->
+                    <div class="account-setting-card">
+                        <h3 class="account-setting-title">Where you're signed in</h3>
+                        <p class="body-text is-muted">Signing out from the account menu closes this tab only. Ending every session signs you out on all devices, including this one, and you sign in again next time.</p>
+                        <button type="button" class="button button-ghost" id="account-revoke-sessions-btn">Sign out everywhere</button>
+                        <p class="account-setting-status" id="account-revoke-sessions-status" role="status" aria-live="polite"></p>
+                    </div>
+                    <div class="account-setting-card">
+                        <h3 class="account-setting-title">Email</h3>
+                        <p class="body-text is-muted">Money emails go to the address you signed up with. The security ones always will, whatever you set below.</p>
+                        <label class="switch-row" for="money-emails-toggle">
+                            <span class="switch-row-text">
+                                <span class="switch-row-label">Deposit and withdrawal emails</span>
+                                <span class="switch-row-hint" id="money-emails-hint">Receipts and progress updates. Switch off and everything still shows on this page and in your history — you just stop getting it in your inbox.</span>
+                            </span>
+                            <span class="switch">
+                                <input type="checkbox" id="money-emails-toggle" class="switch-input" role="switch" aria-describedby="money-emails-hint" disabled>
+                                <span class="switch-track" aria-hidden="true"></span>
+                            </span>
+                        </label>
+                        <p class="account-setting-note" id="money-emails-always-on">
+                            <strong>Always sent:</strong> email confirmation, password reset, and the six-digit code that authorises a withdrawal. These are what let you into the account and move money in it, so there is no switch for them — turning one off locks you out rather than quieting anything.
+                        </p>
+                        <p class="account-setting-status" id="money-emails-status" role="status" aria-live="polite"></p>
+                    </div>
+                    <!-- Your data. Both of these are real and work offline of support: the export
+                         is built in the browser from the same history the page is already
+                         showing, so it is the same numbers with no second source to disagree
+                         with them. The reference is what support asks for first when something
+                         looks wrong. -->
+                    <div class="account-setting-card">
+                        <h3 class="account-setting-title">Your data</h3>
+                        <p class="body-text is-muted">Download every transaction on this account as a spreadsheet, or copy the reference support will ask for.</p>
+                        <div class="profile-actions">
+                            <button type="button" class="button button-ghost" id="account-export-btn">Download CSV</button>
+                            <button type="button" class="button button-ghost" id="account-copy-ref-btn">Copy account reference</button>
+                        </div>
+                        <p class="account-setting-status" id="account-data-status" role="status" aria-live="polite"></p>
+                    </div>
+                    <div class="account-setting-card">
+                        <h3 class="account-setting-title">Need help?</h3>
+                        <p class="body-text is-muted">Have a question about an offer, a deposit, or a payment? Reach out to our support team.</p>
+                        <button type="button" class="button button-ghost" id="account-contact-btn" data-contact-trigger>Contact support</button>
+                    </div>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <!--
+        The footer, identical on every page.
+
+        One column, top to bottom, at every width. The previous layout put Product / Help /
+        Legal side by side as parallel columns on desktop, which reads fine on paper and badly
+        on a screen: someone looking for the Privacy Policy has to guess which of three columns
+        holds it and then check the other two headings to be sure. Stacked, the page has one
+        reading order that is the same on every device, and "the legal links are further down"
+        is an answer a visitor can act on without a strategy.
+
+        Every href resolves. That is checked, not assumed: a legal link that goes nowhere is
+        worse than a missing one, because it implies the document exists and cannot be read.
+    -->
+    <footer class="site-footer">
+        <div class="site-footer-brand">
+            <span class="site-footer-meta">
+                <span class="footer-mark" aria-hidden="true"></span>
+                RewardZone&trade;
+            </span>
+            <p class="site-footer-tagline">Free to join. Payouts from $1.00. No fees.</p>
+            <p class="site-footer-copy">&copy; <span data-current-year>2026</span> RewardZone. All rights reserved.</p>
+        </div>
+
+        <nav class="site-footer-group" aria-label="Product">
+            <h2 class="site-footer-heading">Product</h2>
+            <a href="/">Home</a>
+            <a href="/offers">Offers</a>
+            <a href="/account">Your account</a>
+            <a href="/#home-faq">Frequently asked questions</a>
+        </nav>
+
+        <nav class="site-footer-group" aria-label="Help">
+            <h2 class="site-footer-heading">Help</h2>
+            <a href="/account">Sign in or create an account</a>
+            <a href="/reset-password">Reset your password</a>
+            <a href="#" data-helpdesk-trigger>Help desk</a>
+            <a href="#" data-contact-trigger>Contact support</a>
+        </nav>
+
+        <nav class="site-footer-group" aria-label="Legal">
+            <h2 class="site-footer-heading">Legal</h2>
+            <a href="/terms">Terms of service</a>
+            <a href="/privacy">Privacy policy</a>
+            <a href="/cookies">Cookie policy</a>
+            <a href="/aml">AML and KYC policy</a>
+        </nav>
+    </footer>
+
+    <!--
+        Notifications for narrow screens. The header keeps the brand and the nav on one row, and
+        the bell moves here so it sits in thumb reach instead of at the top of a three-row
+        header. Hidden on wide screens, where the header carries the same control.
+
+        No money pair here, deliberately. This page has Deposit and Withdraw in its balance card,
+        at the top of the page and on screen without scrolling, and a second copy in a fixed bar
+        meant two Deposit buttons on one phone screen. The card is the copy.
+
+        No Account item either, which is the same argument applied to identity. The profile
+        button and its menu are in the header on every width -- the menu carries the account,
+        transactions, Add funds, Withdraw and Sign out -- so a bar item that did the same thing
+        was a fourth copy of "where am I and how do I act" in the one place a thumb rests. It
+        also had a genuinely confusing failure: `data-mirror="account-button"` resolves to a
+        button that is `display: none` while signed in, and a hidden button still fires its
+        handler on `.click()`, so the item could sign the user out with nothing on screen saying
+        that is what it does. `syncAccountControls()` also rewrote its label between "Account"
+        and "Sign in" depending on session state, so the same control changed meaning between
+        page loads. Removing it removes the failure with it.
+    -->
+    <nav class="action-bar" aria-label="Notifications">
+        <button type="button" class="action-bar-item notification-bell"
+                id="notification-bell-mobile" aria-label="Notifications" aria-haspopup="dialog" aria-expanded="false" hidden>
+            <span class="notification-icon" aria-hidden="true"></span>
+            <span class="notification-count-mobile" id="notification-count-mobile" hidden>0</span>
+            <span class="action-bar-label">Notifications</span>
+        </button>
+    </nav>
+
+    <dialog class="dialog" id="account-dialog" aria-labelledby="account-title">
+        <form class="dialog-panel" id="account-form">
+            <div class="dialog-heading">
+                <div>
+                    <p class="eyebrow">Account</p>
+                    <h2 id="account-title">Welcome back</h2>
+                </div>
+                <button class="icon-button" type="button" data-close="account-dialog" aria-label="Close">&times;</button>
+            </div>
+
+            <div class="auth-mode" role="tablist" aria-label="Account access">
+                <button class="auth-mode-button is-active" type="button" role="tab" aria-selected="true" data-auth-mode="login">Sign in</button>
+                <button class="auth-mode-button" type="button" role="tab" aria-selected="false" data-auth-mode="register">Create account</button>
+            </div>
+
+            <label class="form-label" for="account-email">Email</label>
+            <input class="form-control" id="account-email" type="email" maxlength="254" autocomplete="email" required>
+
+            <label class="form-label" for="account-password" id="account-password-label">Password</label>
+            <input class="form-control" id="account-password" type="password" minlength="12" maxlength="128" autocomplete="current-password" required>
+            <p id="password-hint" class="field-hint" hidden>Use at least 12 characters.</p>
+
+            <p id="account-message" class="form-message" role="status"></p>
+            <button class="button button-accent button-wide" id="connect-submit" type="submit">Sign in</button>
+            <button class="link-button" id="forgot-password-link" type="button">Forgot password?</button>
+
+            <div id="verify-step" class="verify-step" hidden>
+                <p class="verify-title">Confirm your email</p>
+                <p class="verify-copy">
+                    We sent a 6-digit code to <strong id="verify-email">your address</strong>.
+                    <span id="verify-expiry"></span>
+                </p>
+                <label class="visually-hidden" for="verify-code">6-digit confirmation code</label>
+                <input class="form-control verify-code" id="verify-code" type="text"
+                       inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}"
+                       maxlength="6" placeholder="000000" spellcheck="false">
+                <p id="verify-message" class="form-message" role="status"></p>
+                <button class="button button-accent button-wide" id="verify-submit" type="button">Confirm email</button>
+                <div class="verify-actions">
+                    <button class="link-button" id="verify-resend" type="button">Send a new code</button>
+                    <button class="link-button" id="verify-magic-link" type="button">Send me a magic link instead</button>
+                    <button class="link-button" id="verify-back" type="button">Use a different email</button>
+                </div>
+            </div>
+        </form>
+    </dialog>
+
+    <!-- Deposit credited -->
+    <dialog class="dialog dialog-receipt" id="deposit-success-dialog" aria-labelledby="deposit-success-title">
+        <div class="dialog-panel">
+            <div class="deposit-success">
+                <span class="confirmation-mark" aria-hidden="true"></span>
+                <p class="eyebrow"><span class="eyebrow-dot" aria-hidden="true"></span> Payment received</p>
+                <h2 class="display" id="deposit-success-title">Deposit credited</h2>
+                <p class="credited-amount" id="deposit-success-amount">$0.00</p>
+                <p class="receipt-lead" id="deposit-success-lead">Your balance has been updated.</p>
+
+                <dl class="receipt-facts" id="deposit-success-facts"></dl>
+
+                <p class="credited-balance">New balance <strong id="deposit-success-balance">--</strong></p>
+
+                <div class="receipt-actions">
+                    <a class="button button-accent button-wide" id="deposit-success-receipt" href="#">View receipt</a>
+                    <button class="button button-light button-wide" id="deposit-success-close" type="button">Done</button>
+                </div>
+            </div>
+        </div>
+    </dialog>
+
+    <!-- Deposit -->
+    <dialog class="dialog dialog-deposit" id="deposit-dialog" aria-labelledby="deposit-title">
+        <div class="dialog-panel">
+            <div class="dialog-heading">
+                <div>
+                    <p class="eyebrow">Deposit</p>
+                    <h2 id="deposit-title">Add funds</h2>
+                </div>
+                <button class="icon-button" type="button" data-close="deposit-dialog" aria-label="Close">&times;</button>
+            </div>
+
+            <div class="provider-notice" id="provider-notice">
+                <span class="provider-indicator" aria-hidden="true"></span>
+                <div>
+                    <strong id="deposit-provider-title">Checking payment providers</strong>
+                    <p id="deposit-provider-copy">Contacting the configured payment services...</p>
+                </div>
+            </div>
+
+            <p class="callout is-warning" id="callback-warning" hidden></p>
+
+            <form id="deposit-form" class="deposit-form" novalidate>
+                <div class="amount-block">
+                    <div class="amount-block-head">
+                        <label class="form-label" for="deposit-amount">Amount to add</label>
+                    </div>
+                    <!-- One group, one box: the currency symbol, the number, the currency, and
+                         the action that fills the box. Max used to be a 48px button in the row
+                         above, which read as a second control and left the number looking like
+                         it had a header of its own; and the label row it sat in was 48px tall for
+                         a single word. Inside the field it is where a "max" belongs -- the
+                         right-hand end of the thing it acts on -- and the row above collapses to
+                         the label it actually holds. -->
+                    <div class="amount-field deposit-amount-field">
+                        <span aria-hidden="true">$</span>
+                        <input class="form-control" id="deposit-amount" type="number" min="0.01" max="5000" step="0.01" value="10.00" inputmode="decimal" required>
+                        <span class="amount-suffix" aria-hidden="true">USD</span>
+                        <button class="max-button" id="deposit-max" type="button">Max</button>
+                    </div>
+                    <div class="amount-presets" role="group" aria-label="Quick amount choices">
+                        <button type="button" data-deposit-amount="5">$5</button>
+                        <button type="button" data-deposit-amount="10">$10</button>
+                        <button type="button" data-deposit-amount="25">$25</button>
+                        <button type="button" data-deposit-amount="50">$50</button>
+                    </div>
+                    <p class="field-hint" id="deposit-amount-hint">No minimum set by us. Maximum $5,000.00.</p>
+                    <p id="deposit-floor-warning" class="callout is-warning is-compact" hidden></p>
+                </div>
+
+                <!-- The method block was missing here, and only here. `depositState.method`
+                     defaults to `crypto` and nothing on this page could change it, so the
+                     account deposit silently offered one method while the provider notice
+                     above reported both as available. The coin list was populated into a
+                     `#deposit-currency` that did not exist, so `getElementById` returned null
+                     and the select stayed empty -- there was no way to choose a coin at all.
+                     Kept identical to the catalog page's block, because the script that drives
+                     it is shared and a divergence here is exactly what produced the bug. -->
+                <span class="form-label" id="deposit-method-label">Payment type</span>
+                <div class="deposit-method-options" role="group" aria-labelledby="deposit-method-label">
+                    <button class="deposit-method-option" type="button" data-deposit-method="stripe" aria-pressed="false">
+                        <strong>Card</strong><span data-method-detail>Visa, Mastercard, Apple Pay</span>
+                    </button>
+                    <button class="deposit-method-option is-active" type="button" data-deposit-method="crypto" aria-pressed="true">
+                        <strong>Crypto</strong><span data-method-detail>Wallet address</span>
+                    </button>
+                </div>
+
+                <div id="crypto-deposit-fields" class="field-group" hidden>
+                    <label class="form-label" for="deposit-currency">Pay with</label>
+                    <select class="form-control" id="deposit-currency"></select>
+                    <!-- Resolved for the chosen coin. The option labels carry "from $X" so the
+                         choice is informed before it is made, but the number the user needs to
+                         work against is otherwise only visible inside the closed menu. -->
+                    <p class="coin-summary" id="deposit-coin-summary" hidden></p>
+                    <p class="form-note">You will be shown a deposit address and an exact amount. Send only that asset on that network.</p>
+                </div>
+
+                <p id="deposit-message" class="form-message" role="status"></p>
+                <button id="deposit-submit" class="button button-accent button-wide" type="submit">Continue to secure checkout</button>
+                <p class="fine-print" id="deposit-provider-fine-print" hidden></p>
+            </form>
+
+            <div id="deposit-instructions" class="deposit-receipt" hidden></div>
+
+            <h3 class="history-title">Recent deposits</h3>
+            <div id="deposit-history" class="receipt-list" aria-live="polite">Loading deposit history...</div>
+        </div>
+    </dialog>
+
+    <!-- Withdraw -->
+    <dialog class="dialog dialog-withdraw" id="withdraw-dialog" aria-labelledby="withdraw-title">
+        <div class="dialog-panel">
+        <form id="withdraw-form" novalidate>
+            <div class="dialog-heading">
+                <div>
+                    <p class="eyebrow">Payout</p>
+                    <h2 id="withdraw-title">Request a withdrawal</h2>
+                </div>
+                <button class="icon-button" type="button" data-close="withdraw-dialog" aria-label="Close">&times;</button>
+            </div>
+
+            <div class="balance-card">
+                <div>
+                    <span class="balance-card-label">Available to withdraw</span>
+                    <strong id="withdraw-available">--</strong>
+                </div>
+                <button class="max-button" id="withdraw-max" type="button">Withdraw all</button>
+            </div>
+
+            <div class="callout is-warning" id="withdraw-process-notice">
+                <span>Your balance is held as soon as you submit. Crypto payouts are sent automatically when automatic payouts are on; PayPal and Venmo are always paid by an operator.</span>
+            </div>
+
+            <div class="amount-block">
+                <label class="form-label" for="withdraw-amount">Amount</label>
+                <div class="amount-field">
+                    <span aria-hidden="true">$</span>
+                    <input class="form-control" id="withdraw-amount" type="number" min="1" max="10000" step="0.01" placeholder="0.00" inputmode="decimal" required>
+                    <span class="amount-suffix" aria-hidden="true">USD</span>
+                </div>
+                <p class="field-hint" id="withdraw-amount-hint">Minimum $1.00. Maximum $10,000.00.</p>
+                <p class="callout is-warning is-compact" id="withdraw-minimum-unconfirmed" hidden></p>
+
+                <div class="withdraw-confirm" id="withdraw-confirm" hidden>
+                    <h3 class="withdraw-confirm-title">Confirm this withdrawal</h3>
+                    <p class="withdraw-confirm-lead" id="withdraw-confirm-lead">
+                        We email a 6-digit code to confirm it is really you moving the money.
+                    </p>
+                    <dl class="withdraw-confirm-facts" id="withdraw-confirm-facts"></dl>
+                    <div class="withdraw-confirm-code">
+                        <label class="form-label" for="withdraw-code">6-digit code</label>
+                        <input
+                            class="form-control code-input"
+                            id="withdraw-code"
+                            type="text"
+                            inputmode="numeric"
+                            autocomplete="one-time-code"
+                            pattern="[0-9]{6}"
+                            maxlength="6"
+                            placeholder="000000"
+                        />
+                    </div>
+                    <div class="withdraw-confirm-actions">
+                        <button class="button button-light" type="button" id="withdraw-code-send">Email me a code</button>
+                        <button class="button" type="button" id="withdraw-code-resend" hidden>Send another</button>
+                    </div>
+                    <p class="field-hint" id="withdraw-code-hint" hidden></p>
+                </div>
+            </div>
+
+            <fieldset class="fieldset-reset">
+                <legend class="form-label legend-label">Payment method</legend>
+                <div class="choice-grid" id="withdraw-method-options" role="group"></div>
+            </fieldset>
+
+            <div id="crypto-withdraw-fields" class="field-group" hidden>
+                <p class="form-label legend-label" id="withdraw-asset-label">Crypto asset</p>
+                <div class="choice-grid" id="withdraw-asset-options" role="group" aria-labelledby="withdraw-asset-label"></div>
+
+                <label class="form-label" for="withdraw-network">Network</label>
+                <select class="form-control" id="withdraw-network" required></select>
+                <p class="field-hint" id="withdraw-network-hint"></p>
+            </div>
+
+            <div class="field-group">
+                <label class="form-label" for="withdraw-address" id="withdraw-address-label">Payment destination</label>
+                <input class="form-control" id="withdraw-address" type="text" maxlength="254" autocomplete="off" spellcheck="false" placeholder="Email or wallet address" required>
+                <p class="field-hint" id="withdraw-address-hint"></p>
+                <div id="withdraw-tag-field" hidden>
+                    <label class="form-label" for="withdraw-tag">Destination tag</label>
+                    <input class="form-control" id="withdraw-tag" type="text" inputmode="numeric" maxlength="32" autocomplete="off" spellcheck="false" placeholder="Required on this network">
+                    <p class="field-hint">Some chains, including XRP Ledger, route by a tag as well as by address.</p>
+                </div>
+            </div>
+
+            <dl class="withdraw-summary" id="withdraw-summary" hidden></dl>
+
+            <p id="withdraw-message" class="form-message" role="status"></p>
+            <button class="button button-coral button-wide button-lg" id="withdraw-submit" type="submit">Submit request</button>
+
+            <h3 class="history-title">Recent requests</h3>
+            <div id="withdrawal-history" class="receipt-list" aria-live="polite">Loading withdrawal history...</div>
+        </form>
+
+        <div id="withdraw-confirmation" class="confirmation" hidden></div>
+        </div>
+    </dialog>
+
+    <!-- Contact support -->
+    <dialog class="dialog dialog-contact" id="contact-dialog" aria-labelledby="contact-title">
+        <div class="dialog-panel">
+            <div class="dialog-heading">
+                <div>
+                    <p class="eyebrow">Support</p>
+                    <h2 id="contact-title">Contact us</h2>
+                </div>
+                <button class="icon-button" type="button" data-close="contact-dialog" aria-label="Close">&times;</button>
+            </div>
+                        <form id="contact-form" novalidate>
+                <!--
+                    The fields scroll; the status line and the button do not.
+
+                    This form is taller than a phone screen -- five fields, a hint under two of
+                    them, and a message box -- and the dialog caps its height to the viewport.
+                    Without this split the whole thing scrolls, which put the "Send message"
+                    button 45-50px below the visible area at every size measured: 360x640,
+                    360x800, and 1280x800 alike. A submit button you have to go looking for is
+                    a submit button people do not press, and on a contact form that means a
+                    support request that is never filed.
+
+                    So the body scrolls and the action row is a sibling below it. The button is
+                    now on screen the moment the dialog opens, at any height, and the status
+                    line that reports the result sits directly above it where it is read.
+                -->
+                <div class="contact-form-body">
+                    <p class="form-note" id="contact-note">We reply by email, usually within one business day. Use the address you can actually read.</p>
+                    <div class="form-field">
+                        <label class="form-label" for="contact-name">Your name</label>
+                        <input class="form-input" type="text" id="contact-name" name="name" required maxlength="200" autocomplete="name">
+                    </div>
+                    <div class="form-field">
+                        <label class="form-label" for="contact-email">Reply-to email</label>
+                        <input class="form-input" type="email" id="contact-email" name="email" required maxlength="254" autocomplete="email" aria-describedby="contact-email-hint">
+                        <p class="field-hint" id="contact-email-hint">Where our answer goes. It is not shared with anyone else.</p>
+                    </div>
+                    <div class="form-field">
+                        <label class="form-label" for="contact-subject">Subject</label>
+                        <input class="form-input" type="text" id="contact-subject" name="subject" required maxlength="200">
+                    </div>
+                    <div class="form-field">
+                        <div class="field-heading">
+                            <label class="form-label" for="contact-message">Message</label>
+                            <span class="field-count" id="contact-count" aria-live="polite"></span>
+                        </div>
+                        <textarea class="form-input" id="contact-message" name="message" rows="6" required maxlength="2000" aria-describedby="contact-count"></textarea>
+                    </div>
+                </div>
+                <div class="contact-form-actions">
+                    <p id="contact-form-message" class="form-message" role="status" aria-live="polite"></p>
+                    <button class="button button-accent button-wide button-lg" id="contact-submit" type="submit">Send message</button>
+                </div>
+            </form>
+        </div>
+    </dialog>
+
+    <script src="/contact.js" defer></script>
+</body>
+</html>

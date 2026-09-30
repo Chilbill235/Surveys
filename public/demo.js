@@ -26,9 +26,42 @@
  */
 
 const demoTokenKey = 'offerNetworkSessionToken';
+
+/**
+ * The session token, or `null` if there is not a usable one.
+ *
+ * This duplicates `getSessionToken` in `app.js` on purpose rather than calling it across the
+ * two files, because the two scripts are independent -- `demo.js` is a standalone completion
+ * page and must keep working if the application bundle is not on the page at all. The cost is
+ * one small function; the benefit is that this page has no load-order dependency on the other
+ * one.
+ *
+ * The duplication is the point being made, though: this file previously read the token
+ * straight out of storage and interpolated it into an `Authorization` header, so a session slot
+ * holding anything that is not a token produced `Bearer undefined` and a `jwt malformed`
+ * rejection on the server. `demoTokenKey` is the same storage key the app uses, so it was
+ * exposed to exactly the same failure. The shape test below is what stops it.
+ */
+function demoSessionToken() {
+    let raw = null;
+    try {
+        raw = sessionStorage.getItem(demoTokenKey);
+    } catch {
+        return null;
+    }
+    if (typeof raw !== 'string' || raw.length < 20) return null;
+    const parts = raw.split('.');
+    if (parts.length !== 3) return null;
+    return parts.every((part) => /^[A-Za-z0-9_-]+$/.test(part)) ? raw : null;
+}
+
+/** The `Authorization` header, or nothing when there is no session. Never `Bearer null`. */
+function demoAuthHeaders() {
+    const token = demoSessionToken();
+    return token ? { Authorization: `Bearer ${token}` } : {};
+}
 const params = new URLSearchParams(window.location.search);
 const demoClickId = params.get('click_id') || '';
-const demoType = params.get('type') === 'survey' ? 'survey' : 'offer';
 
 /**
  * Where the participant is returned to after completion.
@@ -51,9 +84,9 @@ let questions = [];
     let returnTimer = null;
 
 document.addEventListener('DOMContentLoaded', () => {
-    document.getElementById('demo-form').addEventListener('submit', onSubmit);
-    document.getElementById('demo-form').addEventListener('change', onAnswerChanged);
-    document.getElementById('survey-back').addEventListener('click', onStepBack);
+    document.getElementById('demo-form')?.addEventListener('submit', onSubmit);
+    document.getElementById('demo-form')?.addEventListener('change', onAnswerChanged);
+    document.getElementById('survey-back')?.addEventListener('click', onStepBack);
     start();
 });
 
@@ -61,7 +94,7 @@ async function start() {
     if (!/^[\da-f]{8}-(?:[\da-f]{4}-){3}[\da-f]{12}$/i.test(demoClickId)) {
         return failTask('This demo link is missing a valid click ID. Start the task from the offers page.');
     }
-    if (!sessionStorage.getItem(demoTokenKey)) {
+    if (!demoSessionToken()) {
         return failTask('Sign in from the offers page to complete this task.');
     }
 
@@ -88,9 +121,12 @@ async function loadTask() {
     let data;
     try {
         const response = await fetch(`/api/demo/survey?clickId=${encodeURIComponent(demoClickId)}`, {
-            headers: { Authorization: `Bearer ${sessionStorage.getItem(demoTokenKey)}` }
+            headers: demoAuthHeaders()
         });
-        const body = await response.json();
+        // The survey endpoint answers with JSON on both success and failure, but the
+        // catch-all error page is HTML. Parse defensively so a 5xx never surfaces as
+        // an "Unexpected token <" parse error ahead of the real message.
+        const body = await response.json().catch(() => ({}));
         if (!response.ok) throw new Error(body.error || 'Could not load the task.');
         data = body;
     } catch (error) {
@@ -110,11 +146,15 @@ async function loadTask() {
         // nothing, and the survey appeared to have no questions at all.
         questions = questions.map((question, index) => ({ ...question, index }));
 
-        document.getElementById('demo-title').textContent = 'Quick survey';
-        document.getElementById('demo-copy').textContent =
+        const titleEl = document.getElementById('demo-title');
+        if (titleEl) titleEl.textContent = 'Quick survey';
+        const copyEl = document.getElementById('demo-copy');
+        if (copyEl) copyEl.textContent =
             `${questions.length} ${questions.length === 1 ? 'question' : 'questions'}. It takes about a minute.`;
-        document.getElementById('demo-submit').textContent = 'Submit answers';
-        document.getElementById('demo-progress').hidden = false;
+        const submitEl = document.getElementById('demo-submit');
+        if (submitEl) submitEl.textContent = 'Submit answers';
+        const progressEl = document.getElementById('demo-progress');
+        if (progressEl) progressEl.hidden = false;
         setMessage('');
 
         for (const question of questions) fields.append(createQuestionGroup(question));
@@ -127,11 +167,15 @@ async function loadTask() {
         return failTask('This task has no steps configured yet.');
     }
 
-    document.getElementById('demo-title').textContent = 'Partner task';
-    document.getElementById('demo-copy').textContent =
+    const titleEl2 = document.getElementById('demo-title');
+    if (titleEl2) titleEl2.textContent = 'Partner task';
+    const copyEl2 = document.getElementById('demo-copy');
+    if (copyEl2) copyEl2.textContent =
         `${steps.length} ${steps.length === 1 ? 'step' : 'steps'}. Tick each one as you do it.`;
-    document.getElementById('demo-submit').textContent = 'Complete task';
-    document.getElementById('demo-progress').hidden = false;
+    const submitEl2 = document.getElementById('demo-submit');
+    if (submitEl2) submitEl2.textContent = 'Complete task';
+    const progressEl2 = document.getElementById('demo-progress');
+    if (progressEl2) progressEl2.hidden = false;
     setMessage('');
 
     for (const step of steps) fields.append(createTaskStep(step));
@@ -191,10 +235,12 @@ function createQuestionGroup(question) {
 
 function renderConfirmationTask() {
     const fields = document.getElementById('demo-fields');
-    document.getElementById('demo-title').textContent = 'Demo partner task';
-    document.getElementById('demo-copy').textContent =
+    const titleEl = document.getElementById('demo-title');
+    if (titleEl) titleEl.textContent = 'Demo partner task';
+    const copyEl = document.getElementById('demo-copy');
+    if (copyEl) copyEl.textContent =
         'This local task tests click tracking and completion without leaving RewardZone.';
-    fields.append(createConfirmationTask());
+    if (fields) fields.append(createConfirmationTask());
 }
 
 /**
@@ -269,7 +315,7 @@ function createTaskStep(step) {
  */
 function updateTaskProgress() {
     const wrapper = document.getElementById('demo-progress');
-    if (steps.length === 0 || wrapper.hidden) return;
+    if (steps.length === 0 || !wrapper || wrapper.hidden) return;
 
     const ticked = steps.filter((step) => {
         const input = document.querySelector(
@@ -279,13 +325,16 @@ function updateTaskProgress() {
     }).length;
 
     const percent = steps.length === 0 ? 0 : Math.round((ticked / steps.length) * 100);
-    document.getElementById('demo-progress-bar').style.width = `${percent}%`;
-    document.getElementById('demo-progress-label').textContent =
+    const progressBar = document.getElementById('demo-progress-bar');
+    if (progressBar) progressBar.style.width = `${percent}%`;
+    const progressLabel = document.getElementById('demo-progress-label');
+    if (progressLabel) progressLabel.textContent =
         `${ticked} of ${steps.length} steps done`;
 }
 
 function setMessage(text, variant) {
     const message = document.getElementById('demo-message');
+    if (!message) return;
     message.className = 'form-message';
     if (variant) message.classList.add(`is-${variant}`);
     message.textContent = text;
@@ -293,8 +342,10 @@ function setMessage(text, variant) {
 
 function failTask(message) {
     setMessage(message, 'error');
-    document.getElementById('demo-form').hidden = true;
-    document.getElementById('demo-progress').hidden = true;
+    const formEl = document.getElementById('demo-form');
+    if (formEl) formEl.hidden = true;
+    const progressEl = document.getElementById('demo-progress');
+    if (progressEl) progressEl.hidden = true;
 }
 
 /**
@@ -356,7 +407,7 @@ function onAnswerChanged(event) {
  */
 function updateProgress() {
     const wrapper = document.getElementById('demo-progress');
-    if (questions.length === 0 || wrapper.hidden) return;
+    if (questions.length === 0 || !wrapper || wrapper.hidden) return;
 
     const answered = questions.filter((question) => {
         const input = document.querySelector(
@@ -366,8 +417,10 @@ function updateProgress() {
     }).length;
 
     const percent = questions.length === 0 ? 0 : Math.round((answered / questions.length) * 100);
-    document.getElementById('demo-progress-bar').style.width = `${percent}%`;
-    document.getElementById('demo-progress-label').textContent =
+    const progressBar = document.getElementById('demo-progress-bar');
+    if (progressBar) progressBar.style.width = `${percent}%`;
+    const progressLabel = document.getElementById('demo-progress-label');
+    if (progressLabel) progressLabel.textContent =
         answered === 0
             ? `${questions.length} ${questions.length === 1 ? 'question' : 'questions'} to answer`
             : `${answered} of ${questions.length} answered`;
@@ -384,7 +437,8 @@ function onSubmit(event) {
     // A task is not paged -- the participant needs to see what is left -- so it submits
     // directly. Only the survey advances.
     if (questions.length > 0 && currentStep < questions.length - 1) {
-        if (!document.getElementById('demo-form').reportValidity()) return;
+        const formEl = document.getElementById('demo-form');
+        if (!formEl || !formEl.reportValidity()) return;
         showStep(currentStep + 1);
         return;
     }
@@ -394,6 +448,7 @@ function onSubmit(event) {
 async function submitTask() {
     const form = document.getElementById('demo-form');
     const button = document.getElementById('demo-submit');
+    if (!form || !button) return;
     const values = Object.fromEntries(new FormData(form).entries());
 
     // The shape of the answers depends on what the server said this click is for, which is
@@ -415,11 +470,14 @@ async function submitTask() {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
-                Authorization: `Bearer ${sessionStorage.getItem(demoTokenKey)}`
+                ...demoAuthHeaders(),
             },
             body: JSON.stringify({ clickId: demoClickId, answers })
         });
-        const data = await response.json();
+        // The complete endpoint answers with JSON on success and failure, but the
+        // catch-all error page is HTML. Parse defensively so a non-JSON 5xx surfaces
+        // the real message instead of an "Unexpected token <" parse error.
+        const data = await response.json().catch(() => ({}));
         if (!response.ok) throw new Error(data.error || 'Could not complete the demo.');
 
         form.querySelectorAll('input, select, button').forEach((control) => { control.disabled = true; });
@@ -433,6 +491,7 @@ async function submitTask() {
 
 function showResult(data) {
     const result = document.getElementById('demo-result');
+    if (!result) return;
     const repeat = Boolean(data.alreadyCompleted);
 
     result.classList.toggle('is-repeat', repeat);
@@ -447,7 +506,8 @@ function showResult(data) {
     }
     result.hidden = false;
 
-    document.getElementById('demo-progress').hidden = true;
+    const progressEl = document.getElementById('demo-progress');
+    if (progressEl) progressEl.hidden = true;
     // `survey-back` only exists on the survey page. Guarding the lookup rather than assuming
     // the element is present keeps the same code working for a task, which has no back button.
     const back = document.getElementById('survey-back');
@@ -456,7 +516,97 @@ function showResult(data) {
         ? 'Saved. This reward was paid to your real balance.'
         : 'Saved. This is simulated test credit only and has no cash value.',
         'success');
+    if (!repeat) {
+        showDemoToast(
+            data.cashValue ? 'Task completed' : 'Demo task completed',
+            data.cashValue
+                ? `Added ${formatMoney(data.credited)} to your balance.`
+                : `Added ${formatMoney(data.credited)} to your test-only balance.`,
+            data.cashValue ? 'success' : 'info'
+        );
+        pushDemoNotification(
+            data.cashValue ? 'Task completed' : 'Demo task completed',
+            data.cashValue
+                ? `Added ${formatMoney(data.credited)} to your balance.`
+                : `Added ${formatMoney(data.credited)} to your test-only balance.`,
+            data.cashValue ? 'success' : 'info'
+        );
+    }
     startReturnCountdown(data.returnTo || RETURN_TO);
+}
+
+/** Toast notifications on the demo page, mirroring app.js's showToast. */
+const toastDedupe = new Map();
+const TOAST_DEDUPE_MS = 3000;
+
+const TOAST_ICONS = {
+    success: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M3 8.5l3 3 7-7" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+    info: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="2"/><path d="M8 5v3M8 11.5v.5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>',
+    error: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M4 4l8 8M12 4L4 12" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></svg>'
+};
+
+function showDemoToast(title, message, tone = 'info') {
+    const now = Date.now();
+    if (toastDedupe.has(title) && now - toastDedupe.get(title) < TOAST_DEDUPE_MS) return;
+    toastDedupe.set(title, now);
+    setTimeout(() => toastDedupe.delete(title), TOAST_DEDUPE_MS);
+
+    const region = document.getElementById('toast-region');
+    if (!region) return;
+    const toast = document.createElement('div');
+    toast.className = `toast is-${tone}`;
+    toast.setAttribute('role', 'status');
+    toast.setAttribute('aria-live', 'polite');
+    toast.innerHTML = `
+        <span class="toast-icon" aria-hidden="true">${TOAST_ICONS[tone] || TOAST_ICONS.info}</span>
+        <div class="toast-body">
+            <div class="toast-title">${title}</div>
+            ${message ? `<div class="toast-message">${message}</div>` : ''}
+        </div>
+        <button class="toast-close" type="button" aria-label="Dismiss notification">&times;</button>
+    `;
+    toast.querySelector('.toast-close').addEventListener('click', () => toast.remove());
+    region.appendChild(toast);
+    setTimeout(() => {
+        toast.classList.add('is-leaving');
+        setTimeout(() => toast.remove(), 200);
+    }, 4500);
+}
+
+const NOTIFICATIONS_KEY = 'offerNetworkNotifications';
+const NOTIFICATIONS_LIMIT = 50;
+
+function loadDemoNotifications() {
+    try {
+        const raw = window.localStorage.getItem(NOTIFICATIONS_KEY);
+        const parsed = raw ? JSON.parse(raw) : [];
+        return Array.isArray(parsed) ? parsed : [];
+    } catch {
+        return [];
+    }
+}
+
+function saveDemoNotifications(list) {
+    try {
+        window.localStorage.setItem(NOTIFICATIONS_KEY, JSON.stringify(list.slice(-NOTIFICATIONS_LIMIT)));
+    } catch {
+        // Storage full or unavailable.
+    }
+}
+
+function pushDemoNotification(title, message, tone = 'info') {
+    const store = loadDemoNotifications();
+    store.push({
+        id: Date.now() + Math.random(),
+        title,
+        message,
+        tone,
+        href: null,
+        category: 'reward',
+        read: false,
+        timestamp: Date.now()
+    });
+    saveDemoNotifications(store);
 }
 
 /**
@@ -478,6 +628,11 @@ function startReturnCountdown(target) {
     countdown.hidden = false;
     link.hidden = false;
     link.href = destination;
+    // The countdown and link sit inside `.demo-return`, which the markup hides until a
+    // task completes. Unhiding the children is not enough: a `[hidden]` parent keeps
+    // descendants hidden, so the container has to be revealed too.
+    const container = countdown.closest('.demo-return');
+    if (container) container.hidden = false;
 
     let remaining = RETURN_DELAY_SECONDS;
     const paint = () => {

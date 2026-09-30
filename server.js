@@ -37,6 +37,9 @@ require('dotenv').config();
 
 const { resolvePublicBaseUrl, isPubliclyReachable, defaultPort } = require('./src/services/publicBaseUrl');
 const { emailConfiguration } = require('./src/services/mailer');
+const { placeholderProblems, realCredential } = require('./src/services/credentials');
+const { stripeKeyMode, looksLikeSecretKey } = require('./src/services/stripeErrors');
+const nowPayments = require('./src/services/nowPayments');
 
 const isProduction = process.env.NODE_ENV === 'production';
 
@@ -99,8 +102,33 @@ function validateRuntimeConfiguration() {
                 'emails cannot be delivered. Set BREVO_API_KEY and EMAIL_FROM.'
             );
         }
-        const hasStripe = Boolean(process.env.STRIPE_SECRET_KEY && process.env.STRIPE_WEBHOOK_SECRET);
-        const hasNowPayments = Boolean(process.env.NOWPAYMENTS_API_KEY && process.env.NOWPAYMENTS_IPN_SECRET);
+        // Placeholder-aware, so a deployment carrying only the example values is told that
+        // at startup instead of discovering it on a customer's first card payment.
+        const stripeProblems = placeholderProblems(process.env, ['STRIPE_SECRET_KEY', 'STRIPE_WEBHOOK_SECRET']);
+        if (stripeProblems.length === 0 && !looksLikeSecretKey(realCredential(process.env, 'STRIPE_SECRET_KEY'))) {
+            stripeProblems.push('STRIPE_SECRET_KEY is not a Stripe secret key (sk_test_... or sk_live_...).');
+        }
+        const hasStripe = stripeProblems.length === 0;
+        const hasNowPayments = nowPayments.isConfigured() && Boolean(nowPayments.getIpnSecret());
+        if (stripeProblems.length > 0) {
+            console.warn(`Warning: card deposits are disabled because ${stripeProblems.join(' ')}`);
+        }
+        if (hasStripe) {
+            // A live key only charges if the account has finished activation. Stripe's refusal
+            // ("Your account cannot currently make live charges") happens on the first
+            // deposit, in front of a customer, and looks identical to a code fault. Naming the
+            // mode here means the log line beside the first failure already says which of the
+            // two it is.
+            const mode = stripeKeyMode();
+            console.log(`Card deposits enabled with a ${mode} Stripe key.`);
+            if (mode === 'live') {
+                console.log(
+                    'Note: a live key needs an activated Stripe account. If the first card deposit is refused with ' +
+                    '"cannot currently make live charges", finish verification in the Stripe dashboard or point ' +
+                    'STRIPE_SECRET_KEY at a test key (sk_test_...) for a sandbox run.'
+                );
+            }
+        }
         if (!hasStripe && !hasNowPayments) {
             console.warn('Warning: no payment provider credentials are set, so deposits are unavailable.');
         }
@@ -157,6 +185,31 @@ const port = defaultPort;
 
 app.listen(port, () => {
     console.log(`Offer network API listening on port ${port}`);
+
+    // ---------------------------------------------------------------------------
+    // Is the database at least as migrated as this build assumes?
+    // ---------------------------------------------------------------------------
+    //
+    // A column added by a migration does not exist until the query runs, so code that uses
+    // it is written, merged, and green while the database it will meet has never been
+    // migrated. The failure surfaces in production, on one control, with a stack trace
+    // about a column -- and nothing at startup said the schema was behind.
+    //
+    // Warned, not fatal. A server that refuses to boot over a pending migration takes down
+    // routes that work perfectly well against the schema that *is* there, which trades a
+    // partial fault for a total outage. `scripts/audit-sql.js` is the deeper check.
+    const pool = require('./src/config/db');
+    const { pendingMigrations, describePendingMigrations } = require('./src/services/schemaCheck');
+    pendingMigrations(pool).then(
+        (result) => {
+            const message = describePendingMigrations(result);
+            if (message) console.warn(`Warning: ${message}`);
+        },
+        () => {
+            // Unreachable database, or one that forbids the read. Not this check's problem to
+            // diagnose; saying so would only compete with the connection error itself.
+        }
+    );
 
     // ---------------------------------------------------------------------------
     // Automatic crypto payouts

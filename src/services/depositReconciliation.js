@@ -10,6 +10,7 @@ const {
 const { amountsMatch } = require('./money');
 const nowPayments = require('./nowPayments');
 const { notifyDepositCredited, notifyDepositFailed } = require('./depositEmails');
+const { realCredential } = require('./credentials');
 
 /**
  * Checks if NOWPayments credentials are set up.
@@ -20,16 +21,21 @@ function nowPaymentsConfigured() {
 
 /**
  * Checks if Stripe API secret key is configured.
+ *
+ * Placeholder-aware: the reconciliation sweep is the last chance to credit a deposit whose
+ * webhook never arrived, so it must not build a client out of the example value and then
+ * report the lookup as failed.
  */
 function stripeConfigured() {
-    return Boolean(process.env.STRIPE_SECRET_KEY);
+    return Boolean(realCredential(process.env, 'STRIPE_SECRET_KEY'));
 }
 
 /**
  * Returns an active Stripe client instance.
  */
 function getStripeClient() {
-    return process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SECRET_KEY) : null;
+    const key = realCredential(process.env, 'STRIPE_SECRET_KEY');
+    return key ? new Stripe(key) : null;
 }
 
 /**
@@ -128,6 +134,16 @@ async function reconcileNowPaymentsDeposit(deposit, summary, logger) {
         providerPayment = await fetchProviderPayment(deposit.provider_payment_id);
     } catch (error) {
         logger.error(`Deposit ${deposit.id}: provider lookup failed (${error.message}).`);
+        summary.skipped += 1;
+        return;
+    }
+
+    // A 200 whose body is not a JSON object reaches the caller as null, so this is a real
+    // answer rather than a fault. Reading a field off it would throw out of this function and
+    // out of the sweep's loop, abandoning every deposit after it -- the opposite of the
+    // "one unusable deposit is a skip, not an abort" rule the rest of this file follows.
+    if (!providerPayment || typeof providerPayment !== 'object' || Array.isArray(providerPayment)) {
+        logger.error(`Deposit ${deposit.id}: provider returned no readable payment record - skipping.`);
         summary.skipped += 1;
         return;
     }

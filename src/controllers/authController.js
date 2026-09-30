@@ -17,10 +17,25 @@ const {
 } = require('../services/verificationEmail');
 const { resolvePublicBaseUrl } = require('../services/publicBaseUrl');
 const { sendMagicLinkEmail } = require('../services/magicLinkEmail');
+const passkeys = require('../services/passkeys');
 
 const scryptAsync = promisify(scrypt);
 
 const MAGIC_LINK_WINDOW_MINUTES = 15;
+
+/**
+ * Sending a magic link is rated per address and per IP, on the same terms as asking for a
+ * new verification code.
+ *
+ * This endpoint sends a real message to a real inbox, so an unlimited one is an
+ * unauthenticated way to bury someone's mail and to spend the provider's quota, either by
+ * hammering one address or by walking a list of them. The limit is consumed before the
+ * address is looked up, so crossing it tells an attacker nothing about whether the account
+ * exists.
+ */
+const MAGIC_LINK_LIMIT_PER_ADDRESS = 3;
+const MAGIC_LINK_LIMIT_PER_IP = 10;
+const MAGIC_LINK_LIMIT_WINDOW_SECONDS = 15 * 60;
 
 /**
  * One message for every failed verification, whatever the reason.
@@ -87,6 +102,8 @@ const LOGIN_MAX_FAILED_ATTEMPTS = 10;
 
 const JWT_EXPIRES_IN = '12h';
 const JWT_ISSUER = 'offer-network-api';
+/** Must match the single algorithm `requireAuth` will verify against. */
+const JWT_ALGORITHM = 'HS256';
 
 /**
  * Postgres / network error codes that mean "the database is not reachable",
@@ -123,6 +140,32 @@ function clientIp(req) {
 
 function isDatabaseUnreachable(error) {
     return DB_UNREACHABLE_CODES.has(error?.code);
+}
+
+/**
+ * Turns a passkey failure into a response the visitor can act on.
+ *
+ * Two rules, and both exist to avoid telling an attacker something.
+ *
+ * The service throws errors that already carry a message written for a person -- "that passkey
+ * did not work, try again or use your password" -- because the library's own errors are
+ * precise about which check failed and that precision is for a log, not for a sign-in screen.
+ * A visitor who is told their assertion had a counter mismatch learns about the credential's
+ * internals and still does not know what to do next.
+ *
+ * A credential id that is not on this site gets the same answer as a signature that does not
+ * verify. Distinguishing them would make this an oracle for which passkeys exist, which is
+ * information about an account to someone who has not proved they own it.
+ */
+function respondToPasskeyError(res, error, fallback) {
+    if (isDatabaseUnreachable(error)) {
+        return res.status(503).json({ error: 'This service is temporarily unavailable.' });
+    }
+    if (error?.code) {
+        return res.status(error.status || 401).json({ error: error.message, code: error.code });
+    }
+    console.error('Passkey Error:', error?.message);
+    return res.status(500).json({ error: fallback });
 }
 
 function normaliseEmail(value) {
@@ -226,10 +269,13 @@ function issueToken(user) {
         );
     }
 
+    // `algorithm` is stated rather than left to the library's default so the signer and
+    // `requireAuth`'s verify-side allow-list cannot drift apart: verification accepts only
+    // HS256, so signing must be pinned to it rather than to whatever happens to be default.
     return jwt.sign(
         { sub: String(user.id), ver: version },
         process.env.JWT_SECRET,
-        { expiresIn: JWT_EXPIRES_IN, issuer: JWT_ISSUER }
+        { expiresIn: JWT_EXPIRES_IN, issuer: JWT_ISSUER, algorithm: JWT_ALGORITHM }
     );
 }
 
@@ -285,7 +331,14 @@ async function replaceResetToken({ userId, token, ip }) {
 /**
  * Consumes a reset token and rotates the account's password in one
  * transaction. Returns `{ ok: false }` when the token is expired, unknown, or
- * already used, and `{ ok: true }` when the password was changed.
+ * already used, and `{ ok: true, user }` when the password was changed.
+ *
+ * The updated row comes back out of the transaction on purpose. The reset is a sign-in --
+ * the holder of a valid, unexpired, single-use token has proved they can read the
+ * account's mail, which is the same proof a password sign-in gives -- so the response
+ * carries a session and the visitor lands on their account rather than being told to
+ * type the password they just invented. Signing that token needs `token_version` *after*
+ * the bump, and only this row has it.
  */
 async function consumeResetToken({ token, passwordHash }) {
     const client = await pool.connect();
@@ -306,17 +359,19 @@ async function consumeResetToken({ token, passwordHash }) {
         const userId = tokenResult.rows[0].user_id;
         // `token_version` is bumped so every session issued before the reset
         // stops working; the middleware rejects any JWT whose `ver` claim is
-        // older than the stored value.
-        await client.query(
+        // older than the stored value. The new value is returned so the token
+        // minted from this row is not immediately stale.
+        const updated = await client.query(
             `UPDATE users
              SET password_hash = $1, token_version = token_version + 1
-             WHERE id = $2`,
+             WHERE id = $2
+             RETURNING id, email, balance, demo_balance, token_version`,
             [passwordHash, userId]
         );
         await client.query('DELETE FROM password_reset_tokens WHERE user_id = $1', [userId]);
 
         await client.query('COMMIT');
-        return { ok: true };
+        return { ok: true, user: updated.rows[0] || null };
     } catch (error) {
         await client.query('ROLLBACK').catch(() => {});
         throw error;
@@ -572,28 +627,33 @@ const authController = {
         if (!isValidEmail(email)) {
             return res.status(400).json({ error: 'Enter a valid email address.' });
         }
-        const ip = req.ip || req.socket?.remoteAddress || 'unknown';
-
-        const [perAddress, perIp] = await Promise.all([
-            consumeRateLimit({
-                bucket: `verify-email:${email}`,
-                maxAttempts: RESEND_CODE_LIMIT_PER_ADDRESS,
-                windowSeconds: RESEND_CODE_WINDOW_SECONDS
-            }),
-            consumeRateLimit({
-                bucket: `verify-email:ip:${ip}`,
-                maxAttempts: RESEND_CODE_LIMIT_PER_IP,
-                windowSeconds: RESEND_CODE_WINDOW_SECONDS
-            })
-        ]);
-        if (!perAddress.allowed || !perIp.allowed) {
-            return res.status(429).json({
-                error: 'Too many requests for a new code. Try again in a few minutes.',
-                retryAfterSeconds: Math.max(perAddress.retryAfterSeconds, perIp.retryAfterSeconds)
-            });
-        }
+        const ip = clientIp(req);
 
         try {
+            // Inside the try, deliberately. `consumeRateLimit` queries the database, and a
+            // rejected promise escaping an async handler is not caught by Express 4: the
+            // request hangs until the client gives up and the rejection is unhandled, which
+            // under Node's default policy takes the process down. A database blip while
+            // rating a resend has to be an ordinary 503, not a crash.
+            const [perAddress, perIp] = await Promise.all([
+                consumeRateLimit({
+                    bucket: `verify-email:${email}`,
+                    maxAttempts: RESEND_CODE_LIMIT_PER_ADDRESS,
+                    windowSeconds: RESEND_CODE_WINDOW_SECONDS
+                }),
+                consumeRateLimit({
+                    bucket: `verify-email:ip:${ip}`,
+                    maxAttempts: RESEND_CODE_LIMIT_PER_IP,
+                    windowSeconds: RESEND_CODE_WINDOW_SECONDS
+                })
+            ]);
+            if (!perAddress.allowed || !perIp.allowed) {
+                return res.status(429).json({
+                    error: 'Too many requests for a new code. Try again in a few minutes.',
+                    retryAfterSeconds: Math.max(perAddress.retryAfterSeconds, perIp.retryAfterSeconds)
+                });
+            }
+
             const found = await pool.query(
                 'SELECT id, email, email_verified_at FROM users WHERE LOWER(email) = $1',
                 [email]
@@ -604,13 +664,27 @@ const authController = {
                 const code = generateCode();
                 // Any previous live code is dropped, so only the newest one works and a code
                 // still sitting in the user's inbox from an earlier request cannot be used
-                // after they asked for a new one.
-                await pool.query('DELETE FROM email_verification_codes WHERE user_id = $1', [user.id]);
-                await pool.query(
-                    `INSERT INTO email_verification_codes (user_id, code_hash, expires_at)
-                     VALUES ($1, $2, NOW() + ($3 || ' minutes')::interval)`,
-                    [user.id, hashCode(code, user.id), String(CODE_LIFETIME_MINUTES)]
-                );
+                // after they asked for a new one. Dropped and replaced in one transaction:
+                // two requests that interleave -- both deletes, then both inserts -- would
+                // otherwise leave two live codes behind, and only one of them would be the
+                // one the user is now reading.
+                const client = await pool.connect();
+                try {
+                    await client.query('BEGIN');
+                    await client.query('DELETE FROM email_verification_codes WHERE user_id = $1', [user.id]);
+                    await client.query(
+                        `INSERT INTO email_verification_codes (user_id, code_hash, expires_at)
+                         VALUES ($1, $2, NOW() + ($3 || ' minutes')::interval)`,
+                        [user.id, hashCode(code, user.id), String(CODE_LIFETIME_MINUTES)]
+                    );
+                    await client.query('COMMIT');
+                } catch (error) {
+                    await client.query('ROLLBACK').catch(() => {});
+                    throw error;
+                } finally {
+                    client.release();
+                }
+
                 const delivery = await sendVerificationEmail({ to: user.email, code });
                 if (!delivery.sent) {
                     console.error(`Verification email was not delivered (${delivery.reason}).`);
@@ -764,13 +838,17 @@ const authController = {
             }
 
             const token = randomBytes(RESET_TOKEN_BYTES).toString('hex');
-            await replaceResetToken({ userId: user.id, token, ip });
-
             const resetUrl = buildResetUrl(token);
             if (!resetUrl) {
+                // Refused before the token is stored. A deployment with no usable
+                // APP_BASE_URL cannot deliver this link at all, and storing it first would
+                // delete whatever reset link the account did have and replace it with one
+                // that can never arrive.
                 console.error('Password reset link could not be built: APP_BASE_URL is not configured.');
                 return res.json(RESET_GENERIC_RESPONSE);
             }
+
+            await replaceResetToken({ userId: user.id, token, ip });
 
             const delivery = await sendPasswordResetEmail({ to: email, resetUrl });
             if (!delivery.sent) {
@@ -795,6 +873,10 @@ const authController = {
      * same transaction that changes the password. `token_version` is bumped so
      * every session issued before the reset stops working, and outstanding
      * reset tokens for the account are removed.
+     *
+     * The response carries a session token, so the browser goes straight to the
+     * account page instead of showing a message telling the visitor to sign in with
+     * the password they have just set.
      */
     resetPassword: async (req, res) => {
         const token = resetTokenFromBody(req.body);
@@ -829,9 +911,27 @@ const authController = {
                 return res.status(400).json({ error: RESET_INVALID_MESSAGE });
             }
 
+            // A session for the reset itself, so the visitor lands on their account instead
+            // of being told to sign in with the password they chose one second ago. The
+            // token is signed at the bumped `token_version`, so it is not one of the sessions
+            // the reset just revoked. If signing fails for any reason the reset still stands
+            // -- the password really has changed -- so the response degrades to the old
+            // "now sign in" shape rather than reporting a failure that did not happen.
+            let session = null;
+            if (outcome.user) {
+                try {
+                    session = { token: issueToken(outcome.user), user: publicUser(outcome.user) };
+                } catch (error) {
+                    console.error('Password reset succeeded but the session could not be issued:', error.message);
+                }
+            }
+
             return res.json({
-                message: 'Your password has been updated. Sign in with your new password.',
+                message: session
+                    ? 'Your password has been updated and you are signed in.'
+                    : 'Your password has been updated. Sign in with your new password.',
                 signedOutEverywhere: true,
+                ...(session?.token ? { token: session.token, user: session.user } : {}),
             });
         } catch (error) {
             console.error('Password reset failed:', error.message);
@@ -854,8 +954,133 @@ const authController = {
      * with no session to revoke is handled the same as one whose token was already
      * stale.
      */
+    // -----------------------------------------------------------------------
+    // Passkeys
+    // -----------------------------------------------------------------------
+    //
+    // Four endpoints, two round trips. The first of each pair generates a challenge and
+    // returns options for `navigator.credentials`; the second takes what the authenticator
+    // produced and finishes the job. They cannot be merged, because the browser has to run
+    // between them and that is where the Face ID or Touch ID prompt happens.
+    //
+    // Registration needs a session -- a passkey is added to an account, so somebody has to
+    // already be in it. Authentication deliberately does not: that is the whole point of a
+    // discoverable passkey, that the account is resolved from the credential after the user
+    // has proved who they are rather than by being told who they are first.
+    //
+    // `requireAuth` on the two register routes is also what keeps a stolen session from
+    // quietly enrolling a new device on its way out.
+
+    /**
+     * Options for adding a device.
+     *
+     * `req.user` is passed as it is rather than copied field by field. The copy this used to
+     * make listed `email` and `display_name`, and `requireAuth` puts neither on that object -- it
+     * builds one field by field on purpose -- so both were `undefined` and the options went out
+     * with no `user.name`, which the browser rejects before the device is ever asked. The service
+     * reads the account's identity from the database, which is also the only place it can be
+     * trusted from.
+     */
+    passkeyRegisterOptions: async (req, res) => {
+        try {
+            const options = await passkeys.registrationOptions(req, req.user);
+            return res.json(options);
+        } catch (error) {
+            return respondToPasskeyError(res, error, 'Could not start setting up that passkey.');
+        }
+    },
+
+    /** Finishes adding a device, or refuses and explains. */
+    passkeyRegisterVerify: async (req, res) => {
+        try {
+            const result = await passkeys.completeRegistration(
+                req,
+                req.user,
+                req.body?.response,
+                req.body?.challenge
+            );
+            return res.json({ ok: true, credentialId: result.credentialId });
+        } catch (error) {
+            return respondToPasskeyError(res, error, 'Could not register that passkey.');
+        }
+    },
+
+    /** Options for signing in. Anonymous, and deliberately so. */
+    passkeyAuthenticateOptions: async (req, res) => {
+        try {
+            return res.json(await passkeys.authenticationOptions(req));
+        } catch (error) {
+            return respondToPasskeyError(res, error, 'Could not start passkey sign-in.');
+        }
+    },
+
+    /**
+     * Finishes signing in.
+     *
+     * The response shape is the same as `login`, so the client has one sign-in path rather
+     * than two that differ in a field name. An unconfirmed account is refused exactly as
+     * `login` refuses it -- holding a passkey is not confirmation, and letting it through
+     * would create accounts that can hold a balance but never receive the email that says
+     * they are real.
+     */
+    passkeyAuthenticateVerify: async (req, res) => {
+        try {
+            const user = await passkeys.completeAuthentication(req, req.body?.response, req.body?.challenge);
+            if (!user.email_verified_at) {
+                return res.status(403).json({
+                    error: 'Confirm your email address before signing in.',
+                    requiresVerification: true,
+                    email: user.email
+                });
+            }
+            const token = issueToken(user);
+            if (!token) {
+                return res.status(503).json({ error: 'Authentication is not configured.' });
+            }
+            return res.json({
+                token,
+                user: { id: user.id, email: user.email, display_name: user.display_name || null }
+            });
+        } catch (error) {
+            return respondToPasskeyError(res, error, 'Passkey sign-in did not work.');
+        }
+    },
+
+    /** The devices this account can sign in with, for the revoke list. */
+    passkeyList: async (req, res) => {
+        try {
+            return res.json({ passkeys: await passkeys.listPasskeys(req.user.id) });
+        } catch (error) {
+            if (isDatabaseUnreachable(error)) {
+                return res.status(503).json({ error: 'This service is temporarily unavailable.' });
+            }
+            return res.status(500).json({ error: 'Could not load your passkeys right now.' });
+        }
+    },
+
+    /**
+     * Removes a device.
+     *
+     * 404 for a credential this account does not have, which is also the answer for one that
+     * belongs to somebody else. A 403 would confirm that the credential exists, which is a
+     * small thing to leak but a free one, and there is no version of this that needs it.
+     */
+    passkeyDelete: async (req, res) => {
+        try {
+            const removed = await passkeys.deletePasskey(req.user.id, req.params.credentialId);
+            if (!removed) {
+                return res.status(404).json({ error: 'That passkey was not found.' });
+            }
+            return res.json({ ok: true });
+        } catch (error) {
+            if (isDatabaseUnreachable(error)) {
+                return res.status(503).json({ error: 'This service is temporarily unavailable.' });
+            }
+            return res.status(500).json({ error: 'Could not remove that passkey right now.' });
+        }
+    },
+
     logout: async (req, res) => {
-        const ip = clientIp(req);
         try {
             const client = await pool.connect();
             try {
@@ -888,11 +1113,13 @@ const authController = {
      * The address is not confirmed to exist or not exist: the response is identical
      * either way, and the email is only actually sent if a live, unconfirmed account
      * is found. This prevents the endpoint from being used to enumerate accounts or
-     * to spam an address that does not have one.
+     * to spam an address that does not have one -- but only if sending is itself
+     * rate limited, which is why the counters are spent before the address is looked up.
      *
      * The link itself is a random 32-byte token carried in the URL fragment. The
      * token is hashed before storage, so a database read cannot produce a valid link.
-     * It is single-use and expires after a short window.
+     * It is single-use, it expires after a short window, and requesting a new one
+     * invalidates any that were outstanding.
      */
     sendMagicLink: async (req, res) => {
         const email = normaliseEmail(req.body.email);
@@ -901,6 +1128,25 @@ const authController = {
         }
 
         try {
+            const [perAddress, perIp] = await Promise.all([
+                consumeRateLimit({
+                    bucket: `magic-link:${email}`,
+                    maxAttempts: MAGIC_LINK_LIMIT_PER_ADDRESS,
+                    windowSeconds: MAGIC_LINK_LIMIT_WINDOW_SECONDS
+                }),
+                consumeRateLimit({
+                    bucket: `magic-link:ip:${clientIp(req)}`,
+                    maxAttempts: MAGIC_LINK_LIMIT_PER_IP,
+                    windowSeconds: MAGIC_LINK_LIMIT_WINDOW_SECONDS
+                })
+            ]);
+            if (!perAddress.allowed || !perIp.allowed) {
+                return res.status(429).json({
+                    error: 'Too many magic links requested. Try again in a few minutes.',
+                    retryAfterSeconds: Math.max(perAddress.retryAfterSeconds, perIp.retryAfterSeconds)
+                });
+            }
+
             const userResult = await pool.query(
                 'SELECT id, email, email_verified_at FROM users WHERE LOWER(email) = $1',
                 [email]
@@ -911,11 +1157,28 @@ const authController = {
                 const token = randomBytes(32).toString('hex');
                 const tokenHash = createHash('sha256').update(token).digest('hex');
 
-                await pool.query(
-                    `INSERT INTO magic_link_tokens (token_hash, user_id, email, expires_at)
-                     VALUES ($1, $2, $3, NOW() + ($4 || ' minutes')::interval)`,
-                    [tokenHash, user.id, user.email, MAGIC_LINK_WINDOW_MINUTES]
-                );
+                // Replaces rather than appends, in one transaction. Without the delete a
+                // second request leaves the first link live, so a link that has already been
+                // forwarded, or copied out of a mailbox, still signs the account in after the
+                // owner has asked for a new one -- and the rows accumulate. The transaction is
+                // what stops two concurrent requests from each deleting the other's row and
+                // then both inserting, which leaves two live tokens again.
+                const client = await pool.connect();
+                try {
+                    await client.query('BEGIN');
+                    await client.query('DELETE FROM magic_link_tokens WHERE user_id = $1', [user.id]);
+                    await client.query(
+                        `INSERT INTO magic_link_tokens (token_hash, user_id, email, expires_at)
+                         VALUES ($1, $2, $3, NOW() + ($4 || ' minutes')::interval)`,
+                        [tokenHash, user.id, user.email, MAGIC_LINK_WINDOW_MINUTES]
+                    );
+                    await client.query('COMMIT');
+                } catch (error) {
+                    await client.query('ROLLBACK').catch(() => {});
+                    throw error;
+                } finally {
+                    client.release();
+                }
 
                 const delivery = await sendMagicLinkEmail({ to: user.email, token });
                 if (!delivery.sent) {
@@ -942,8 +1205,10 @@ const authController = {
      * Consumes a magic link token and issues a session.
      *
      * The token is compared as a hash: the raw token is never stored. On success the
-     * row is deleted so it cannot be replayed, and the user's `token_version` is
-     * bumped so any prior stale tokens are invalidated.
+     * row is deleted so it cannot be replayed, the address is confirmed -- the link is
+     * proof of control of the inbox, the same proof a six-digit code carries -- and the
+     * user's `token_version` is bumped so any session issued before this sign-in stops
+     * working.
      *
      * Because this endpoint is reached by a link in an email rather than a form
      * submission, the token arrives in the request body from the frontend (which
@@ -983,16 +1248,31 @@ const authController = {
 
             const row = found.rows[0];
 
-            // Re-fetch the user with token_version so issueToken has the column it needs.
-            const userResult = await client.query(
-                `SELECT id, email, balance, demo_balance, is_banned, token_version
-                 FROM users
-                 WHERE id = $1 FOR UPDATE`,
+            // Confirm the account and retire earlier sessions in one write.
+            //
+            // The confirmation is the point: the link was only ever sent to an address
+            // with `email_verified_at` NULL, and clicking it is the same proof of inbox
+            // control that the six-digit code is. Leaving the column NULL signed the user
+            // in here and then refused their very next password sign-in as unverified,
+            // while the thank-you email sent below claimed the opposite.
+            //
+            // `RETURNING` rather than a separate read so `issueToken` is handed the version
+            // this write produced. Reading first and bumping afterwards would sign a token
+            // one version behind the row, and every request made with it would be refused
+            // as revoked. `is_banned` is filtered in the WHERE clause, so a disabled
+            // account gets the same "invalid link" answer and, because the delete is
+            // rolled back with it, its token is not silently burned.
+            const updated = await client.query(
+                `UPDATE users
+                 SET email_verified_at = COALESCE(email_verified_at, NOW()),
+                     token_version = token_version + 1
+                 WHERE id = $1 AND is_banned IS NOT TRUE
+                 RETURNING id, email, balance, demo_balance, token_version`,
                 [row.user_id]
             );
-            const user = userResult.rows[0];
+            const user = updated.rows[0];
 
-            if (!user || user.is_banned) {
+            if (!user) {
                 await client.query('ROLLBACK');
                 client.release();
                 client = null;

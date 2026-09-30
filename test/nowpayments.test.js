@@ -936,7 +936,7 @@ test('a refusal is reported as a refusal, which is not the same as no figure', a
         // coins are not worth asking about; an answer with no usable figure does not.
         assert.equal(nowPayments.isPayoutMinimumRefused(), false, 'a fresh process starts unrefused');
 
-        global.fetch = async () => new Response('Access denied', { status: 403 });
+        undici.fetch = async () => new Response('Access denied', { status: 403 });
         const originalWarn = console.warn;
         console.warn = () => {};
         try {
