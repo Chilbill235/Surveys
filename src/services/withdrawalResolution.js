@@ -189,6 +189,93 @@ async function refundWithdrawal(client, withdrawalId, reason) {
 }
 
 /**
+ * Cancels a withdrawal the user asked to cancel, and returns the money.
+ *
+ * This is the self-service counterpart to an operator refunding a request, and the difference
+ * is who is asking -- which changes the risk, because the user cannot be asked to read a
+ * provider dashboard first. So it is deliberately *narrower* than `reverseWithdrawal` rather
+ * than a thinner wrapper around it.
+ *
+ * Why it cannot just call `reverseWithdrawal`
+ * ------------------------------------------
+ * `refundWithdrawal` refuses a withdrawal carrying a `provider_reference`, on the reasoning
+ * that a submitted payout can still settle on-chain afterwards. That guard is correct and it
+ * is also *not sufficient here*, because `provider_reference` is only written when a payout
+ * reaches `paid`. Every stage before that -- claimed, batch submitted, in flight, or parked
+ * because the provider never answered -- leaves it NULL. A crypto withdrawal sitting in
+ * `WAITING` or `PROCESSING` is therefore invisible to that guard, and refunding one would
+ * credit the balance while the transfer completed, paying the user twice with a database that
+ * agrees with itself throughout.
+ *
+ * The extra rule
+ * --------------
+ * A user may cancel only while the row carries no evidence that a payout was ever *started*:
+ * no claim, no provider status, no batch, no submitted timestamp. That covers the case a user
+ * actually hits -- a request that has been sitting in `pending` because automatic payouts are
+ * off, a provider that never answered, a queue the user no longer wants to be in -- while
+ * refusing everything from the moment the payout machinery touched the row.
+ *
+ * The two refusals are reported differently on purpose. `already-sent` is not an error the
+ * user caused or can fix; it is the one case that genuinely needs a person, because deciding
+ * it means reading the provider dashboard. The route turns that into a message telling the
+ * user their request is in flight and support will finish it, rather than a generic refusal
+ * that reads as a bug.
+ *
+ * `payout_claimed_at` is the column that makes this safe rather than merely cautious. It is
+ * written by the claim UPDATE, in the same statement that moves the row to `processing`, and
+ * it is only ever cleared on a *release* -- a provable refusal. So `payout_claimed_at IS NULL`
+ * is exactly "no claim is live", including across a crash mid-run: a row claimed by a
+ * process that then died is refused here, which is the correct answer, because that process
+ * may have sent the payout before it went down.
+ */
+async function cancelWithdrawalByUser(withdrawalId, userId) {
+    return withTransaction(async (client) => {
+        // The row is locked for the rest of the transaction, and scoped to the owner. The lock
+        // is what makes the read-then-write a decision rather than a guess: a payout run
+        // claiming this row at the same moment blocks here until this commits, and then finds
+        // `status = 'cancelled'` and skips it. Without it the two interleave and the user is
+        // refunded for a payout that is being submitted.
+        const row = await client.query(
+            `SELECT w.id, w.user_id, w.amount, w.status, w.payment_method, w.provider_reference,
+                    w.payout_status, w.payout_claimed_at, w.batch_id, w.payout_provider_id,
+                    w.payout_submitted_at
+               FROM withdrawals w
+              WHERE w.id = $1 AND w.user_id = $2
+              FOR UPDATE`,
+            [withdrawalId, userId]
+        );
+        if (row.rows.length === 0) return { changed: false, reason: 'not-found' };
+
+        const withdrawal = row.rows[0];
+        if (settledStatuses.has(withdrawal.status)) {
+            return { changed: false, reason: 'already-paid', withdrawal };
+        }
+        if (terminalStatuses.has(withdrawal.status)) {
+            return { changed: false, reason: 'already-resolved', withdrawal };
+        }
+
+        // The gate. Any one of these means a payout was started, and started is the point of
+        // no return -- the money may already be on its way, so the only correct answer is to
+        // refuse and let a person reconcile it.
+        const started = withdrawal.payout_claimed_at
+            || withdrawal.payout_status
+            || withdrawal.batch_id
+            || withdrawal.payout_provider_id
+            || withdrawal.payout_submitted_at
+            || withdrawal.provider_reference;
+        if (started) {
+            return { changed: false, reason: 'already-sent', withdrawal };
+        }
+
+        // Everything below is the same close-and-refund that an operator refund performs, so the
+        // money path stays in one place: one balance write, one `refund` ledger row keyed on
+        // the withdrawal id, both inside this transaction, and a repeat attempt is a rollback
+        // rather than a second credit.
+        return refundWithdrawal(client, withdrawalId, 'Cancelled by you. Your balance has been updated.');
+    });
+}
+
+/**
  * The ledger source id for a withdrawal refund.
  *
  * Keyed on the withdrawal id and nothing else, so the second refund attempt collides with
@@ -264,13 +351,23 @@ async function sendWithdrawal(withdrawalId, providerReference) {
     return result;
 }
 
-/** Closes a withdrawal and refunds the balance. */
-async function reverseWithdrawal(withdrawalId, reason) {
+/**
+ * Closes a withdrawal and refunds the balance.
+ *
+ * `reason` is the operator's record of why, and it is written to the row. `options.emailReason`
+ * is what the user is shown instead, when the two need to differ -- which is the case for every
+ * failure that originates at the provider. "NOWPayments /v1/payout returned 400.: Insufficient
+ * balance" is the right thing to keep on the row and the wrong thing to put in an email: it
+ * names a third party the user has no relationship with, an HTTP status, and an endpoint path.
+ * The email carries the same fact in words the user can act on, and both are sent from here so
+ * the refund and the message announcing it remain one event.
+ */
+async function reverseWithdrawal(withdrawalId, reason, { emailReason } = {}) {
     const result = await withTransaction((client) =>
         refundWithdrawal(client, Number(withdrawalId), reason)
     );
     if (result.changed) {
-        await notifyRefunded(result.withdrawal, reason).catch((error) => {
+        await notifyRefunded(result.withdrawal, emailReason || reason).catch((error) => {
             console.error(
                 `Withdrawal ${withdrawalId} was refunded but its email was not sent: ${error.message}`
             );
@@ -343,6 +440,7 @@ module.exports = {
     refundWithdrawal,
     sendWithdrawal,
     reverseWithdrawal,
+    cancelWithdrawalByUser,
     listUnresolvedWithdrawals,
     refundSourceId,
     resolvableStatuses,

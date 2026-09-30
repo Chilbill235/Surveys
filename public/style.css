@@ -2074,6 +2074,11 @@ select.form-control:disabled { cursor: not-allowed; background-image: none; padd
     display: flex;
     align-items: center;
     justify-content: space-between;
+    /* Wrapping, so a row may carry a block-level child that is wider than one line. Without
+     * it a flex container refuses to wrap no matter how large a flex basis its children ask
+     * for, and the withdrawal details below would be crushed into the sliver of space left
+     * beside the badge. */
+    flex-wrap: wrap;
     gap: 12px;
     padding: 12px 14px;
     background: var(--surface-2);
@@ -2082,7 +2087,105 @@ select.form-control:disabled { cursor: not-allowed; background-image: none; padd
 }
 .history-row > div { min-width: 0; display: grid; gap: 4px; }
 
+/* Cancel on a withdrawal row.
+ *
+ * The details cell is given `flex: 1` so a third child does not squeeze the amount and status
+ * out of shape: the row is `display: flex` with `space-between`, and without a cell that grows
+ * the text does not take the slack, so adding a control to the end pushes the description into
+ * a narrower column than it had on every other row. */
+
+.history-row > div:first-child { flex: 1 1 auto; }
+
+.history-cancel {
+    flex: 0 0 auto;
+    align-self: center;
+    min-height: 32px;
+    padding: 6px 12px;
+    font-size: 0.75rem;
+    color: var(--danger);
+    white-space: nowrap;
+}
+
+.history-cancel:disabled { opacity: 0.5; cursor: default; }
+
+@media (max-width: 600px) {
+    /* On a phone the row wraps the control onto its own line rather than competing with the
+     * amount for the width of a single line. `flex-basis: 100%` plus the wrap is what moves
+     * it; `justify-content` alone would only centre it. */
+    .history-cancel { margin-left: auto; }
+}
+
 .payout-progress { color: var(--muted); font-size: var(--step--1); line-height: 1.45; }
+
+/* The per-withdrawal details disclosure.
+ *
+ * A 12-column grid rather than a two-column list, because the labels are not all the same
+ * length: "Amount requested" against "Transaction reference" in two fixed columns leaves the
+ * first label wrapping onto three lines and the second one a wall of space. `auto auto` pairs
+ * each label with its own value and lets the whole set breathe.
+ *
+ * `flex: 1 0 100%` is what puts the list on its own line. The row is a flex container, and a
+ * definition list of eleven pairs is a block, not a badge-sized object; sharing a line with
+ * the status pill would squeeze it to roughly 200px. The basis is 100% and it may not shrink,
+ * which is the whole of the trick. */
+
+.history-detail { flex: 1 0 100%; margin-top: 2px; }
+.history-detail-summary {
+    color: var(--muted);
+    font-size: var(--step--1);
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    cursor: pointer;
+}
+.history-detail-summary:hover { color: var(--ink); }
+.history-detail-list {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    gap: 4px 14px;
+    margin: 10px 0 2px;
+    padding-top: 10px;
+    border-top: 1px solid var(--line);
+}
+.history-detail-label { color: var(--muted); font-size: var(--step--1); }
+.history-detail-value { color: var(--ink); font-size: var(--step--1); overflow-wrap: anywhere; }
+
+/* Addresses and transaction hashes, and nothing else. These are the two values that are a
+ * single unbroken run of 40-90 characters, and the disclosure is the one place they are shown
+ * in full rather than shortened -- so they have to wrap somewhere, and here is that place. */
+
+.history-detail-mono { font-family: var(--font-mono); }
+
+/* The links at the foot of a withdrawal disclosure: its receipt, and the blockchain.
+ *
+ * A full-width strip rather than another row in the list, because these are the only two values
+ * in it that do anything when pressed. The `gap` and the top border are what separate them from
+ * the facts above -- without them the strip reads as a continuation of the address line rather
+ * than as somewhere to go. */
+
+.history-detail-links {
+    grid-column: 1 / -1;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 6px;
+    padding-top: 10px;
+    border-top: 1px solid var(--line);
+}
+
+.history-detail-link {
+    display: inline-flex;
+    align-items: center;
+    min-height: 32px;
+    padding: 0 12px;
+    border: 1px solid var(--line);
+    border-radius: var(--r-pill);
+    color: var(--accent);
+    font-size: var(--step--1);
+    font-weight: 700;
+    text-decoration: none;
+}
+.history-detail-link:hover { background: var(--surface-2); }
 .history-row strong { color: var(--ink); font-size: var(--step-0); text-transform: capitalize; overflow-wrap: anywhere; }
 .history-row div > span { color: var(--muted); font-size: var(--step--1); overflow-wrap: anywhere; }
 
@@ -2372,6 +2475,41 @@ select.form-control:disabled { cursor: not-allowed; background-image: none; padd
  * than as a longer string. The phone case is handled by the width-constrained override below,
  * which is where that concern belongs. */
 .receipt-facts dd.is-wrappable { text-align: right; font-family: var(--font-mono); font-size: 0.74rem; }
+
+/* The block-explorer links on a receipt.
+ *
+ * A block-level strip of links rather than more `dt`/`dd` pairs, because these are actions and
+ * everything else in that list is a value. Left-aligned, where the rest of the facts are
+ * right-aligned -- a link that is right-aligned under a right-aligned hash reads as part of the
+ * hash rather than as something to press.
+ *
+ * The gap is what separates them from the facts above: these are the only things on the card
+ * that go somewhere outside it, and without a rule to make that visible they read as a
+ * continuation of the address line. */
+
+.receipt-links {
+    grid-column: 1 / -1;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin-top: 6px;
+    padding-top: 12px;
+    border-top: 1px solid var(--line);
+}
+
+.receipt-link {
+    display: inline-flex;
+    align-items: center;
+    min-height: 40px;
+    padding: 0 14px;
+    border: 1px solid var(--line);
+    border-radius: var(--r-pill);
+    color: var(--accent);
+    font-size: var(--step--1);
+    font-weight: 700;
+    text-decoration: none;
+}
+.receipt-link:hover { background: var(--surface-2); }
 
 .receipt-shell { width: min(560px, calc(100% - 32px)); margin: clamp(24px, 6vw, 64px) auto; }
 .receipt-card { padding: clamp(22px, 4vw, 32px); background: var(--surface); border: 1px solid var(--line); border-top: 4px solid var(--indigo-700); border-radius: var(--r-lg); box-shadow: var(--shadow-sm); }
@@ -4289,6 +4427,32 @@ textarea.form-input { min-height: 128px; resize: vertical; line-height: 1.55; }
     border-bottom: 0;
 }
 
+/* A notification that points somewhere is a real link, so it needs the two things an anchor
+ * brings by default removed: the underline, and the link colour. Left in, every title renders
+ * as a hyperlink in the accent colour and the row stops reading as a notification. */
+.notification-item.is-link {
+    color: inherit;
+    text-decoration: none;
+}
+.notification-item.is-link:focus-visible {
+    outline: 2px solid var(--coral-500);
+    outline-offset: -2px;
+}
+.notification-item-go {
+    flex: 0 0 auto;
+    align-self: center;
+    color: var(--accent);
+    font-size: var(--step-0);
+    /* The arrow marks the row as a destination, so it is hidden from a screen reader: the link's
+     * own accessible name is the message, and "right arrow" added to it says nothing. */
+    opacity: 0;
+    transition: opacity 0.16s var(--ease);
+}
+.notification-item.is-link:hover .notification-item-go,
+.notification-item.is-link:focus-visible .notification-item-go {
+    opacity: 1;
+}
+
 .notification-item-icon {
     flex: 0 0 auto;
     margin-top: 2px;
@@ -4692,6 +4856,47 @@ textarea.form-input { min-height: 128px; resize: vertical; line-height: 1.55; }
 .history-item.is-conversion .history-item-amount { color: var(--warning); }
 .history-item.is-adjustment .history-item-amount { color: var(--success); }
 
+/* The receipt link on a history row.
+ *
+ * Sized and coloured to read as part of the row rather than as a call to action, because it is
+ * one: the notification that brought the reader here is already on screen or dismissed, and a
+ * list where every row shouts at the reader is a list they stop reading. The focus ring is
+ * explicit because the row itself is now focusable, and a visible focus indicator on the row is
+ * the only thing that tells a keyboard user which one the link moved them to. */
+
+.history-item-receipt {
+    margin-left: 16px;
+    color: var(--accent);
+    font-size: var(--step--1);
+    font-weight: 700;
+    text-decoration: none;
+    white-space: nowrap;
+}
+.history-item-receipt:hover { text-decoration: underline; }
+.history-item-receipt:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 3px;
+    border-radius: var(--r-chip, 6px);
+}
+
+/* The row a notification's link pointed at.
+ *
+ * A left rule and a raised surface rather than a colour change: the row's own colours already
+ * encode what kind of transaction it is, and recolouring one would overwrite the only thing that
+ * says whether the money arrived or left. The highlight is meant to answer "which of these is
+ * the one I was told about", which is a question about position, not about state.
+ *
+ * `scroll-margin-top` matters as much as the outline: the row is scrolled to `block: 'center'`,
+ * but a sticky header would otherwise sit on top of it on a phone. */
+
+.history-item.is-focused {
+    background: var(--surface-2);
+    box-shadow: inset 3px 0 0 var(--accent);
+    scroll-margin-top: 96px;
+    border-radius: var(--r-card, 14px);
+}
+.history-item.is-focused:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
 .header-nav {
     display: inline-flex;
     gap: 12px;
@@ -4722,10 +4927,56 @@ textarea.form-input { min-height: 128px; resize: vertical; line-height: 1.55; }
     border-bottom-color: var(--indigo-700);
 }
 
+/* Pagination for the transaction list.
+ *
+ * A three-column grid rather than a flex row so the status stays centred when one button is
+ * disabled and the other is not. The buttons are always both present -- `disabled` at the ends
+ * rather than removed -- because a bar that changes width as the user pages through it moves
+ * the control out from under a pointer that was heading for it. */
+
+.history-pagination {
+    display: grid;
+    grid-template-columns: 1fr auto 1fr;
+    align-items: center;
+    gap: 12px;
+    margin-top: 16px;
+}
+
+.history-pagination .history-page-button { justify-self: start; }
+.history-pagination .history-page-button:last-of-type { justify-self: end; }
+
+/* Disabled rather than hidden, and dimmed rather than hidden, so the ends of the list read as
+ * the ends of the list rather than as the control having failed to load. */
+.history-page-button:disabled { opacity: 0.4; cursor: default; }
+
+.history-page-status {
+    margin: 0;
+    text-align: center;
+    font-size: 0.75rem;
+    color: var(--muted);
+    white-space: nowrap;
+}
+
+/* Reached when a notification asked for a specific row and the list did not contain it. Warm
+ * rather than alarming: the money is not lost, the record is simply not something this list
+ * holds -- an entry from before history was kept, or a row a different filter covers. */
+.history-target-missing {
+    margin: 0 0 12px;
+    padding: 10px 14px;
+    border-radius: 10px;
+    background: var(--surface-muted, rgba(99, 102, 241, 0.08));
+    color: var(--muted);
+    font-size: 0.8125rem;
+}
+
 @media (max-width: 720px) {
     .history-section { padding: 16px 4px 70px; }
     .history-filters { overflow-x: auto; padding-bottom: 6px; }
     .history-item { padding: 12px; }
+    /* The status line is the first thing to go on a narrow screen: the page number is
+     * recoverable from the buttons, whereas a four-column grid is not. */
+    .history-pagination { grid-template-columns: 1fr 1fr; }
+    .history-page-status { grid-column: 1 / -1; grid-row: 1; }
 }
 
 .toast {
@@ -4794,6 +5045,63 @@ textarea.form-input { min-height: 128px; resize: vertical; line-height: 1.55; }
 .toast .toast-title { font-weight: 700; font-size: var(--step--1); color: var(--heading); }
 .toast .toast-message { font-size: var(--step--2); color: var(--ink-soft); line-height: 1.45; overflow-wrap: anywhere; }
 
+/* A toast with somewhere to go.
+ *
+ * The button is the whole message, not a small "open" link tucked in the corner, because the
+ * thing a user is aiming at after reading "your deposit landed" is the message itself. The
+ * styling exists to erase the button entirely -- no border, no background, inherited font and
+ * colour -- so the only thing that reads as a control is the affordance line and the hover.
+ *
+ * A grid rather than a flex row so the destination label sits *under* the message, aligned with
+ * it. As a third flex child it would compete with the message for the width of one line, and a
+ * long notice plus a label is exactly the case where that looks broken.
+ */
+.toast .toast-action {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    grid-template-rows: auto auto;
+    column-gap: 12px;
+    row-gap: 4px;
+    align-items: start;
+    flex: 1 1 auto;
+    min-width: 0;
+    /* The reset. A button brings its own background, border, font, and text alignment, and every
+     * one of them is wrong here. */
+    appearance: none;
+    background: none;
+    border: 0;
+    padding: 0;
+    margin: 0;
+    font: inherit;
+    color: inherit;
+    text-align: left;
+    cursor: pointer;
+    border-radius: var(--r-sm);
+}
+
+.toast .toast-action .toast-icon { grid-column: 1; grid-row: 1 / span 2; }
+.toast .toast-action .toast-body { grid-column: 2; grid-row: 1; }
+
+.toast .toast-action-label {
+    grid-column: 2;
+    grid-row: 2;
+    justify-self: start;
+    font-size: var(--step--2);
+    font-weight: 600;
+    color: var(--accent);
+    text-decoration: underline;
+    text-underline-offset: 2px;
+}
+
+/* The hover is on the button rather than on the label, so the whole card responds. It is a
+ * background tint rather than a border change because the card already has a border and
+ * changing it would move the box the eye is tracking. */
+.toast.is-link:hover .toast-action { background: color-mix(in srgb, var(--accent) 7%, transparent); }
+.toast.is-link .toast-action:focus-visible {
+    outline: 2px solid var(--coral-500);
+    outline-offset: 2px;
+}
+
 .toast .toast-close {
     flex: 0 0 auto;
     margin-left: 8px;
@@ -4856,6 +5164,17 @@ textarea.form-input { min-height: 128px; resize: vertical; line-height: 1.55; }
     .button, .icon-button, .amount-presets button, .choice, .deposit-method-option,
     .auth-mode-button, .start-button, .max-button, .deposit-method-options button,
     .history-reopen { min-height: 48px; }
+    .history-cancel { min-height: 48px; }
+    /* A disclosure summary is a control by every measure that matters here -- it is focusable
+     * and it changes state on activation -- so it gets the same 48px hit area as the buttons
+     * above it rather than the 20px its text size would otherwise give it. */
+    .history-detail-summary { min-height: 48px; display: flex; align-items: center; }
+    /* The block-explorer links on a receipt. The 40px base is a mouse target; on a touch device
+     * the same link needs the same 48px as every other control here, for the same reason: the
+     * base is sized for a pointer, and the override has to come after it. */
+    .receipt-link { min-height: 48px; }
+    .history-detail-link { min-height: 48px; }
+    .history-item-receipt { min-height: 48px; display: inline-flex; align-items: center; }
     .catalog-filters .form-control, .search-field input, .sort-field select { height: 48px; }
     .form-control { min-height: 48px; }
 

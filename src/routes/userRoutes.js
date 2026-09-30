@@ -8,6 +8,8 @@ const { rateLimitByIp } = require('../services/security');
 const { register: registerMethod } = require('./methodRegistry');
 const emailPreferences = require('../services/emailPreferences');
 const profile = require('../services/profile');
+const withdrawalResolution = require('../services/withdrawalResolution');
+const { explorerLinks } = require('../services/explorerLinks');
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -20,6 +22,45 @@ const profile = require('../services/profile');
  * the same bug from two directions.
  */
 const HISTORY_PAGE_SIZE = 20;
+
+/**
+ * The most rows `/history` will return, whatever the caller asks for.
+ *
+ * The endpoint takes a `limit` so the transactions page can paginate and the CSV export can
+ * cover more than one screen, and an unbounded value would let a caller pull an entire lifetime
+ * of ledger rows in a single request. This is a ceiling on the response, not a policy about how
+ * much history exists.
+ */
+const HISTORY_MAX_LIMIT = 500;
+
+/**
+ * The `transaction_type` values `/history` will filter on.
+ *
+ * A closed list, so `?type=` is matched against a known vocabulary rather than passed through
+ * to decide what comes back. The client renders exactly these five tabs, and the endpoint
+ * answering "no rows" for anything else is what lets the page count stay truthful: a filter the
+ * server does not recognise cannot contribute a `X-Total-Count` that disagrees with the rows.
+ *
+ * Kept next to the pagination constants because both exist for the same reason -- the endpoint
+ * is asked questions about a list rather than only being asked for the list.
+ */
+const HISTORY_FILTER_TYPES = new Set(['deposit', 'withdrawal', 'conversion', 'refund', 'adjustment']);
+
+/**
+ * Reads a positive integer from a query parameter, ignoring anything else.
+ *
+ * Both parameters are attacker-controlled, so neither is interpolated into the SQL as text: they
+ * are returned as numbers and still bound as `$2`/`$3`, and the range check is what stops a
+ * negative or absurd value reaching the database at all. `Number.parseInt('10abc')` is 10, which
+ * is lenient in a way that is fine for a display size and wrong for anything that mattered --
+ * so the whole string is required to be digits instead.
+ */
+function positiveIntFromQuery(value, fallback, max) {
+    if (typeof value !== 'string' || !/^\d{1,9}$/.test(value.trim())) return fallback;
+    const parsed = Number(value.trim());
+    if (!Number.isSafeInteger(parsed) || parsed < 1) return fallback;
+    return Math.min(parsed, max);
+}
 
 /**
  * A Postgres BIGINT holds up to 19 digits. A longer numeric string is not a
@@ -103,8 +144,88 @@ router.use((req, res, next) => {
  * which is a different question and can legitimately be a tunnel while the
  * user is on localhost.
  */
-function withReceiptUrl(deposit) {
-    return { ...deposit, receipt_url: `/receipt/deposit/${deposit.id}` };
+function withDepositDetails(deposit) {
+    return {
+        ...deposit,
+        receipt_url: `/receipt/deposit/${deposit.id}`,
+        // A deposit gets an address link and never a transaction link, and that is a statement
+        // about what the provider tells us rather than an omission. The NOWPayments callback
+        // carries the payment id, the amounts and the status -- and no on-chain transaction hash
+        // for an incoming payment, because the provider is the one transacting, not us. So the
+        // only honest explorer link is to the address, which is what lets someone watch the
+        // payment they just sent actually land.
+        explorer: explorerLinks({
+            assetCode: deposit.asset_code,
+            network: deposit.network,
+            address: deposit.deposit_address
+        })
+    };
+}
+
+/**
+ * The same for a withdrawal, plus the block-explorer links.
+ *
+ * A withdrawal had no receipt at all, which is why every withdrawal notification pointed at the
+ * account page: a user told their money had been sent, who then had to find the one row it was
+ * in among a list of a dozen. The explorer links are the other half -- `provider_reference` is
+ * the only place the on-chain transaction is recorded, and it was in a JSON field nobody
+ * outside the operator tools could read, so the one fact a user wants when a payout lands (did
+ * it actually go, and can I check) was not available to them.
+ *
+ * A `pending` withdrawal is not a payment, so it gets no receipt link here either. Sending
+ * someone a receipt for a request that has not been attempted says the transaction exists when
+ * there is nothing yet to look up.
+ */
+function withWithdrawalDetails(withdrawal) {
+    const settled = ['paid', 'failed', 'cancelled'].includes(String(withdrawal.status || '').toLowerCase());
+    const explorer = explorerLinks({
+        assetCode: withdrawal.asset_code,
+        network: withdrawal.network,
+        transactionReference: withdrawal.provider_reference,
+        address: withdrawal.payout_address || withdrawal.payment_address
+    });
+    return {
+        ...withdrawal,
+        ...(settled ? { receipt_url: `/receipt/withdrawal/${withdrawal.id}` } : {}),
+        explorer
+    };
+}
+
+/**
+ * The deposit or withdrawal a ledger row is about, or null.
+ *
+ * A ledger row is one row in a table shared by deposits, withdrawals, rewards, refunds and manual
+ * adjustments, and the only thing on it that points at a record is `source_id` -- which has
+ * three different shapes depending on which kind of row this is:
+ *
+ *   - a deposit credit carries `deposit_id` directly (migration 027), because `source_id` holds
+ *     the *provider's* payment id and so could never say which of our deposits it was;
+ *   - a withdrawal debit carries the bare withdrawal id, `87`;
+ *   - a refund carries `withdrawal:87`, prefixed.
+ *
+ * A client told to figure that out would be re-deriving it from three spellings, and would get
+ * it subtly wrong the day a fourth row type is added. It is resolved once, here, into a single
+ * typed reference, and the client only ever sees `{ kind, id }` or nothing.
+ *
+ * Null is a real and common answer: a reward, a demo reward, and a manual adjustment all have no
+ * record behind them, and a client that treated an unresolvable row as an error would be wrong
+ * about most of the rows it renders.
+ */
+function historyRecordFrom(row) {
+    if (row.deposit_id !== null && row.deposit_id !== undefined) {
+        return { kind: 'deposit', id: String(row.deposit_id) };
+    }
+    const source = String(row.source_id ?? '').trim();
+    if (source === '') return null;
+
+    if (row.transaction_type === 'withdrawal' || row.transaction_type === 'refund') {
+        const id = source.startsWith('withdrawal:') ? source.slice('withdrawal:'.length) : source;
+        // Only digits. `source` came from a column this app writes, but it is not a number and a
+        // non-numeric value would be interpolated into a client-built url; refusing it here keeps
+        // that from being the client's problem to discover.
+        return /^\d{1,19}$/.test(id) ? { kind: 'withdrawal', id } : null;
+    }
+    return null;
 }
 
 /** Classifies a database error so the same cause always produces the same status. */
@@ -361,7 +482,9 @@ router.get('/updates', async (req, res) => {
         const result = await pool.query(
             `SELECT u.balance, u.demo_balance, u.token_version,
                     (SELECT COALESCE(MAX(updated_at)::TEXT, '') FROM deposits WHERE user_id = u.id) AS deposits_at,
-                    (SELECT COALESCE(MAX(updated_at)::TEXT, '') FROM withdrawals WHERE user_id = u.id) AS withdrawals_at
+                    (SELECT COALESCE(MAX(updated_at)::TEXT, '') FROM withdrawals WHERE user_id = u.id) AS withdrawals_at,
+                    (SELECT COALESCE(MAX(created_at)::TEXT, '') FROM balance_transactions WHERE user_id = u.id) AS ledger_at,
+                    (SELECT COALESCE(MAX(id)::TEXT, '0') FROM balance_transactions WHERE user_id = u.id) AS ledger_id
              FROM users u
              WHERE u.id = $1`,
             [req.user.id]
@@ -371,7 +494,22 @@ router.get('/updates', async (req, res) => {
         }
 
         const row = result.rows[0];
-        const version = [row.deposits_at, row.withdrawals_at, row.balance, row.demo_balance, row.token_version].join('|');
+        // The ledger is part of the version for the same reason `balance` is: a reward credits
+        // the balance, but so does an operator correction, a bonus, or a migration, and the
+        // client cannot tell those apart from the balance alone. Including the ledger's latest
+        // row means a balance change that has no ledger row behind it still produces a new
+        // version, so the client sees it and can report it as unexplained rather than staying
+        // silent. `id` is included as well as `created_at` because two rows can share a
+        // timestamp and a manual correction is exactly the kind of write that does.
+        const version = [
+            row.deposits_at,
+            row.withdrawals_at,
+            row.balance,
+            row.demo_balance,
+            row.token_version,
+            row.ledger_at,
+            row.ledger_id
+        ].join('|');
 
         // `no-store` is not optional here. A cached poll result would report "unchanged"
         // after the deposit that just credited, which is the exact failure this endpoint
@@ -385,10 +523,16 @@ router.get('/updates', async (req, res) => {
             return res.status(304).end();
         }
 
-        const [deposits, withdrawals] = await Promise.all([
+        const [deposits, withdrawals, ledger] = await Promise.all([
             pool.query(
+                // `pay_amount` and `actually_paid` are the two sides of a short payment, and the
+                // client needs both to be able to say "0.0076 of 0.0083 SOL received" instead of
+                // only "waiting". A deposit the user is still funding is the one where silence
+                // is most expensive, because they are looking at the address to see whether the
+                // money arrived.
                 `SELECT id, amount, asset_code, currency_code, network, deposit_address,
-                        checkout_url, status, credited_at, created_at
+                        checkout_url, status, credited_at, created_at, updated_at,
+                        pay_amount, actually_paid, pay_currency, underpaid_at
                  FROM deposits
                  WHERE user_id = $1
                  ORDER BY created_at DESC, id DESC
@@ -396,8 +540,17 @@ router.get('/updates', async (req, res) => {
                 [req.user.id, HISTORY_PAGE_SIZE]
             ),
             pool.query(
+                // The payout columns are here, not only on `GET /api/user/withdrawals`, and that
+                // asymmetry is the bug this fixes. The live poll is what repaints the withdrawal
+                // list while a payout is moving, and it was returning a row with no
+                // `payout_status` -- so every withdrawal the user watched after the initial page
+                // load lost its progress line and fell back to reading "Processing" with nothing
+                // under it. The initial load looked right and the live updates did not, which is
+                // the worst shape a bug can take: it disappears on refresh.
                 `SELECT w.id, w.amount, w.payment_method, w.payment_address, w.asset_code, w.network,
-                        w.status, w.failure_reason, w.created_at, w.paid_at,
+                        w.status, w.failure_reason, w.created_at, w.paid_at, w.updated_at,
+                        w.payout_status, w.payout_submitted_at, w.payout_coin_amount, w.payout_fee_coin,
+                        w.payout_currency, w.payout_address, w.payout_error, w.provider_reference,
                         r.created_at AS refunded_at
                  FROM withdrawals w
                  LEFT JOIN balance_transactions r
@@ -405,7 +558,20 @@ router.get('/updates', async (req, res) => {
                         AND r.source_id = 'withdrawal:' || w.id::TEXT
                         AND r.user_id = w.user_id
                  WHERE w.user_id = $1
-                 ORDER BY w.created_at DESC
+                 ORDER BY w.created_at DESC, w.id DESC
+                 LIMIT $2`,
+                [req.user.id, HISTORY_PAGE_SIZE]
+            ),
+            // The reason a balance moved, which `balance` alone cannot express. Without it the
+            // client has to infer a cause from the size of a change, and the only cause it can
+            // name is "a completed offer" -- which is what a $10 row inserted by hand in the
+            // database was reported as. `is_demo` is included so a test reward is not announced
+            // as a real one.
+            pool.query(
+                `SELECT id, amount, transaction_type, source_id, description, is_demo, created_at
+                 FROM balance_transactions
+                 WHERE user_id = $1
+                 ORDER BY created_at DESC, id DESC
                  LIMIT $2`,
                 [req.user.id, HISTORY_PAGE_SIZE]
             )
@@ -415,8 +581,12 @@ router.get('/updates', async (req, res) => {
             version,
             balance: row.balance,
             demoBalance: row.demo_balance,
-            deposits: deposits.rows.map(withReceiptUrl),
-            withdrawals: withdrawals.rows
+            deposits: deposits.rows.map(withDepositDetails),
+            withdrawals: withdrawals.rows.map(withWithdrawalDetails),
+            // `balance_transactions` is also the name of the table, but the client already reads
+            // `deposits` and `withdrawals` as the two lists, so `transactions` is the consistent
+            // third member of that set rather than a table name leaking into an API shape.
+            transactions: ledger.rows
         });
     } catch (error) {
         return sendDatabaseFailure(res, 'Updates Error', error);
@@ -426,6 +596,70 @@ router.get('/updates', async (req, res) => {
 // ---------------------------------------------------------------------------
 // Withdrawal history
 // ---------------------------------------------------------------------------
+
+/**
+ * Why a cancel was refused, in the words the person who pressed the button should read.
+ *
+ * The refusals are separated because they are not the same problem. `already-sent` is the only
+ * one the app cannot resolve by itself: a payout was started, it may already be on-chain, and
+ * the balance has *not* been returned, so telling the user their money is coming back would be
+ * a lie about their balance. It is also the one they cannot fix, so it names what happens next
+ * rather than just refusing.
+ *
+ * `already-paid` is deliberately worded the same way whether the payout finished a second ago
+ * or a month ago: a user who asks to cancel wants to know where their money is, not how long it
+ * has been gone.
+ */
+const CANCEL_REFUSALS = {
+    'not-found': { status: 404, error: 'That withdrawal does not exist.' },
+    'already-paid': {
+        status: 409,
+        error: 'This withdrawal has already been paid, so it cannot be cancelled.'
+    },
+    'already-resolved': {
+        status: 409,
+        error: 'This withdrawal has already been closed. Your balance has already been updated.'
+    },
+    'already-sent': {
+        status: 409,
+        error: 'This withdrawal is already on its way and cannot be cancelled. '
+            + 'Your balance has not been refunded, because the transfer may still complete. '
+            + 'Support can confirm it for you.'
+    }
+};
+
+router.post('/withdrawals/:id/cancel', async (req, res) => {
+    const id = String(req.params.id);
+    if (!RECORD_ID_PATTERN.test(id)) {
+        // The id is malformed rather than absent, so it is reported as not-found rather than
+        // as a validation error that describes the shape of the id back to the caller.
+        return res.status(404).json({ error: 'That withdrawal does not exist.' });
+    }
+
+    try {
+        const result = await withdrawalResolution.cancelWithdrawalByUser(Number(id), req.user.id);
+
+        if (!result.changed) {
+            const refusal = CANCEL_REFUSALS[result.reason] || {
+                status: 409,
+                error: 'This withdrawal cannot be cancelled right now.'
+            };
+            return res.status(refusal.status).json({ error: refusal.error });
+        }
+
+        // The new balance is returned rather than left for the client to infer, because the
+        // client already holds a stale copy and the number it would otherwise show is the one
+        // thing the user is looking at when they ask whether the money came back.
+        return res.json({
+            cancelled: true,
+            withdrawalId: Number(id),
+            refunded: result.refunded,
+            balance: result.balance
+        });
+    } catch (error) {
+        return sendDatabaseFailure(res, 'Withdrawal cancel error', error);
+    }
+});
 
 router.get('/withdrawals', async (req, res) => {
     try {
@@ -440,11 +674,28 @@ router.get('/withdrawals', async (req, res) => {
         // the ledger rather than inferred from the status: a row edited outside
         // the app can say `failed` with no refund behind it, and telling the
         // user it was returned in that case would be a lie about their money.
+        // `cancellable` is computed here rather than left to the client. The client would have
+        // to reimplement the gate in `cancelWithdrawalByUser`, and the two copies would drift:
+        // a UI that offers Cancel for a payout already in flight is one click away from
+        // refunding a transfer that is still moving. One SQL expression, used by the one
+        // function that enforces it, is the only way they cannot disagree.
+        //
+        // It is deliberately the same six columns the gate checks, negated. A withdrawal with
+        // a claim, a status, a batch, a provider id, or a submitted timestamp has had the
+        // payout machinery touch it and is no longer the user's to cancel.
         const result = await pool.query(
             `SELECT w.id, w.amount, w.payment_method, w.payment_address, w.asset_code, w.network,
-                    w.status, w.failure_reason, w.created_at, w.paid_at,
-                    w.payout_status, w.payout_submitted_at,
-                    r.created_at AS refunded_at
+                    w.status, w.failure_reason, w.created_at, w.paid_at, w.updated_at,
+                    w.payout_status, w.payout_submitted_at, w.payout_coin_amount, w.payout_fee_coin,
+                    w.payout_currency, w.payout_address, w.payout_error, w.provider_reference,
+                    r.created_at AS refunded_at,
+                    (w.status = ANY($4)
+                     AND w.payout_claimed_at IS NULL
+                     AND w.payout_status IS NULL
+                     AND w.batch_id IS NULL
+                     AND w.payout_provider_id IS NULL
+                     AND w.payout_submitted_at IS NULL
+                     AND w.provider_reference IS NULL) AS cancellable
              FROM withdrawals w
              LEFT JOIN balance_transactions r
                     ON r.transaction_type = 'refund'
@@ -453,9 +704,14 @@ router.get('/withdrawals', async (req, res) => {
              WHERE w.user_id = $1
              ORDER BY w.created_at DESC, w.id DESC
              LIMIT $3`,
-            [req.user.id, WITHDRAWAL_REFUND_SOURCE_PREFIX, HISTORY_PAGE_SIZE]
+            [
+                req.user.id,
+                WITHDRAWAL_REFUND_SOURCE_PREFIX,
+                HISTORY_PAGE_SIZE,
+                [...withdrawalResolution.resolvableStatuses]
+            ]
         );
-        return res.json(result.rows);
+        return res.json(result.rows.map(withWithdrawalDetails));
     } catch (error) {
         return sendDatabaseFailure(res, 'Withdrawal history error', error);
     }
@@ -479,8 +735,8 @@ router.get('/withdrawals', async (req, res) => {
  * and "the money is on the balance" are the same thing only when the credit ran, and the person
  * reading is the one who cannot tell the two apart.
  */
-const DEPOSIT_COLUMNS = 'id, amount, pay_amount, expires_at, asset_code, currency_code, network, ' +
-    'deposit_address, checkout_url, status, credited_at, created_at';
+const DEPOSIT_COLUMNS = 'id, amount, pay_amount, actually_paid, pay_currency, underpaid_at, expires_at, ' +
+    'asset_code, currency_code, network, deposit_address, checkout_url, status, credited_at, created_at';
 
 router.get('/deposits', async (req, res) => {
     try {
@@ -493,7 +749,7 @@ router.get('/deposits', async (req, res) => {
             [req.user.id, HISTORY_PAGE_SIZE]
         );
         return res.json(await Promise.all(result.rows.map(async (row) => {
-            const deposit = withReceiptUrl(row);
+            const deposit = withDepositDetails(row);
             // A crypto deposit that is still awaiting payment is re-openable. The exact coin
             // amount and the deadline are read from the row (migration 013) rather than
             // recomputed, because the rate has moved since the deposit was created and the
@@ -535,9 +791,50 @@ router.get('/deposits/:id', async (req, res) => {
         if (result.rows.length === 0) {
             return res.status(404).json({ error: 'Deposit not found.' });
         }
-        return res.json(withReceiptUrl(result.rows[0]));
+        return res.json(withDepositDetails(result.rows[0]));
     } catch (error) {
         return sendDatabaseFailure(res, 'Deposit lookup error', error);
+    }
+});
+
+/**
+ * One withdrawal, for its own receipt screen.
+ *
+ * The counterpart to `GET /deposits/:id`, added with the withdrawal receipt page. The refund
+ * lookup is joined rather than queried, because whether the money came back is the single fact
+ * that decides how a receipt reads -- "Failed" and "Returned to your balance" are different
+ * claims about the user's money, and a receipt that showed the first without the second would
+ * be reporting a loss that did not happen.
+ *
+ * Scoped to the owner, and 404 rather than 403 for someone else's withdrawal, so the response
+ * does not confirm that the id exists.
+ */
+router.get('/withdrawals/:id', async (req, res) => {
+    const withdrawalId = String(req.params.id);
+    if (!RECORD_ID_PATTERN.test(withdrawalId)) {
+        return res.status(404).json({ error: 'Withdrawal not found.' });
+    }
+    try {
+        const result = await pool.query(
+            `SELECT w.id, w.amount, w.payment_method, w.payment_address, w.asset_code, w.network,
+                    w.destination_tag, w.status, w.failure_reason, w.created_at, w.paid_at, w.updated_at,
+                    w.payout_status, w.payout_submitted_at, w.payout_coin_amount, w.payout_fee_coin,
+                    w.payout_currency, w.payout_address, w.payout_error, w.provider_reference,
+                    r.created_at AS refunded_at
+             FROM withdrawals w
+             LEFT JOIN balance_transactions r
+                    ON r.transaction_type = 'refund'
+                    AND r.source_id = $2 || w.id::TEXT
+                    AND r.user_id = w.user_id
+             WHERE w.id = $1 AND w.user_id = $3`,
+            [withdrawalId, WITHDRAWAL_REFUND_SOURCE_PREFIX, req.user.id]
+        );
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'Withdrawal not found.' });
+        }
+        return res.json(withWithdrawalDetails(result.rows[0]));
+    } catch (error) {
+        return sendDatabaseFailure(res, 'Withdrawal lookup error', error);
     }
 });
 
@@ -569,18 +866,83 @@ router.get('/deposits/:id', async (req, res) => {
  * Nothing here touches the cash invariant `npm run audit:balance` relies on -- that query reads
  * the table with its own `is_demo IS NOT TRUE` filter and is unaffected by what this endpoint
  * returns.
+ *
+ * `limit` and `offset` exist because a fixed twenty rows cannot support a paginated list. The
+ * response is still a bare array, because two clients consume it -- the page and the CSV export
+ * -- and the count they need is carried in `X-Total-Count` instead of by changing the shape.
+ * A header rather than an envelope specifically so the CSV export, which iterates the body
+ * directly, keeps working unchanged.
+ *
+ * `type` narrows to one `transaction_type` and is filtered here rather than in the client for
+ * the same reason `limit` is honoured here: pagination over a client-side filter counts the
+ * wrong rows. Fetching one page of twenty and filtering it to deposits would show a page of
+ * three while the header reported the unfiltered total, and "page 2" would silently repeat or
+ * skip rows depending on where the deposits happened to fall. The filter and the window have to
+ * be applied to the same set for the count to mean anything.
+ *
+ * It is matched against a fixed list, and an unrecognised value is an error rather than a
+ * silent "no filter": the column is a bound parameter, never interpolated, so this is about
+ * answering the question the caller meant -- an unknown type is a client bug, and quietly
+ * returning everything would hide it behind a list that looks right.
  */
 router.get('/history', async (req, res) => {
+    const limit = positiveIntFromQuery(req.query.limit, HISTORY_PAGE_SIZE, HISTORY_MAX_LIMIT);
+    // No upper bound on the offset: it is not attacker-amplifiable the way an unbounded limit
+    // is, and refusing a large one would make a deep page unreachable rather than merely slow.
+    const offset = positiveIntFromQuery(req.query.offset, 0, Number.MAX_SAFE_INTEGER) || 0;
+
+    // `all` and an absent filter both mean "unfiltered". Anything else must be a type this
+    // endpoint can actually produce, so the list is derived from the same vocabulary the
+    // client renders rather than from whatever the column happens to contain.
+    const requestedType = String(req.query.type ?? '').trim().toLowerCase();
+    const type = requestedType === '' || requestedType === 'all' ? null : requestedType;
+    if (type !== null && !HISTORY_FILTER_TYPES.has(type)) {
+        return res.status(400).json({ error: 'Unknown history type.' });
+    }
+
     try {
+        // The count and the page come from one round trip via a window function, so the two
+        // cannot describe different moments -- which is what makes `X-Total-Count` trustworthy
+        // enough for the page number to be derived from it.
         const result = await pool.query(
-            `SELECT id, amount, transaction_type, source_id, description, is_demo, created_at
-             FROM balance_transactions
-             WHERE user_id = $1
-             ORDER BY created_at DESC, id DESC
-             LIMIT $2`,
-            [req.user.id, HISTORY_PAGE_SIZE]
+            `SELECT id, amount, transaction_type, source_id, description, is_demo, created_at,
+                    deposit_id,
+                    COUNT(*) OVER () AS total_count
+              FROM balance_transactions
+              WHERE user_id = $1
+                AND ($4::TEXT IS NULL OR transaction_type = $4)
+              ORDER BY created_at DESC, id DESC
+              LIMIT $2 OFFSET $3`,
+            [req.user.id, limit, offset, type]
         );
-        return res.json(result.rows);
+
+        // Reported on every response, including a page past the end where there are no rows. The
+        // client needs the true total to keep its page count honest, and deriving it from the
+        // rows returned would make the last page look like the only one.
+        //
+        // The window function cannot supply it on an empty page -- there are no rows to carry it
+        // -- so the count is asked for separately. Substituting the offset instead would be
+        // wrong in the one case a user reaches deliberately: a stale deep page would report a
+        // total equal to its own offset and invent a screenful of pages that do not exist.
+        let total = Number(result.rows[0]?.total_count ?? 0);
+        if (result.rows.length === 0 && offset > 0) {
+            const counted = await pool.query(
+                `SELECT COUNT(*)::INT AS total
+                   FROM balance_transactions
+                  WHERE user_id = $1
+                    AND ($2::TEXT IS NULL OR transaction_type = $2)`,
+                [req.user.id, type]
+            );
+            total = Number(counted.rows[0]?.total ?? 0);
+        }
+        res.set('X-Total-Count', String(total));
+
+
+        // The window column is stripped rather than left on the row. It is a count for the
+        // caller, not a field of a transaction, and both consumers of this body -- the page and
+        // the CSV export -- iterate the rows as transactions, so an extra field on each is a
+        // shape change disguised as a convenience.
+        return res.json(result.rows.map(({ total_count, ...row }) => ({ ...row, record: historyRecordFrom(row) })));
     } catch (error) {
         return sendDatabaseFailure(res, 'History Error', error);
     }
@@ -604,12 +966,14 @@ registerMethod(/^\/api\/user\/payment-options\/?$/, ['GET']);
 registerMethod(/^\/api\/user\/withdrawal-options\/?$/, ['GET']);
 registerMethod(/^\/api\/user\/deposits\/?$/, ['GET', 'POST']);
 registerMethod(/^\/api\/user\/deposits\/\d{1,19}\/?$/, ['GET']);
+registerMethod(/^\/api\/user\/withdrawals\/\d{1,19}\/?$/, ['GET']);
 registerMethod(/^\/api\/user\/email-preferences\/?$/, ['GET', 'PATCH']);
 
 router.post('/withdrawals/code', financialMutationLimit, payoutController.sendWithdrawalCode);
 router.post('/withdrawals', financialMutationLimit, payoutController.requestWithdrawal);
 registerMethod(/^\/api\/user\/withdrawals\/?$/, ['GET', 'POST']);
 registerMethod(/^\/api\/user\/withdrawals\/code\/?$/, ['POST']);
+registerMethod(/^\/api\/user\/withdrawals\/\d{1,19}\/cancel\/?$/, ['POST']);
 registerMethod(/^\/api\/user\/withdraw\/?$/, ['POST']);
 
 module.exports = router;

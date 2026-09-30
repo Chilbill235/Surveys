@@ -3,6 +3,7 @@ const { test } = require('node:test');
 const pool = require('../src/config/db');
 const nowPayments = require('../src/services/nowPayments');
 const autoPayouts = require('../src/services/autoPayouts');
+const payoutEmails = require('../src/services/payoutEmails');
 
 /**
  * These cover the decisions that move money, and they run without a database or a provider
@@ -115,6 +116,50 @@ test('a provider rejection is retried, but an undetermined answer never is', () 
 
     // No response at all -- a timeout or a dropped socket -- is the definition of unknown.
     assert.equal(autoPayouts.isUndetermined(new Error('socket hang up')), true);
+});
+
+/**
+ * A refusal over a `unique_external_id` we already sent is not a refusal of anything.
+ *
+ * The id is derived from the withdrawal id, so it is identical on every attempt to send the
+ * same row. Once any attempt has reached the provider the id is spent, and the create call
+ * answers `400 unique_external_id already exists` from then on. Read as an ordinary 4xx that
+ * releases the claim, and the row goes back to `pending`, is re-claimed, and is refused
+ * identically on every scheduler tick -- the balance debited and the money never moving, with
+ * the run reporting a `released` that means the opposite. The refusal is evidence a payout
+ * under this id exists, so the claim is held.
+ */
+test('a duplicate unique_external_id is held, never released, even though it arrives as a 400', () => {
+    // Exactly the shape the provider returned for withdrawal 74, including the generic
+    // `BAD_REQUEST` code that every refusal shares -- which is why the message is what is
+    // matched on.
+    const duplicate = new nowPayments.NowPaymentsError('NOWPayments /v1/payout returned 400.', {
+        status: 400,
+        path: '/v1/payout',
+        providerResponse: { status: false, statusCode: 400, code: 'BAD_REQUEST', message: 'unique_external_id already exists' }
+    });
+    assert.equal(autoPayouts.isUndetermined(duplicate), true);
+
+    // The message alone is enough, so a provider that omits the structured fields still
+    // classifies correctly rather than reverting to a releasable failure.
+    const messageOnly = new nowPayments.NowPaymentsError(
+        'unique_external_id already exists',
+        { status: 400, path: '/v1/payout' }
+    );
+    assert.equal(autoPayouts.isUndetermined(messageOnly), true);
+
+    // An ordinary 400 is still determinate. The fix must not turn every refusal into a hold,
+    // which would strand genuinely-rejected rows that an operator could safely re-queue.
+    const ordinaryRejection = new nowPayments.NowPaymentsError('NOWPayments /v1/payout returned 400.', {
+        status: 400,
+        path: '/v1/payout',
+        providerResponse: { code: 'BAD_REQUEST', message: 'Invalid payout address' }
+    });
+    assert.equal(autoPayouts.isUndetermined(ordinaryRejection), false);
+
+    // Unrelated 4xx keep their own meaning.
+    const notFound = new nowPayments.NowPaymentsError('missing', { status: 404, path: '/v1/payout' });
+    assert.equal(autoPayouts.isUndetermined(notFound), false);
 });
 
 test('the provider payout vocabulary is normalised, so a sent payout is not left looking unresolved', () => {
@@ -397,6 +442,191 @@ test('a failure after the batch exists is still held, never auto-failed', async 
         assert.equal(sqlMatching(statements, "transaction_type, source_id").length, 0);
         assert.equal(sqlMatching(statements, "SET status = 'failed'").length, 0);
     } finally {
+        nowPayments.submitPayoutBatch = originalSubmit;
+    }
+});
+
+/**
+ * The refusal that must never be released, because releasing it is what produced the loop.
+ *
+ * The provider answers `400 unique_external_id already exists` once an id has been spent, and
+ * the id is derived from the withdrawal id so it is spent for good. Releasing the claim on that
+ * answer returned the row to `pending`, the next run claimed it again, the next send was
+ * refused identically, and the scheduler repeated it indefinitely -- the log line reading
+ * `1 claimed, 1 resolved [74:released]` while the balance stayed debited and no money ever
+ * moved. The assertions below are that specific bug, and the double-payment hazard that
+ * releasing a row whose payout may already exist would create.
+ */
+test('a duplicate unique_external_id holds the claim instead of re-queueing it forever', async () => {
+    const claimed = [{ id: 74, payoutId: 'wd-74', address: 'bc1qexample', currency: 'btc', amount: 0.001 }];
+    const originalSubmit = nowPayments.submitPayoutBatch;
+    const originalError = console.error;
+    const logged = [];
+    try {
+        nowPayments.submitPayoutBatch = async () => {
+            throw new nowPayments.NowPaymentsError('NOWPayments /v1/payout returned 400.', {
+                status: 400,
+                path: '/v1/payout',
+                providerResponse: {
+                    status: false, statusCode: 400, code: 'BAD_REQUEST',
+                    message: 'unique_external_id already exists'
+                }
+            });
+        };
+        // The collision is the one refusal that needs a person, so it is reported rather than
+        // left to look like a proxy timeout that reconciliation resolves unattended.
+        console.error = (...args) => logged.push(args.join(' '));
+
+        const { result, statements } = await withRecordedDatabase(() => autoPayouts.submitClaimedPayouts(claimed));
+
+        // Held, and counted as uncertain -- the number an operator reads to find it.
+        assert.equal(result.uncertain, 1);
+        assert.equal(result.released, 0);
+        assert.equal(wroteValue(statements, 'SUBMISSION_UNKNOWN'), true);
+
+        // The loop itself: the row is not put back in the queue the claim query reads from.
+        assert.equal(sqlMatching(statements, "SET status = 'pending'").length, 0);
+        // Nor is it refunded, which would credit a user whose payout may already exist.
+        assert.equal(sqlMatching(statements, "SET status = 'failed'").length, 0);
+        assert.equal(sqlMatching(statements, 'UPDATE users SET balance').length, 0);
+        assert.equal(sqlMatching(statements, 'INSERT INTO balance_transactions').length, 0);
+
+        // The verdict says what happened, and the reason reaches the operator with the id they
+        // would search the dashboard for.
+        assert.equal(result.outcomes[0].verdict, 'held');
+        assert.ok(logged.some((line) => line.includes('wd-74')));
+    } finally {
+        console.error = originalError;
+        nowPayments.submitPayoutBatch = originalSubmit;
+    }
+});
+
+/**
+ * `400 Insufficient balance` is a refusal of the platform's own wallet, and re-queuing the user
+ * cannot fix it.
+ *
+ * The provider was reached, read the request, and declined because the money to send it is not
+ * in its account. That is determinate -- no payout exists, nothing moved -- so it is safe to
+ * refund. What made it a bug is the alternative: the row went back to `pending`, the next run
+ * claimed it, the next send was refused with the same words, and the scheduler repeated that
+ * forever. The log read `1 claimed, 1 resolved [87:released]` on every tick, with withdrawal 87's
+ * balance debited the entire time and no email, no refund, and no news.
+ *
+ * So the test is about the loop, not just the outcome: the row must not return to the queue the
+ * claim query reads from, and the money must go back.
+ */
+test('an insufficient provider balance refunds the withdrawal instead of re-queueing it', async () => {
+    const claimed = [{ id: 87, payoutId: 'wd-87', address: 'bc1qexample', currency: 'btc', amount: 0.001 }];
+    const originalSubmit = nowPayments.submitPayoutBatch;
+    const originalError = console.error;
+    const logged = [];
+    // A row in the state the claim left it: `processing`, no provider reference, so there is no
+    // evidence a payout was submitted and the refund will not be refused.
+    const row = {
+        id: 87, user_id: 1, amount: '20.00', status: 'processing', payout_status: 'CREATING',
+        provider_reference: null, payment_method: 'crypto', payment_address: 'bc1qexample',
+        asset_code: 'BTC', network: 'bitcoin', user_email: 'user@example.com', user_money_emails: true
+    };
+    try {
+        nowPayments.submitPayoutBatch = async () => {
+            throw new nowPayments.NowPaymentsError('NOWPayments /v1/payout returned 400.', {
+                status: 400,
+                path: '/v1/payout',
+                providerResponse: {
+                    status: false, statusCode: 400, code: 'BAD_REQUEST',
+                    message: 'Insufficient balance'
+                }
+            });
+        };
+        console.error = (...args) => logged.push(args.join(' '));
+
+        const { result, statements } = await withStubbedWithdrawals(
+            () => autoPayouts.submitClaimedPayouts(claimed),
+            { rows: [row] }
+        );
+
+        // The loop: not re-queued, and not parked as unknown. A withdrawal nobody can pay is
+        // neither a retry nor an open question.
+        assert.equal(sqlMatching(statements, "SET status = 'pending'").length, 0);
+        assert.equal(sqlMatching(statements, "SET payout_status = 'SUBMISSION_UNKNOWN'").length, 0);
+        assert.equal(result.released, 0);
+        assert.equal(result.uncertain, 0);
+
+        // The refund itself, which is the whole point: the balance comes back, and it comes back
+        // through the one path that also writes the ledger and emails the user.
+        assert.equal(result.abandoned, 1);
+        assert.equal(result.outcomes[0].verdict, 'abandoned');
+        assert.equal(sqlMatching(statements, "SET status = 'failed'").length, 1);
+        assert.equal(sqlMatching(statements, 'UPDATE users SET balance').length, 1);
+        assert.equal(sqlMatching(statements, 'INSERT INTO balance_transactions').length, 1);
+
+        // The operator is told this is a deployment fault, because it is the only payout failure
+        // they can fix by funding an account rather than by touching a user's withdrawal.
+        assert.ok(
+            logged.some((line) => /insufficient balance/i.test(line) && line.includes('87')),
+            'the shortfall was not reported to the operator with the withdrawal it affected'
+        );
+    } finally {
+        console.error = originalError;
+        nowPayments.submitPayoutBatch = originalSubmit;
+    }
+});
+
+/**
+ * A shortfall is a refusal of the payout account, not of the withdrawal, so the words the user
+ * reads must not be the ones the operator reads.
+ *
+ * The row keeps the full detail, because an operator searching the provider dashboard needs the
+ * endpoint and the status. The email gets the same fact in a sentence the user can act on, and
+ * an email naming a third party they have no relationship with is not something to send.
+ */
+test('the refund email does not quote the provider error back at the user', async () => {
+    const sent = [];
+    const originalSubmit = nowPayments.submitPayoutBatch;
+    const originalSend = payoutEmails.sendWithdrawalRefundedEmail;
+    const originalError = console.error;
+    const row = {
+        id: 87, user_id: 1, amount: '20.00', status: 'processing', payout_status: 'CREATING',
+        provider_reference: null, payment_method: 'crypto', payment_address: 'bc1qexample',
+        asset_code: 'BTC', network: 'bitcoin', user_email: 'user@example.com', user_money_emails: true
+    };
+    try {
+        nowPayments.submitPayoutBatch = async () => {
+            throw new nowPayments.NowPaymentsError('NOWPayments /v1/payout returned 400.', {
+                status: 400,
+                path: '/v1/payout',
+                providerResponse: {
+                    status: false, statusCode: 400, code: 'BAD_REQUEST',
+                    message: 'Insufficient balance'
+                }
+            });
+        };
+        payoutEmails.sendWithdrawalRefundedEmail = async (args) => {
+            sent.push(args);
+            return { sent: true };
+        };
+        console.error = () => {};
+
+        await withStubbedWithdrawals(
+            () => autoPayouts.submitClaimedPayouts([{ id: 87, payoutId: 'wd-87', address: 'bc1qexample', currency: 'btc', amount: 0.001 }]),
+            { rows: [row] }
+        );
+
+        assert.equal(sent.length, 1, 'the user was refunded without being told');
+        const { reason, to, amount } = sent[0];
+        assert.equal(to, 'user@example.com');
+        assert.equal(amount, '20.00');
+        // The internal string names a provider, an endpoint and an HTTP status.
+        assert.doesNotMatch(
+            String(reason || ''),
+            /\/v1\/payout|400|NOWPayments/i,
+            'the refund email quotes the raw provider error at the user'
+        );
+        // And it says the thing that matters: the money is back and this was not their doing.
+        assert.match(String(reason || ''), /returned to your balance/i);
+    } finally {
+        console.error = originalError;
+        payoutEmails.sendWithdrawalRefundedEmail = originalSend;
         nowPayments.submitPayoutBatch = originalSubmit;
     }
 });
@@ -842,6 +1072,55 @@ test('reconciliation settles a payout whose callback never arrived', async () =>
             }
         );
         assert.equal(sqlMatching(statements, "SET status = 'paid'").length, 1, 'the read-back state must be applied, not just logged');
+    } finally {
+        nowPayments.getPayoutStatus = originalGetPayoutStatus;
+    }
+});
+
+/**
+ * The reference is the proof the money moved, and a payout whose `batch_id` was never stored
+ * used to record the literal string `batch:`.
+ *
+ * That value looks like a reference and resolves to nothing, so it is worse than none: it
+ * satisfies the "marking a withdrawal paid requires the reference that proves it" rule while
+ * proving nothing at all. The provider's own payout id is always available to the
+ * reconciliation pass -- it is what the lookup was made with -- so the reference can always
+ * name something real.
+ */
+test('a reconciled payout records a reference that can actually be looked up', async () => {
+    const originalGetPayoutStatus = nowPayments.getPayoutStatus;
+    const cases = [
+        {
+            label: 'no batch id stored, no hash reported',
+            pending: { id: 7, batch_id: null, payout_provider_id: '5007985324', payout_status: 'CREATING', payout_claimed_at: null },
+            payout: { payout_status: 'FINISHED' },
+            expected: 'payout:5007985324'
+        },
+        {
+            label: 'an on-chain hash is preferred over the ids',
+            pending: { id: 7, batch_id: 'batch-1', payout_provider_id: '5007985324', payout_status: 'SENDING', payout_claimed_at: null },
+            payout: { payout_status: 'FINISHED', payout_hash: 'X5jr18jvqAbZ8WVUTT9YXvPqq5rAXwMLaWC9dEK' },
+            expected: 'X5jr18jvqAbZ8WVUTT9YXvPqq5rAXwMLaWC9dEK'
+        },
+        {
+            label: 'a hash nested under result is still found',
+            pending: { id: 7, batch_id: 'batch-1', payout_provider_id: '5007985324', payout_status: 'SENDING', payout_claimed_at: null },
+            payout: { result: { payout_status: 'FINISHED', txid: 'NestedHash1111111111111111111111111111111' } },
+            expected: 'NestedHash1111111111111111111111111111111'
+        }
+    ];
+
+    try {
+        for (const item of cases) {
+            nowPayments.getPayoutStatus = async () => item.payout;
+            const { statements } = await withStubbedWithdrawals(
+                () => autoPayouts.reconcilePayouts({ limit: 5, logger: { log() {}, warn() {} } }),
+                { rows: [], pending: [item.pending] }
+            );
+            const paid = sqlMatching(statements, "SET status = 'paid'");
+            assert.equal(paid.length, 1, `${item.label}: the payout must be marked paid`);
+            assert.equal(paid[0].params[0], item.expected, item.label);
+        }
     } finally {
         nowPayments.getPayoutStatus = originalGetPayoutStatus;
     }

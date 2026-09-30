@@ -210,11 +210,48 @@ async function submitClaimedPayouts(claimed) {
         // judgement about whether the money went -- there was no payout to go -- and it is the
         // only outcome that gets the user their balance back and an email saying so, instead
         // of a row stuck in `processing` with the money already debited and nothing sent.
-        if (failedBeforeSending(error)) {
-            return await abandonClaimedPayouts(claimed, detail, explanation);
+        //
+        // The funds shortfall is here, beside the auth failure, for the same reason and with the
+        // same consequences: a determinate refusal that will be refused identically forever if
+        // the row is re-queued, so the user is refunded and told rather than left waiting on a
+        // platform account that has nothing to send. It is checked after `failedBeforeSending`
+        // because that is the strictly stronger statement -- a call that never got as far as
+        // being authenticated cannot be refused for a balance it was never read against.
+        if (failedBeforeSending(error) || isProviderFundsShortfall(error)) {
+            // The two need different words. An auth failure means the deployment could not
+            // reach the provider at all, which is our problem to fix silently; a funds
+            // shortfall means the provider was reached and could not pay, and the user is owed
+            // both the refund and an explanation of why it is not our fault. The operator keeps
+            // the full detail on the row either way.
+            return await abandonClaimedPayouts(
+                claimed,
+                detail,
+                explanation,
+                isProviderFundsShortfall(error)
+                    ? 'We were not able to send this withdrawal because our payment provider could not '
+                      + 'complete the transfer at that time. Nothing left your account, and the full amount '
+                      + 'has been returned to your balance.'
+                    : null
+            );
         }
 
         const unknown = isUndetermined(error);
+        // Called out separately because it is the one refusal an operator cannot fix by
+        // re-running. The claim is held, so the loop stops, but the row will not settle on its
+        // own either: a duplicate id means the provider already holds a payout under this key,
+        // and the only way to learn that payout's batch id is the dashboard. Left as an ordinary
+        // `held` line it would be indistinguishable from a proxy timeout that reconciliation
+        // resolves by itself.
+        if (isDuplicateExternalId(error)) {
+            console.error(
+                `Payout submission for ${claimed.map((entry) => entry.id).join(', ')} was refused ` +
+                'because the provider already holds a payout under this unique_external_id. The ' +
+                'claims are held rather than released so the withdrawal cannot be sent twice. ' +
+                `Find the existing payout on the provider dashboard (external id ` +
+                `${claimed.map((entry) => entry.payoutId).join(', ')}) and settle it there, or ` +
+                'release the claim by hand once you have confirmed no payout exists.'
+            );
+        }
         await releaseOrHoldClaims(claimed, unknown ? 'SUBMISSION_UNKNOWN' : 'SUBMIT_FAILED', detail);
         const outcomes = claimed.map((entry) =>
             summarizeOutcome(entry, {
@@ -333,8 +370,11 @@ async function submitClaimedPayouts(claimed) {
  * Per-row rather than all-or-nothing, because a batch can straddle the failure: `reverseWithdrawal`
  * refuses a row that is already paid or already carries a provider reference, and that refusal
  * is a correct outcome to report rather than an error to throw over the rows that did resolve.
+ *
+ * `userReason` is what the refunding email says, and it is optional because not every caller
+ * has a phrasing that is better than the raw detail -- see `reverseWithdrawal`.
  */
-async function abandonClaimedPayouts(claimed, detail, providerMessage) {
+async function abandonClaimedPayouts(claimed, detail, providerMessage, userReason) {
     const outcomes = [];
     let abandoned = 0;
     let held = 0;
@@ -344,7 +384,11 @@ async function abandonClaimedPayouts(claimed, detail, providerMessage) {
         if (id === null) continue;
 
         try {
-            const result = await reverseWithdrawal(id, detail.slice(0, 500));
+            const result = await reverseWithdrawal(id, detail.slice(0, 500), {
+                // Omitted entirely when the caller has nothing better to say, so the operator
+                // detail reaches the email rather than a blank callout.
+                ...(userReason ? { emailReason: userReason } : {})
+            });
             if (result.changed) {
                 abandoned += 1;
                 outcomes.push(summarizeOutcome(entry, {
@@ -381,6 +425,22 @@ async function abandonClaimedPayouts(claimed, detail, providerMessage) {
     }
 
     logPayoutRun('submitClaimedPayouts', claimed, outcomes);
+
+    // The one abandonment that is a deployment fault rather than a per-withdrawal outcome, and
+    // the only one an operator can fix from the outside. Logged as an error and by amount,
+    // because every other withdrawal this run touches will fail the same way until the
+    // provider's own account is funded, and the user-visible consequence of that should be a
+    // queue of refunded requests rather than a queue of stuck ones.
+    if (userReason) {
+        console.error(
+            'Payout account has insufficient balance: '
+            + `${abandoned} withdrawal(s) were refunded to their users (`
+            + `${claimed.map((entry) => entry.id).join(', ')}) because the provider refused to send. `
+            + 'Fund the NOWPayments payout account. Until it is funded, every payout run refunds the '
+            + 'withdrawals it attempts rather than leaving them queued.'
+        );
+    }
+
     return {
         submitted: 0,
         released: 0,
@@ -505,7 +565,100 @@ function payoutIpnCallbackUrl() {
  */
 function isUndetermined(error) {
     if (!(error instanceof nowPayments.NowPaymentsError)) return true;
+    // A refusal over a `unique_external_id` we already sent is the one 4xx that is not
+    // determinate. See `isDuplicateExternalId` for why, and why it is handled by exclusion
+    // rather than by a status check: the status is 400, the same as every other refusal.
+    if (isDuplicateExternalId(error)) return true;
     return !(error.status >= 400 && error.status < 500);
+}
+
+/**
+ * Whether the provider refused a create because our `unique_external_id` is already taken.
+ *
+ * This is the answer to a question nobody asked. The id is `wd-<withdrawal id>`, derived from
+ * the row rather than generated, so it is stable across every attempt to send the same
+ * withdrawal -- which is the point: it is what makes a repeated send impossible. The cost is
+ * that once a single attempt has reached the provider, the id is spent forever, and the create
+ * call answers `400 unique_external_id already exists` from then on.
+ *
+ * The failure mode that follows is the reason this is checked separately. Read as an ordinary
+ * 4xx, "nothing was sent, release the claim" is exactly wrong: the refusal is *evidence that a
+ * payout under this id exists*. Releasing sends the row back to `pending`, the next run claims
+ * it, the next send is refused identically, and the loop repeats on every scheduler tick --
+ * `1 claimed, 1 resolved [74:released]` forever, with the balance debited and the money never
+ * moving. It is also a double-payment hazard in the general case, because a row released to
+ * `pending` is a row the app will happily send under a different id once one is supplied.
+ *
+ * The claim therefore stays held, exactly as it would for a transport failure whose answer is
+ * unknown, and reconciliation settles it from whatever the provider reports. It is not treated
+ * as a batch that provably never existed, because a duplicate id is proof of the opposite.
+ *
+ * Matched on the provider's own words rather than on a code, because the code is the generic
+ * `BAD_REQUEST` that every refusal shares. Both the structured code and the message are checked
+ * so a reworded message alone cannot silently reclassify this back into a releasable failure.
+ */
+function isDuplicateExternalId(error) {
+    if (!(error instanceof nowPayments.NowPaymentsError)) return false;
+    if (error.path && String(error.path).trim().toLowerCase() !== '/v1/payout') return false;
+
+    const provider = error.providerResponse;
+    const haystack = [
+        provider?.code,
+        provider?.message,
+        provider?.error,
+        error.message
+    ]
+        .map((value) => String(value ?? '').toLowerCase())
+        .join(' ');
+
+    return haystack.includes('unique_external_id') && haystack.includes('already exists');
+}
+
+/**
+ * Whether the provider refused because its own payout wallet could not cover the payout.
+ *
+ * `POST /v1/payout` answers `400 Insufficient balance` when the platform's own balance is below
+ * the amount being sent. It is a determinate refusal -- the provider read the request and
+ * declined it, so no payout exists and no money moved -- but it is the one 4xx that must not
+ * be released back to `pending`, and the reason is about time rather than about safety.
+ *
+ * The balance being short is a fact about the platform account, and the fix for it is an
+ * operator topping that account up. Re-queuing the user's withdrawal does not touch it. So the
+ * row goes back to `pending`, the next scheduler tick claims it, the next send is refused with
+ * the same words, and the loop repeats forever -- `1 claimed, 1 resolved [87:released]` on every
+ * run, with the user's balance debited the whole time and nothing at all sent. A user watching
+ * their request sit in "processing" indefinitely is worse off than a user who has been told
+ * their money is back and can try again when the platform can actually pay.
+ *
+ * So this is treated as an abandonment rather than a release: `abandonClaimedPayouts` refunds
+ * the balance through `reverseWithdrawal`, which also writes the ledger row and sends the
+ * "your money is back" email, so the refund and the notification are the same event and cannot
+ * come apart.
+ *
+ * Matched on the provider's words for the same reason as `isDuplicateExternalId`: the code is
+ * the generic `BAD_REQUEST` every refusal shares, so only the message distinguishes this one.
+ * The `path` is checked because a shortfall on a *verification* call means something different
+ * from a shortfall on the create, and the create is the only place a batch was refused for lack
+ * of funds.
+ */
+function isProviderFundsShortfall(error) {
+    if (!(error instanceof nowPayments.NowPaymentsError)) return false;
+    if (error.path && String(error.path).trim().toLowerCase() !== '/v1/payout') return false;
+
+    const provider = error.providerResponse;
+    const haystack = [
+        provider?.code,
+        provider?.message,
+        provider?.error,
+        error.providerMessage,
+        error.message
+    ]
+        .map((value) => String(value ?? '').toLowerCase())
+        .join(' ');
+
+    return haystack.includes('insufficient balance')
+        || haystack.includes('insufficient funds')
+        || haystack.includes('not enough balance');
 }
 
 /**
@@ -805,7 +958,7 @@ async function applyPayoutCallback(body) {
         if (seen.has(key)) continue;
         seen.add(key);
 
-        await applyResolvedPayout(target, status, batchId, item?.error);
+        await applyResolvedPayout(target, status, batchId, item?.error, payoutReferenceFrom(item, batchId));
         applied += 1;
     }
 
@@ -843,7 +996,7 @@ async function withdrawalForBatch(batchId) {
  * the operator endpoints use -- which is what guarantees a `paid` withdrawal cannot be
  * refunded, and that a refund is a balance write plus a ledger row in one transaction.
  */
-async function applyResolvedPayout(withdrawal, status, batchId, error) {
+async function applyResolvedPayout(withdrawal, status, batchId, error, reference = null) {
     const current = normalisePayoutStatus(withdrawal.payout_status);
     if (current && resolvedPayoutStatuses.has(current)) {
         // Already final. Re-applying would be a second write, and a second refund is the
@@ -869,7 +1022,25 @@ async function applyResolvedPayout(withdrawal, status, batchId, error) {
     }
 
     if (status === nowPayments.PAYOUT_STATUSES.FINISHED) {
-        const result = await sendWithdrawal(withdrawal.id, `batch:${batchId}`);
+        // The reference is what support and the user are shown as proof the money moved, so it
+        // has to name something real. `batch:` with nothing after it is what a row whose
+        // `batch_id` was never stored used to record, and an empty-looking reference is worse
+        // than none: it looks like a value and cannot be looked up. The caller's reference wins
+        // when it has one (a transaction hash, or the individual payout id), and the batch id is
+        // only the last resort.
+        const resolved = reference || (batchId ? `batch:${batchId}` : null);
+        if (!resolved) {
+            return 'unchanged';
+        }
+        const result = await sendWithdrawal(withdrawal.id, resolved);
+        // The provider's own final state is written alongside the resolution, not left behind.
+        //
+        // `markWithdrawalPaid` closes the withdrawal but does not touch `payout_status`, so a
+        // payout settled by this path kept whatever progress state it last saw -- and the
+        // history row a user reads is built from `payout_status`, so a finished payout was
+        // still described as "Preparing your payout" long after the money had arrived. That
+        // was the visible half of the same stuck row this whole function exists to clear.
+        if (result.changed) await recordTerminalPayoutStatus(withdrawal.id, status);
         return result.changed ? 'sent' : 'unchanged';
     }
 
@@ -880,7 +1051,30 @@ async function applyResolvedPayout(withdrawal, status, batchId, error) {
             : 'The payout provider could not send this withdrawal.')
     );
     const result = await reverseWithdrawal(withdrawal.id, reason);
+    if (result.changed) await recordTerminalPayoutStatus(withdrawal.id, status);
     return result.changed ? 'refunded' : 'unchanged';
+}
+
+/**
+ * Stores the provider's final state against a withdrawal that has just been resolved.
+ *
+ * Guarded the same way as the progress write above, so a payout that some other path resolved
+ * in the meantime is not overwritten. Fails quietly: the withdrawal is already closed, so a
+ * history line that stays one step behind is a cosmetic problem, and throwing here would turn
+ * a settled payout into an error report about an unsettled one.
+ */
+async function recordTerminalPayoutStatus(withdrawalId, status) {
+    try {
+        await pool.query(
+            `UPDATE withdrawals
+             SET payout_status = $1, updated_at = NOW()
+             WHERE id = $2
+               AND (payout_status IS NULL OR payout_status NOT IN ${UNRESOLVED_PAYOUT_STATES})`,
+            [status, withdrawalId]
+        );
+    } catch (error) {
+        console.warn(`Could not record payout status ${status} for withdrawal ${withdrawalId}: ${error.message}`);
+    }
 }
 
 /**
@@ -947,7 +1141,7 @@ async function reconcilePayouts({ limit = 20, logger = console } = {}) {
         // A single-payout read may be flat, or may nest the payout under `result`/`payout`.
         // Read across the shapes rather than assuming one, because a wrong guess here reads
         // as "status unknown" and a payout that finished would look unresolved forever.
-        const status = payoutStatusFrom(payout);
+        const status = payoutStatusFrom(payout, lookupId);
         if (!status) {
             outcomes.push({ id: row.id, resolved: false, reason: 'status-unreadable' });
             continue;
@@ -957,7 +1151,8 @@ async function reconcilePayouts({ limit = 20, logger = console } = {}) {
             { id: row.id, payout_status: row.payout_status },
             status,
             row.batch_id || '',
-            payoutErrorFrom(payout)
+            payoutErrorFrom(payout, lookupId),
+            payoutReferenceFrom(payout, lookupId)
         );
         outcomes.push({ id: row.id, resolved: true, status, outcome });
         if (outcome === 'sent' || outcome === 'refunded') {
@@ -967,21 +1162,83 @@ async function reconcilePayouts({ limit = 20, logger = console } = {}) {
     return outcomes;
 }
 
-/** The payout status, wherever the provider chose to put it in the response. */
-function payoutStatusFrom(payout) {
+/**
+ * The individual payout record inside whatever the provider answered with.
+ *
+ * `GET /v1/payout/{id}` does not answer with the payout. It answers with the *batch* that
+ * contains it: `{ id: "<batch id>", createdAt, withdrawals: [ { id, status, hash, ... } ] }`,
+ * and it does so whether the id asked for is a batch id or a single payout id. So reading
+ * `status` off the top level finds nothing, the status reads as absent, and a payout that
+ * genuinely finished is reported as "status-unreadable" and left in `processing` forever --
+ * which is precisely the state reconciliation exists to clear.
+ *
+ * The entry is chosen by matching the id that was actually asked for. Falling back to "the
+ * only entry" is safe for a single-withdrawal batch, and a batch with several entries that
+ * somehow has no id match resolves to nothing rather than to an arbitrary member: reading
+ * one withdrawal's outcome off another withdrawal's record marks the wrong row paid, and a
+ * row wrongly stored as paid is then protected by the idempotency check, so the real outcome
+ * would be ignored when it did arrive.
+ */
+function payoutRecordFrom(payout, lookupId) {
     const source = payout?.result ?? payout?.payout ?? payout;
+    if (!source || typeof source !== 'object') return null;
+
+    const entries = Array.isArray(source.withdrawals) ? source.withdrawals : null;
+    if (!entries || entries.length === 0) return source;
+
+    const wanted = lookupId === null || lookupId === undefined ? '' : String(lookupId).trim();
+    if (wanted) {
+        const exact = entries.find((entry) => String(entry?.id ?? '').trim() === wanted);
+        if (exact) return exact;
+    }
+    return entries.length === 1 ? entries[0] : null;
+}
+
+/** The payout status, wherever the provider chose to put it in the response. */
+function payoutStatusFrom(payout, lookupId = null) {
+    const source = payoutRecordFrom(payout, lookupId) ?? payout;
     return normalisePayoutStatus(source?.payout_status ?? source?.status ?? payout?.status);
 }
 
 /** The provider's explanation of a failure, if it gave one. */
-function payoutErrorFrom(payout) {
-    const source = payout?.result ?? payout?.payout ?? payout;
+function payoutErrorFrom(payout, lookupId = null) {
+    const source = payoutRecordFrom(payout, lookupId) ?? payout;
     const value = source?.error ?? payout?.error;
     if (value === null || value === undefined) return null;
     if (typeof value === 'string') return value;
     // A structured error is rendered rather than JSON-stringified into the user's inbox.
     const message = value.message ?? value.error ?? null;
     return message ? String(message) : null;
+}
+
+/**
+ * The proof recorded against a withdrawal the provider says has finished.
+ *
+ * This is what the user's history shows and what support reads when someone asks where the
+ * money went, so it is ordered by how much it is worth to a human: the on-chain transaction
+ * hash first, because it is the one value that can be pasted into a block explorer, then the
+ * provider's own payout id, and only then the batch id.
+ *
+ * The batch id is last rather than first on purpose. It is the value this app had the most
+ * trouble obtaining -- it is the one field the create response did not spell the way the
+ * parser expected -- so a row whose `batch_id` is null was previously recorded with the
+ * literal string `batch:`, which reads like a reference and resolves to nothing. Falling
+ * through to the individual payout id means a reconciled payout always carries the id the
+ * provider dashboard shows.
+ */
+function payoutReferenceFrom(payout, lookupId) {
+    const source = payoutRecordFrom(payout, lookupId) ?? payout ?? {};
+    // `hash` is the field the provider actually sends on a finished payout, and the one its
+    // dashboard labels "Payout Hash". The longer spellings are kept because they are what the
+    // status endpoint uses for a different read, and a hash that cannot be pasted into a
+    // block explorer is not worth much as proof.
+    const hash = source?.hash ?? source?.payout_hash ?? source?.payoutHash ?? source?.txid
+        ?? source?.tx_id ?? source?.transaction_hash ?? source?.transactionHash;
+    if (typeof hash === 'string' && hash.trim()) return hash.trim();
+    const id = source?.id ?? payout?.id ?? lookupId;
+    if (id === null || id === undefined) return null;
+    const trimmed = String(id).trim();
+    return trimmed ? `payout:${trimmed}` : null;
 }
 
 /**

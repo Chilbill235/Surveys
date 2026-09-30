@@ -108,6 +108,25 @@ function renderFacts(deposit) {
         if (String(value).length > 34) dd.className = 'is-wrappable';
         list.append(dt, dd);
     }
+
+    // The explorer link to the address the customer paid. A deposit gets this and never a
+    // transaction link, because the provider's callback carries no on-chain hash for an incoming
+    // payment -- the provider is the one transacting. The address is what lets someone watch the
+    // money they just sent actually arrive, which is the reason to open a receipt twice.
+    const explorer = deposit.explorer || {};
+    if (explorer.addressUrl) {
+        const links = document.createElement('div');
+        links.className = 'receipt-links';
+        const link = document.createElement('a');
+        link.className = 'receipt-link';
+        link.href = explorer.addressUrl;
+        link.textContent = `View this address on ${explorer.explorerName}`;
+        link.target = '_blank';
+        link.rel = 'noopener noreferrer';
+        links.append(link);
+        list.append(links);
+    }
+
     facts.replaceChildren(list);
     facts.hidden = false;
 }

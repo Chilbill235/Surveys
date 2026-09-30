@@ -177,9 +177,32 @@ function isTrustedBaseUrl() {
 let cachedProxyDispatcher = null;
 let cachedProxyUrl = null;
 
+/**
+ * Set once the proxy has proved it cannot authenticate, and never cleared within a process.
+ *
+ * A 407 is not a blip. It is the proxy refusing the username or password in `FIXIE_URL`, and
+ * nothing about waiting changes the answer -- the credentials are wrong until an operator fixes
+ * them. Without this, every payout on every withdrawal run paid the full connection timeout,
+ * failed, and was reported as a transport failure, so one expired Fixie plan or one typo in
+ * `.env` took out the entire payout queue rather than degrading it.
+ *
+ * The fallback is a direct connection, not a refusal. If NOWPayments still has an IP whitelist
+ * the direct attempt is refused by the provider with a 403, which is a true answer and is
+ * logged as such; if the whitelist has been switched off, the direct attempt succeeds and
+ * payouts work again with no proxy at all. Either way the operator sees one clear line naming
+ * the cause instead of an identical failure repeated until someone reads the log.
+ */
+let proxyAuthFailed = false;
+
 function payoutProxyDispatcher() {
     const url = String(process.env.FIXIE_URL || '').trim();
     if (!url) return null;
+
+    // A deliberate opt-out, for a deployment that has turned NOWPayments' IP whitelist off and
+    // therefore has no use for a fixed-egress proxy. Checked before everything else so it works
+    // even when `FIXIE_URL` is still present in the environment, which is the common case: the
+    // variable outlives the need for it.
+    if (payoutProxyDisabled()) return null;
 
     // Not used outside production. The proxy exists for one reason: NOWPayments whitelists the
     // payout endpoints by IP, and a serverless host's outbound address moves on every cold
@@ -193,6 +216,8 @@ function payoutProxyDispatcher() {
     if (getBaseUrl() !== PRODUCTION_BASE_URL) {
         return null;
     }
+
+    if (proxyAuthFailed) return null;
 
     // Rebuild only if the URL changed. In practice it does not change within one
     // process, but this guards against a test that swaps it.
@@ -211,6 +236,41 @@ function payoutProxyDispatcher() {
         cachedProxyUrl = null;
         return null;
     }
+}
+
+/**
+ * Whether the operator has declared the proxy unnecessary.
+ *
+ * Named for the state it describes rather than the mechanism: the question an operator is
+ * answering is "NOWPayments no longer restricts payouts by IP", and the setting is how they say
+ * so. Treated as a tri-state string so an unset value behaves exactly as it always did.
+ */
+function payoutProxyDisabled() {
+    const value = String(process.env.NOWPAYMENTS_PAYOUT_PROXY || '').trim().toLowerCase();
+    return value === 'off' || value === 'false' || value === '0' || value === 'direct';
+}
+
+/**
+ * Records that the proxy refused its credentials, and says so once.
+ *
+ * Called from the request failure path rather than from the dispatcher, because the dispatcher
+ * cannot see the response -- `ProxyAgent` builds fine and the 407 arrives later, as a thrown
+ * error three levels down.
+ */
+function noteProxyAuthFailure() {
+    if (proxyAuthFailed) return;
+    proxyAuthFailed = true;
+    cachedProxyDispatcher = null;
+    cachedProxyUrl = null;
+    console.error(
+        'FIXIE_URL was rejected by the proxy (407). The username or password in that value is ' +
+        'wrong, or the Fixie plan has lapsed -- this will not resolve by retrying. Payout calls ' +
+        'will now go out directly for the rest of this process. If NOWPayments still restricts ' +
+        'payouts by IP, those direct calls will be refused with a 403 and FIXIE_URL must be ' +
+        'corrected; if the IP whitelist is switched off, payouts will work again with no proxy. ' +
+        'Either way the variable is not needed once the whitelist is off: set ' +
+        'NOWPAYMENTS_PAYOUT_PROXY=off to say so explicitly.'
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -254,12 +314,17 @@ function rateLimited(method, path, run) {
 
 /** An error that carries the provider's own explanation, which is the useful part. */
 class NowPaymentsError extends Error {
-    constructor(message, { status = 0, providerResponse = null, cause = null, path = null } = {}) {
+    constructor(message, { status = 0, providerResponse = null, cause = null, path = null, proxyUsed = null } = {}) {
         super(message);
         this.name = 'NowPaymentsError';
         this.status = status;
         this.providerResponse = providerResponse;
         this.cause = cause;
+        // Whether the request that produced this actually went through FIXIE_URL. Recorded rather
+        // than derived at log time, because `FIXIE_URL` being set and the request using it are
+        // different facts -- the dispatcher is skipped off the production base URL -- and a log
+        // that assumes they are the same sends the operator after the wrong component.
+        this.proxyUsed = proxyUsed;
         // The endpoint the call was making. Carried because the *stage* a payout failed at is
         // what decides whether it is safe to give up on: a request that never got past the
         // token exchange provably sent no money, while the same transport failure at the
@@ -382,7 +447,21 @@ async function request(method, path, {
         }));
     } catch (error) {
         if (error instanceof NowPaymentsError) throw error;
-        throw new NowPaymentsError(`NOWPayments request to ${path} could not be completed.`, { cause: error, path });
+        // A 407 from the proxy is the one transport failure that is worth acting on inside the
+        // request, because the answer cannot change on a retry and continuing to route every
+        // payout through it fails every payout. Detected from the whole cause chain because
+        // undici surfaces the status three levels below the error that is caught here.
+        if (viaProxy && dispatcher && mentionsProxyAuthFailure(error)) {
+            noteProxyAuthFailure();
+        }
+        throw new NowPaymentsError(`NOWPayments request to ${path} could not be completed.`, {
+            cause: error,
+            path,
+            // Recorded because `FIXIE_URL` being set is not the same question as whether this
+            // request used it, and a log line that answers the wrong one sends the operator to
+            // debug a proxy that was never touched.
+            proxyUsed: dispatcher !== null
+        });
     }
 
     const payload = await response.json().catch(() => null);
@@ -717,30 +796,83 @@ async function getPaymentStatus(paymentId) {
  * error as `cause`. That is the right shape for a thrown exception, but it is useless in a
  * log line: an operator reading "could not be completed" learns nothing, and the one detail
  * that would identify the fault -- a proxy that will not authenticate, a name that does not
- * resolve, a socket that was refused -- is a field away and gets discarded. The likeliest
- * cause of a transport failure on the payout endpoints is a misconfigured `FIXIE_URL`, so the
- * line also says whether the proxy is in play at all. Without that, "the proxy is broken" and
- * "there is no proxy and NOWPayments refused the address" look identical from outside.
+ * resolve, a socket that was refused -- is buried two fields down.
+ *
+ * The nesting is undici's, and it is three deep for a proxy failure:
+ *
+ *     TypeError: fetch failed
+ *       cause: Error "Request was cancelled."            <- no code, says nothing
+ *         cause: Error "Proxy response (407) !== 200 when HTTP Tunneling"   <- the answer
+ *
+ * Only the outermost two levels were read, so the deepest message -- the only one that names a
+ * cause -- was dropped and the operator was left with "Request was cancelled", which describes
+ * a symptom. The walk is now a loop with a depth cap rather than two hard-coded dereferences,
+ * so a future undici that adds or removes a level does not silently discard the answer again.
+ *
+ * `proxyUsed` is passed in rather than re-derived from the environment, because the environment
+ * is not the question. `FIXIE_URL` being set does not mean the request went through it: the
+ * dispatcher is skipped off the production base URL, and a log claiming otherwise sends the
+ * operator to debug a proxy that was never used while the real fault goes unexamined.
  */
-function describeTransportFailure(error) {
+function describeTransportFailure(error, { proxyUsed = null } = {}) {
     const parts = [];
-    const cause = error?.cause;
-    if (cause) {
-        const code = cause.code ? ` (${cause.code})` : '';
-        parts.push(`${cause.message || String(cause)}${code}`);
-        // Undici nests the proxy's own failure inside a wrapper whose message is frequently
-        // just "fetch failed", so the informative text is usually one level further down.
-        if (cause.cause?.message) parts.push(`underlying: ${cause.cause.message}`);
+    // Bounded so a self-referential cause chain cannot spin here.
+    let current = error?.cause;
+    for (let depth = 0; current && depth < 5; depth += 1) {
+        const message = typeof current.message === 'string' ? current.message.trim() : '';
+        // "Request was cancelled." is undici's generic wrapper and names no cause on its own.
+        // It is kept only if nothing more specific turns up, so a real reason is never lost to
+        // a more confident-sounding wrapper.
+        if (message && !/^request was cancelled\.?$/i.test(message)) {
+            const code = current.code ? ` (${current.code})` : '';
+            parts.push(`${message}${code}`);
+        }
+        current = current.cause;
     }
-    parts.push(payoutProxyConfigured()
+    if (parts.length === 0 && error?.message) parts.push(error.message);
+
+    // The flag the throwing `request` recorded, which is authoritative. The explicit option wins
+    // when given so a caller that already knows can say so.
+    const used = proxyUsed !== null
+        ? proxyUsed
+        : (typeof error?.proxyUsed === 'boolean' ? error.proxyUsed : payoutProxyDispatcher() !== null);
+    parts.push(used
         ? 'the request went out via FIXIE_URL'
-        : 'FIXIE_URL is unset, so the request went out directly');
+        : 'the request went out directly, without the proxy');
+
+    // A 407 from the proxy is a configuration fault with one specific fix, and the operator
+    // should not have to know what "HTTP Tunneling" means to act on it.
+    if (parts.some((part) => /\b407\b/.test(part))) {
+        parts.push('the proxy rejected FIXIE_URL\'s username or password -- check that value in .env');
+    }
     return parts.join('; ');
 }
 
 /** Whether the whitelisted proxy is configured for this process. */
 function payoutProxyConfigured() {
     return Boolean(String(process.env.FIXIE_URL || '').trim());
+}
+
+/**
+ * Whether a thrown error is the proxy refusing its credentials.
+ *
+ * The status is not on the error: undici reports a 407 to a CONNECT as a thrown
+ * `TypeError: fetch failed`, with the code buried in the cause chain
+ * (`Proxy response (407) !== 200 when HTTP Tunneling`). So the chain is walked rather than a
+ * field read, and the match is on the message text because there is no code to match on.
+ *
+ * Scoped to the tunnelling message deliberately. A bare "407" elsewhere in the chain could be
+ * the *provider* refusing a request, and treating that as a broken proxy would disable a working
+ * proxy on the strength of a 403-family answer from a different host.
+ */
+function mentionsProxyAuthFailure(error) {
+    let current = error;
+    for (let depth = 0; current && depth < 5; depth += 1) {
+        const message = typeof current.message === 'string' ? current.message : '';
+        if (/\b407\b/.test(message) && /tunnel|proxy|proxy_auth/i.test(message)) return true;
+        current = current.cause;
+    }
+    return false;
 }
 
 /**
@@ -763,6 +895,19 @@ let addressValidationFailureReported = false;
 function resetAddressValidationAvailability() {
     addressValidationUnavailableUntil = 0;
     addressValidationFailureReported = false;
+}
+
+/**
+ * Clears the proxy circuit breaker and its cached dispatcher.
+ *
+ * Exists for the same reason as the other resets: the breaker is process-wide state that a
+ * configuration change or a test cannot undo by itself, so an operator who fixes `FIXIE_URL` and
+ * restarts is fine, but a test asserting the breaker's behaviour needs a way back.
+ */
+function resetPayoutProxyState() {
+    proxyAuthFailed = false;
+    cachedProxyDispatcher = null;
+    cachedProxyUrl = null;
 }
 
 /**
@@ -932,7 +1077,14 @@ async function getPayoutMinimum(currency) {
                 if (!payoutMinimumRefusalReported) {
                     payoutMinimumRefusalReported = true;
                     payoutMinimumRefusalSeen = true;
-                    const viaProxy = Boolean(process.env.FIXIE_URL);
+                    // The flag the throwing request recorded, not the presence of the variable.
+                    // A 403 from a request that went out direct means this host's own address is
+                    // not on the whitelist, which is a different fix from "the proxy IPs are not
+                    // whitelisted" -- and the wrong advice sends the operator to a dashboard
+                    // entry that already has the right values in it.
+                    const viaProxy = typeof error.proxyUsed === 'boolean'
+                        ? error.proxyUsed
+                        : Boolean(process.env.FIXIE_URL);
                     console.warn(
                         `NOWPayments refused the payout-minimum endpoint (${error.providerMessage ?? error.message}). ` +
                         (viaProxy
@@ -1044,9 +1196,25 @@ async function submitPayoutBatch(entries, { logger = console, ipnCallbackUrl = n
     viaProxy: true,
 });
 
-    // The provider reports the batch under either spelling depending on version; both are
-    // read because the batch id is the only durable link back to our rows.
-    const batchId = result?.batch_withdrawal_id ?? result?.batchWithdrawalId ?? null;
+    // The provider reports the batch under whichever spelling its version uses, and the batch id
+    // is the only durable link back to our rows -- it is what makes the batch verifiable, and a
+    // batch that is created and never verified sends nothing at all. So every spelling seen in
+    // the wild is read, and `id` is in the list because that is the one the provider's own
+    // reference integrations read: NOWPayments' official SDK verifies with
+    // `batch_withdrawal_id: payout['id']`, taking the create response's top-level `id`.
+    //
+    // Reading only the two snake/camel spellings of `batch_withdrawal_id` meant a real create
+    // answered with `id` returned null here, `submitClaimedPayouts` took its "batch created but
+    // not verified" branch, and the batch sat in the provider holding the withdrawal until a
+    // human verified 2FA in the dashboard. The per-withdrawal ids in the same response were
+    // read correctly, which is what made the failure look like a provider problem rather than a
+    // parse one.
+    const batchId = result?.batch_withdrawal_id
+        ?? result?.batchWithdrawalId
+        ?? result?.batch_id
+        ?? result?.batchId
+        ?? result?.id
+        ?? null;
 
     // Per-entry results, when the provider sends them. Absent for some statuses, in which
     // case the batch id is all we have and reconciliation re-reads the batch.
@@ -1055,6 +1223,19 @@ async function submitPayoutBatch(entries, { logger = console, ipnCallbackUrl = n
 
     const unmatched = matches.reduce((count, item) => count + (item === null ? 1 : 0), 0);
     logger.log(`Submitted a NOWPayments payout batch${batchId ? ` ${batchId}` : ''} with ${list.length} withdrawal(s).`);
+    if (batchId === null) {
+        // Said out loud, loudly, because this is the difference between a payout that sends
+        // itself and a payout that waits for a human to type a 2FA code into the dashboard --
+        // and the symptom on its own ("the batch is in `creating`") points at the provider
+        // rather than at the parse. The top-level key names are the whole diagnosis, and they
+        // are the one thing that cannot be reconstructed from the database afterwards.
+        logger.error(
+            'NOWPayments created a payout batch but the response carried no batch id under any known ' +
+            `field, so the batch cannot be verified and will not be sent. The withdrawal ` +
+            `${list.map((entry) => entry.payoutId).join(', ')} must be verified by hand or settled by ` +
+            `reconciliation. Response top-level keys: ${Object.keys(result || {}).join(', ') || '(none)'}`
+        );
+    }
     if (unmatched > 0) {
         // Said out loud rather than swallowed. An unmatched entry still gets the batch id and
         // the conservative `WAITING` status, so it is safe; it just has to wait for
@@ -1502,5 +1683,14 @@ module.exports = {
 
     sortKeysDeep,
     verifyIpnSignature,
-    classifyIpnBody
+    classifyIpnBody,
+    // Exported because the value of a transport-failure log line is entirely in which cause it
+    // surfaces, and the nesting depth that decides that is an implementation detail of undici
+    // that a test is the right place to pin.
+    describeTransportFailure,
+    // The circuit breaker and the detector behind it, so the behaviour can be tested without a
+    // real proxy and the "is this a 407 or a provider refusal" distinction can be pinned.
+    resetPayoutProxyState,
+    mentionsProxyAuthFailure,
+    payoutProxyDisabled
 };

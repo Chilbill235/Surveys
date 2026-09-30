@@ -15,6 +15,7 @@ const { resolvePublicBaseUrl, isPubliclyReachable } = require('../services/publi
 // ---------------------------------------------------------------------------
 
 const RECONCILE_PATH = '/api/maintenance/reconcile-deposits';
+const RECONCILE_PAYOUTS_PATH = '/api/maintenance/reconcile-payouts';
 const IPN_DIAGNOSTICS_PATH = '/api/maintenance/ipn-diagnostics';
 const WITHDRAWALS_PATH = '/api/maintenance/withdrawals';
 const AUTO_PAYOUTS_PREFLIGHT_PATH = '/api/maintenance/payouts/preflight';
@@ -39,6 +40,7 @@ const MAX_PROVIDER_REFERENCE_LENGTH = 200;
  */
 const MAINTENANCE_METHODS = {
     reconcile: /^\/api\/maintenance\/reconcile-deposits\/?$/,
+    reconcilePayouts: /^\/api\/maintenance\/reconcile-payouts\/?$/,
     ipnDiagnostics: /^\/api\/maintenance\/ipn-diagnostics\/?$/,
     listWithdrawals: /^\/api\/maintenance\/withdrawals\/?$/,
     markPaid: /^\/api\/maintenance\/withdrawals\/\d{1,19}\/paid\/?$/,
@@ -228,6 +230,51 @@ async function handleReconcile(req, res) {
 }
 
 registerGetAndPost(RECONCILE_PATH, handleReconcile);
+
+// ---------------------------------------------------------------------------
+// Payout reconciliation
+// ---------------------------------------------------------------------------
+
+/**
+ * Scheduled recovery endpoint for payouts whose provider callback never arrived.
+ *
+ * This is the counterpart to `handleReconcile`, and it exists because deposits and payouts
+ * fail in the same way for the same reason -- the provider POSTs a callback to a URL that
+ * has to be publicly reachable -- but only deposits had an endpoint to recover them.
+ *
+ * The gap was not cosmetic. `reconcilePayouts` had been correct and tested the whole time,
+ * and `server.js` runs it on a timer, but the deployed app does not run `server.js`: Vercel
+ * serves `api/index.js`, which has no timer, so the in-process loop was a development-only
+ * safety net. A payout that finished on-chain with its callback undeliverable therefore left
+ * the withdrawal in `processing` with the balance already debited and the user told nothing,
+ * which is the exact state that generates a support ticket about missing money.
+ *
+ * It only ever reads from the provider and settles rows that are already claimed, so running
+ * it repeatedly is safe, and it needs no provider credentials beyond the ones reconciliation
+ * already uses.
+ */
+async function handleReconcilePayouts(req, res) {
+    if (!enforceAccess(req, res)) return;
+
+    try {
+        const autoPayouts = require('../services/autoPayouts');
+        const outcomes = await autoPayouts.reconcilePayouts({ limit: 50 });
+        const settled = outcomes.filter((o) => o.outcome === 'sent' || o.outcome === 'refunded');
+        return res.json({
+            ok: true,
+            summary: {
+                examined: outcomes.length,
+                settled: settled.length,
+                outcomes
+            }
+        });
+    } catch (error) {
+        console.error('Scheduled payout reconciliation failed:', error.message);
+        return res.status(500).json({ ok: false, error: 'Payout reconciliation failed.' });
+    }
+}
+
+registerGetAndPost(RECONCILE_PAYOUTS_PATH, handleReconcilePayouts);
 
 // ---------------------------------------------------------------------------
 // IPN diagnostics

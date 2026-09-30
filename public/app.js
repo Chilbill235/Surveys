@@ -125,10 +125,10 @@ const depositState = { options: null, method: 'crypto' };
  * Same interface as the `Set` it replaces (`has` / `add`), so the call sites are unchanged and
  * there is one place that owns the storage.
  */
-const CREDITED_SEEN_KEY = 'offerNetworkCreditedDepositsSeen';
-// Bounded so a long-lived tab cannot grow the entry without limit. Only the most recent
-// credits need remembering: anything older has long since been acknowledged, and the set is
-// only consulted to avoid repeating something the user has already seen.
+const CREDITED_SEEN_KEY = 'offerNetworkDepositStatesSeen';
+// Bounded so a long-lived tab cannot grow the entry without limit. Only the most recent events
+// need remembering: anything older has long since been acknowledged, and the set is only
+// consulted to avoid repeating something the user has already seen.
 const CREDITED_SEEN_LIMIT = 50;
 
 /** Session storage throws rather than returning null when it is disabled or full. */
@@ -146,12 +146,26 @@ function readCreditedSeen() {
 
 const creditedSeen = readCreditedSeen();
 
-const creditedDepositsSeen = {
-    has(id) {
-        return creditedSeen.has(String(id));
+/**
+ * Whether a deposit has already been announced in a given state, and marks it seen.
+ *
+ * Keyed on the state as well as the id, not just the id, and that is what lets a *failed* deposit
+ * be announced as well as a credited one. Keyed on the id alone, the first announcement for a
+ * deposit consumes the entry and every later state of the same deposit is silent -- so a deposit
+ * that expired after being announced as pending, or failed after the user was told nothing, was
+ * never reported at all. Those are the events a user most needs to hear about, and they are the
+ * ones the id-only key swallowed.
+ *
+ * Same storage, same lifetime and the same trimming as the withdrawal states, deliberately: two
+ * mechanisms that differ in one respect each is how a repeat gets announced on one path and
+ * suppressed on the other.
+ */
+const depositStateSeen = {
+    has(id, state) {
+        return creditedSeen.has(`${String(id)}:${String(state)}`);
     },
-    add(id) {
-        creditedSeen.add(String(id));
+    add(id, state) {
+        creditedSeen.add(`${String(id)}:${String(state)}`);
         // Most recent last, so trimming from the front drops the oldest.
         if (creditedSeen.size > CREDITED_SEEN_LIMIT) {
             for (const stale of creditedSeen) {
@@ -168,6 +182,66 @@ const creditedDepositsSeen = {
         }
     }
 };
+
+/**
+ * The newest moment this browser had already told the user about, or null.
+ *
+ * This is the piece that makes "announce it once" survive a new tab, and it is the reason the
+ * two sets above are not enough on their own. `sessionStorage` is scoped to one tab, so it is
+ * empty the moment a user opens a second tab -- and with an empty set, the first poll after
+ * that load reports every deposit this account has ever had credited and every withdrawal it
+ * has ever had sent or failed, all at once. Twenty of them, for events that happened last
+ * month. The `firstUpdate` guard handles the repeat-reload case; only a timestamp that outlives
+ * the tab can tell a fresh tab which of those rows are new.
+ *
+ * `localStorage` rather than `sessionStorage` precisely because it has to outlive the tab. It
+ * is a single ISO string, it is only ever read at load, and a read failure degrades to "announce
+ * nothing" rather than to replaying history.
+ */
+const LAST_SEEN_AT_KEY = 'offerNetworkLastSeenAt';
+
+function readLastSeenAt() {
+    try {
+        const raw = window.localStorage.getItem(LAST_SEEN_AT_KEY);
+        if (!raw) return null;
+        const at = Date.parse(raw);
+        return Number.isFinite(at) ? at : null;
+    } catch {
+        return null;
+    }
+}
+
+function writeLastSeenAt(at) {
+    try {
+        window.localStorage.setItem(LAST_SEEN_AT_KEY, new Date(at).toISOString());
+    } catch {
+        // Storage unavailable. The in-memory `lastSeenAt` still seeds correctly for the rest
+        // of this page's life, so the only cost is a replay after a reload.
+    }
+}
+
+// Read once, at load, and never re-read: the value that matters is the one from *before* this
+// page existed, because the first update is the one being judged against it. Re-reading after
+// the first update would compare every later event against itself and announce nothing.
+const lastSeenAtBeforeLoad = readLastSeenAt();
+
+/**
+ * Whether an event is new enough to announce, judged against the pre-load timestamp.
+ *
+ * A row with no usable event time is treated as *not* new. That is the one case where this
+ * returns the wrong answer on purpose: a missing timestamp means the app cannot order the row,
+ * and the alternative -- announcing it -- is a burst on every fresh tab, which is the failure
+ * this whole mechanism exists to prevent. The row is still in the history list, so nothing is
+ * actually hidden from the user; the only cost is a toast that did not arrive.
+ */
+function isEventSinceLastSeen(eventAt) {
+    if (lastSeenAtBeforeLoad === null) return false;
+    if (!eventAt) return false;
+    const at = Date.parse(eventAt);
+    if (!Number.isFinite(at)) return false;
+    return at > lastSeenAtBeforeLoad;
+}
+
 /* ==========================================================================
    Toast notifications
    --------------------------------------------------------------------------
@@ -208,9 +282,131 @@ const NOTIFICATION_CATEGORY_ICONS = {
 const MAX_VISIBLE_TOASTS = 3;
 
 /**
+ * Toasts already on screen, by what they say, so the same sentence cannot appear twice.
+ *
+ * A net under the structural once-only rules, not a substitute for them. Those decide whether
+ * an event is new by comparing timestamps and ids; this only catches two calls arriving for the
+ * same words in the same moment, which is what a double-clicked submit, or a burst of parallel
+ * requests all failing the same way, produces.
+ *
+ * Keyed on the title and the message together, so two genuinely different toasts never collide
+ * even when they share a title -- "Reward credited" twice for two different offers is two
+ * events and both must be shown. The window is short because a toast lives about four seconds:
+ * anything repeating after that is either a new event or a real bug, and either way it should
+ * not be silently swallowed by a longer window.
+ */
+const TOAST_DEDUPE_MS = 2000;
+const recentToasts = new Map();
+const TOAST_DEDUPE_LIMIT = 60;
+
+function toastAlreadyShown(title, message) {
+    const key = `${title} ${message}`;
+    const now = Date.now();
+    const previous = recentToasts.get(key);
+    if (previous !== undefined && now - previous < TOAST_DEDUPE_MS) return true;
+    recentToasts.set(key, now);
+    while (recentToasts.size > TOAST_DEDUPE_LIMIT) {
+        const oldest = recentToasts.keys().next();
+        if (oldest.done) break;
+        if (now - recentToasts.get(oldest.value) >= TOAST_DEDUPE_MS) {
+            recentToasts.delete(oldest.value);
+            continue;
+        }
+        break;
+    }
+    return false;
+}
+
+/**
+ * Where each kind of notification points, so clicking it takes you to what it is about.
+ *
+ * A toast is a sentence about something that happened on another page, and reading it is
+ * usually the first half of a two-step action: the message tells you a deposit landed, and then
+ * you have to go and find it. Leaving the destination implicit means every one of these is a
+ * dead end -- a notice that reports a change and offers no way to look at it, which is the same
+ * class of bug as a button that renders and does nothing.
+ *
+ * Keyed by the `category` the notification helpers already pass, rather than by matching on the
+ * title. Titles are prose and get reworded; a category is a decision, and matching text would
+ * silently stop matching the first time someone improves a sentence.
+ *
+ * `null` is a real answer, not a gap: a notice with nowhere to go stays a plain, non-clickable
+ * card. Offering a click that does nothing is worse than not looking clickable, so the control
+ * is only added when there is a destination.
+ *
+ * A deposit points at its own receipt, which is the one page that can answer "did the right
+ * amount arrive" -- the account list can only say it was confirmed. `depositId` is used when the
+ * caller knows it and falls back to the account list when it does not, so a deposit notice is
+ * never a link to nowhere.
+ */
+const NOTIFICATION_TARGETS = {
+    deposit: { href: '/account', label: 'View transactions' },
+    withdrawal: { href: '/account', label: 'View withdrawals' },
+    reward: { href: '/account', label: 'View transactions' },
+    survey: { href: '/offers', label: 'Browse offers' },
+    magic: { href: '/offers', label: 'Sign in' }
+};
+
+/**
+ * The destination for a notification, or null when it has none.
+ *
+ * `href` given by the caller always wins, because a caller that knows a specific record should
+ * not be overruled by a category's general page. The deposit receipt is the one case where a
+ * category is refined by data, since "your deposit landed" is about one specific deposit.
+ */
+function notificationTarget({ category, href, recordId, depositId, withdrawalId }) {
+    // The record first, and that ordering is the fix for a whole class of dead links.
+    //
+    // The destination is deliberately *derived* from the record rather than resolved once and
+    // stored on the notification. A stored `href` is a cached answer to "where should this go",
+    // and the rules for that answer changed here more than once -- from a receipt page, to a
+    // history row, and the stored copies kept winning. Every notification already sitting in a
+    // user's bell carries the answer its own version of the code produced, so any change to the
+    // rules is invisible to every one of them, and the link stays wrong until it is dismissed
+    // by hand. Deriving at render time means there is one rule and every entry follows it.
+    //
+    // The two record cases, which are the whole point of having this function. A category on
+    // its own can only ever point at a list, and a list is a thing you have to search: being
+    // told your deposit landed and then being dropped on a page where the row is one of many is
+    // the same as not being told which row.
+    //
+    // The destination is the *history row*, not the record's own page, and that is a deliberate
+    // choice in the other direction. The history list is where a person goes to see their money
+    // in context -- what else happened, what the balance did -- and it can offer the receipt from
+    // there. Sending them straight to a receipt answers a narrower question than the one they
+    // had, and the record is then one link away rather than zero.
+    const record = depositId ?? withdrawalId ?? recordId;
+    if (category === 'deposit' && record) {
+        return { href: `/account#${historyRowId('deposit', record)}`, label: 'View in history' };
+    }
+    if (category === 'withdrawal' && record) {
+        return { href: `/account#${historyRowId('withdrawal', record)}`, label: 'View in history' };
+    }
+    // The caller's own href, for a case that genuinely is not a record link: a rejected deposit
+    // writes no ledger row, so there is nothing in the history list to scroll to and the receipt
+    // is the only page that can show what went wrong. Checked after the record so it is a
+    // deliberate choice for that case rather than a way for a stale value to win.
+    if (href) return { href, label: 'View details' };
+    return NOTIFICATION_TARGETS[category] || null;
+}
+
+/**
+ * The DOM id of a history row, for one kind of record and id.
+ *
+ * The one place this string is built. It appears in a notification's `href` and in the id the
+ * history list puts on the row it describes, and those two have to agree exactly -- a mismatch is
+ * a link to a fragment that matches nothing, which scrolls nowhere and looks like the page is
+ * broken. Keeping the format behind one function is what stops a change to one side from
+ * silently orphaning every notification already stored in a user's bell.
+ */
+function historyRowId(kind, id) {
+    return `history-${String(kind || '').replace(/[^a-z-]/g, '')}-${encodeURIComponent(String(id ?? ''))}`;
+}
+
+/**
  * A brief notice, anchored top-right on desktop and above the action bar on a phone.
  *
- * Three behaviours here that are not obvious from the call sites:
+ * Four behaviours here that are not obvious from the call sites:
  *
  * - An error stays until it is dismissed. Every toast had a 4.5 second life, including the
  *   ones saying a deposit failed or a withdrawal was refused. A message about money that
@@ -222,11 +418,28 @@ const MAX_VISIBLE_TOASTS = 3;
  *   the remaining time is still there when the pointer leaves.
  * - The oldest is dropped when there are more than `MAX_VISIBLE_TOASTS`. Dropped, not
  *   queued: a queued toast fires minutes later about something that has been resolved.
+ * - A toast with somewhere to go is a real control, and one without stays a plain card.
+ *
+ * On that last point. The whole clickable area is a `<button>`, not the toast div with a click
+ * handler: this codebase has been bitten twice by a control that was reachable, looked right,
+ * and did nothing, and once more by a `div` acting as a button, so the rule here is that
+ * anything clickable is a real element with a role the browser and a screen reader already
+ * understand. That gets keyboard activation, focus, and the accessible name for free, and the
+ * only thing it costs is that the markup nests differently than the old one.
+ *
+ * A toast with no target keeps `role="status"` and stays put. Adding a button that navigates
+ * nowhere would be worse than not looking clickable, so `null` is a real answer here.
  */
-function showToast(title, message, { tone = 'info', duration = 4500 } = {}) {
+function showToast(title, message, { tone = 'info', duration = 4500, category = null, href = null, depositId = null, withdrawalId = null } = {}) {
     if (!toastRegion) return;
+    // Checked after the region guard so a page with no toast region still records nothing,
+    // and before the counter is incremented so a suppressed toast does not burn an id and
+    // leave a gap in the sequence the DOM ids are built from.
+    if (toastAlreadyShown(String(title || ''), String(message || ''))) return;
     const id = ++toastCount;
     const persistent = tone === 'error';
+    const target = notificationTarget({ category, href, depositId, withdrawalId });
+
     const toast = document.createElement('div');
     toast.className = `toast is-${tone}`;
     toast.dataset.id = id;
@@ -235,14 +448,42 @@ function showToast(title, message, { tone = 'info', duration = 4500 } = {}) {
     // The animation reads this custom property, and so does the pause below -- which is why
     // the duration has to live on the element rather than only in the timeout.
     toast.style.setProperty('--toast-duration', `${duration / 1000}s`);
-    toast.innerHTML = `
+
+    const body = `
         <span class="toast-icon" aria-hidden="true">${TOAST_ICONS[tone] || TOAST_ICONS.info}</span>
         <div class="toast-body">
             <div class="toast-title">${escapeHtml(title)}</div>
             ${message ? `<div class="toast-message">${escapeHtml(message)}</div>` : ''}
         </div>
-        <button class="toast-close" type="button" aria-label="Dismiss notification">&times;</button>
     `;
+
+    if (target) {
+        // The label is appended as a separate line rather than folded into the title, so the
+        // title still reads as the sentence it is. A title that ended in "View transactions"
+        // would be read by a screen reader as one long claim about money.
+        toast.classList.add('is-link');
+        toast.innerHTML = `
+            <button class="toast-action" type="button">
+                ${body}
+                <span class="toast-action-label">${escapeHtml(target.label)}</span>
+            </button>
+            <button class="toast-close" type="button" aria-label="Dismiss notification">&times;</button>
+        `;
+        // Activating the toast dismisses it first. Without that the old one stays on screen
+        // for the rest of its timer over the page it just navigated to, and on a slow
+        // connection the user lands on the destination and then watches a message about the
+        // thing they just clicked fade out.
+        toast.querySelector('.toast-action').addEventListener('click', () => {
+            dismissToast(id);
+            followNotificationTarget(target.href);
+        });
+    } else {
+        toast.innerHTML = `
+            ${body}
+            <button class="toast-close" type="button" aria-label="Dismiss notification">&times;</button>
+        `;
+    }
+
     toast.querySelector('.toast-close').addEventListener('click', () => dismissToast(id));
 
     toastRegion.appendChild(toast);
@@ -319,15 +560,37 @@ function dismissToast(id) {
 
 const NOTIFICATIONS_KEY = 'offerNetworkNotifications';
 const NOTIFICATIONS_LIMIT = 50;
-/** Recently pushed titles, used to suppress duplicate notifications within a short window. */
+/** Recently pushed notifications, used to collapse one event that arrived twice. */
 const notificationDedupe = new Map();
 const NOTIFICATION_DEDUPE_MS = 3000;
+const NOTIFICATION_DEDUPE_LIMIT = 50;
+
+/**
+ * Shape version for a stored notification.
+ *
+ * Bumped whenever what a notification records about its destination changes. It exists because
+ * the entries in `localStorage` outlive the code that wrote them, and an entry written before a
+ * rule change holds a cached answer that is now wrong -- and, for the ones below, cannot be
+ * repaired at all.
+ */
+const NOTIFICATION_SHAPE_VERSION = 2;
 
 function loadNotifications() {
     try {
         const raw = window.localStorage.getItem(NOTIFICATIONS_KEY);
         const parsed = raw ? JSON.parse(raw) : [];
-        return Array.isArray(parsed) ? parsed : [];
+        if (!Array.isArray(parsed)) return [];
+        // Anything without the current shape is dropped rather than migrated.
+        //
+        // These are the entries written before a notification recorded *which* record it was
+        // about. They stored a pre-resolved `href` -- `/account` -- and no id, so there is
+        // nothing in the entry from which the real destination can be recovered: the id was
+        // never written, and guessing one would produce a link to an arbitrary transaction. So
+        // the choice is a link known to be wrong, kept until dismissed by hand, or no link at
+        // all. Dropping is the better of the two, and the entries are a convenience list with no
+        // financial meaning -- every one of them names something that is still in the history
+        // list and on its receipt.
+        return parsed.filter((entry) => entry && Number(entry.v) === NOTIFICATION_SHAPE_VERSION);
     } catch {
         return [];
     }
@@ -347,18 +610,66 @@ function unreadCount() {
     return notificationStore.filter((n) => !n.read).length;
 }
 
-function pushNotification({ title, message, tone = 'info', href = null, category = null }) {
-    // Suppress duplicates that arrive within a short window. Two calls with the same
-    // title in quick succession usually mean the same event was pushed twice (a race
-    // between the immediate form-submit notification and the first poll), not two
-    // genuinely different events.
-    const dedupeKey = title;
+/**
+ * Follows a notification's destination, including when it is the page already open.
+ *
+ * `location.assign` to the URL you are already on is not a no-op that the reader can see as
+ * "nothing moved" -- it is genuinely nothing. Same path, same fragment: no navigation, no
+ * document load, no `hashchange`, because the fragment did not change. The list on screen is
+ * never re-examined, so clicking the same notification twice leaves the second click with no
+ * effect whatsoever, and if the first click arrived before the row was on the page there is
+ * nothing on the page to recover to.
+ *
+ * Re-dispatching `hashchange` is the fix rather than a new event, because the page that consumes
+ * it already listens for exactly that and already knows how to find and focus its rows. A second
+ * event type would be a second path into that same code, and the two would drift.
+ *
+ * Harmless on a page with no such listener, which is the point of reusing the name rather than
+ * importing anything.
+ */
+function followNotificationTarget(href) {
+    if (!href) return;
+    const current = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+    if (current === href) {
+        window.dispatchEvent(new Event('hashchange'));
+        return;
+    }
+    window.location.assign(href);
+}
+
+function pushNotification({ title, message, tone = 'info', href = null, category = null, depositId = null, withdrawalId = null }) {
+    // Collapse an event that arrived twice, and only that.
+    //
+    // The key is the whole notification, not the title. The previous key was the title alone
+    // inside a three-second window, which failed in both directions at once: two different
+    // withdrawals of the same amount failing together shared a title, so the second was
+    // silently discarded and the user was never told their money had failed twice; and the same
+    // event arriving four seconds apart passed straight through, because the window had closed
+    // and nothing was recording that it had already been announced.
+    //
+    // Keyed on all three fields, two genuinely different notifications never collide however
+    // close together they land, and one event delivered by two code paths in the same tick
+    // still collapses to a single bell entry.
+    const dedupeKey = `${category || ''} ${title} ${message}`;
     const now = Date.now();
-    if (notificationDedupe.has(dedupeKey) && now - notificationDedupe.get(dedupeKey) < NOTIFICATION_DEDUPE_MS) {
+    const previous = notificationDedupe.get(dedupeKey);
+    if (previous !== undefined && now - previous < NOTIFICATION_DEDUPE_MS) {
         return;
     }
     notificationDedupe.set(dedupeKey, now);
-    setTimeout(() => notificationDedupe.delete(dedupeKey), NOTIFICATION_DEDUPE_MS);
+    // Pruned on write rather than by a `setTimeout` per notification. A timer per push is a
+    // live handle that outlives the entry it exists to clear, and the map would only ever be
+    // trimmed if the tab kept running. Entries older than the window are worthless, so the
+    // oldest are dropped whenever a new one arrives.
+    while (notificationDedupe.size > NOTIFICATION_DEDUPE_LIMIT) {
+        const oldest = notificationDedupe.keys().next();
+        if (oldest.done) break;
+        if (now - notificationDedupe.get(oldest.value) >= NOTIFICATION_DEDUPE_MS) {
+            notificationDedupe.delete(oldest.value);
+            continue;
+        }
+        break;
+    }
 
     notificationStore.push({
         id: Date.now() + Math.random(),
@@ -367,6 +678,12 @@ function pushNotification({ title, message, tone = 'info', href = null, category
         tone,
         href,
         category,
+        // The record this notification is about, stored so the bell can resolve the same
+        // destination the toast did. The id rather than a resolved url, because a url resolved
+        // at push time is frozen against whatever the rules were at that moment and then goes
+        // stale silently -- see `notificationTarget`.
+        recordId: depositId ?? withdrawalId ?? null,
+        v: NOTIFICATION_SHAPE_VERSION,
         read: false,
         timestamp: Date.now()
     });
@@ -456,11 +773,55 @@ function renderNotificationList() {
     list.innerHTML = '';
     const fragment = document.createDocumentFragment();
     for (const item of recent) {
+        // Marked read on the way in, whether or not the row is a link. An unread row that
+        // navigates away still has to be read -- otherwise reading it by following the link
+        // leaves the badge claiming it was never seen.
+        const target = notificationTarget({
+            category: item.category,
+            href: item.href,
+            // The stored record, so a notification that was created before this tab opened
+            // still resolves to its own receipt rather than falling back to the account list.
+            recordId: item.recordId
+        });
+        if (!item.read) markNotificationRead(item.id);
+
+        if (target) {
+            // A real `<a>`, so the destination is in the DOM, middle-click and "open in new
+            // tab" work, and the row is reachable by keyboard. It used to be a `div` with a
+            // click handler and an `href` that nothing ever set, which is a control that
+            // looked live, took focus as nothing, and navigated nowhere.
+            const link = document.createElement('a');
+            link.className = `notification-item is-${item.tone} ${item.read ? '' : 'unread'} is-link`;
+            link.href = target.href;
+            // Kept as a real link so the destination is in the DOM and middle-click and
+            // "open in new tab" keep working, and intercepted for a plain left click for one
+            // reason: a link to the page and fragment already open is a click with no effect at
+            // all, and browsers are not consistent about firing `hashchange` for it. The handler
+            // defers to the browser for every modified click, which is the same rule
+            // `wireCopyLink` uses on the receipt pages.
+            link.addEventListener('click', (event) => {
+                if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey || event.button !== 0) return;
+                event.preventDefault();
+                markNotificationRead(item.id);
+                followNotificationTarget(target.href);
+            });
+            link.innerHTML = `
+                <span class="notification-item-icon" aria-hidden="true">${iconSvgFor(item)}</span>
+                <div class="notification-item-content">
+                    <div class="notification-item-title">${escapeHtml(item.title)}</div>
+                    ${item.message ? `<div class="notification-item-message">${escapeHtml(item.message)}</div>` : ''}
+                    <div class="notification-item-time">${formatTimeAgo(item.timestamp)}</div>
+                </div>
+                <span class="notification-item-go" aria-hidden="true">&rarr;</span>
+            `;
+            fragment.appendChild(link);
+            continue;
+        }
+
         const el = document.createElement('div');
         el.className = `notification-item is-${item.tone} ${item.read ? '' : 'unread'}`;
-        const iconSvg = NOTIFICATION_CATEGORY_ICONS[item.category] || TOAST_ICONS[item.tone] || TOAST_ICONS.info;
         el.innerHTML = `
-            <span class="notification-item-icon" aria-hidden="true">${iconSvg}</span>
+            <span class="notification-item-icon" aria-hidden="true">${iconSvgFor(item)}</span>
             <div class="notification-item-content">
                 <div class="notification-item-title">${escapeHtml(item.title)}</div>
                 ${item.message ? `<div class="notification-item-message">${escapeHtml(item.message)}</div>` : ''}
@@ -468,17 +829,16 @@ function renderNotificationList() {
             </div>
             <button type="button" class="notification-item-close" aria-label="Dismiss">&times;</button>
         `;
-
         const closeButton = el.querySelector('.notification-item-close');
         if (closeButton) closeButton.addEventListener('click', () => dismissNotification(item.id));
-        el.addEventListener('click', (event) => {
-            if (event.target.closest('.notification-item-close')) return;
-            if (!item.read) markNotificationRead(item.id);
-            if (item.href) window.location.assign(item.href);
-        });
         fragment.appendChild(el);
     }
     list.appendChild(fragment);
+}
+
+/** The icon for a stored notification: its category first, then its tone. */
+function iconSvgFor(item) {
+    return NOTIFICATION_CATEGORY_ICONS[item.category] || TOAST_ICONS[item.tone] || TOAST_ICONS.info;
 }
 
 function formatTimeAgo(ts) {
@@ -570,34 +930,109 @@ function escapeHtml(value) {
         .replace(/"/g, '&quot;')
         .replace(/'/g, '&#39;');
 }
-
 // Convenience wrappers matching the events that need them.
+//
+// Each one passes the same `category` to the toast and to the bell. They used to pass it only
+// to the bell, which is why clicking a notification in the bell navigated nowhere: the store
+// had an `href` field and a `window.location.assign` behind it, and nothing ever filled it in.
+// The category is now the single thing that decides where a notice goes, and it is set on both
+// halves so a toast and its bell entry cannot point at different pages.
+
 function notifyDepositConfirmed(item) {
     const title = 'Deposit credited';
     const message = `${formatBalance(item.amount)} ${item.currency_code || 'USD'} added to your balance.`;
-    showToast(title, message, { tone: 'success' });
-    pushNotification({ title, message, tone: 'success', category: 'deposit' });
+    // The record, not a pre-resolved url: the bell resolves it through the same
+    // `notificationTarget` the toast does, so there is one rule and not two copies of it.
+    showToast(title, message, { tone: 'success', category: 'deposit', depositId: item.id ?? null });
+    pushNotification({
+        title,
+        message,
+        tone: 'success',
+        category: 'deposit',
+        depositId: item.id ?? null
+    });
 }
 
-function notifyWithdrawalSubmitted(item) {
+/**
+ * Announces a deposit that will not be credited.
+ *
+ * The one notification that links to the receipt rather than to the history list, and the reason
+ * is not a preference. A credit writes a row to `balance_transactions` and a failure writes
+ * none -- no money moved, so there is no movement to record -- which means the list this product
+ * would otherwise link to has no row to scroll to. A link to a fragment that matches nothing is
+ * the exact failure this feature exists to remove, so the destination is chosen from what
+ * actually exists for each outcome rather than uniformly.
+ *
+ * The message leads with the money, not the failure. What a person wants to know first is whether
+ * their balance still holds it, and a toast that says "Deposit failed" above a balance card has
+ * already been read as a loss.
+ */
+function notifyDepositRejected(item) {
+    const title = 'Deposit not completed';
+    const expired = String(item.status || '').toLowerCase() === 'expired';
+    const message = expired
+        ? `${formatBalance(item.amount)} ${item.currency_code || 'USD'} was not paid before its address expired. `
+          + 'Nothing was taken from your balance.'
+        : `${formatBalance(item.amount)} ${item.currency_code || 'USD'} was not credited. `
+          + 'Nothing was taken from your balance.';
+    const href = item.id === null || item.id === undefined
+        ? null
+        : `/receipt/deposit/${encodeURIComponent(item.id)}`;
+    showToast(title, message, { tone: 'error', category: 'deposit', href });
+    pushNotification({ title, message, tone: 'error', category: 'deposit', href });
+}
+
+/**
+ * Announces a withdrawal the user has just submitted.
+ *
+ * The wording is the server's, not a sentence written here. `POST /api/user/withdraw` returns
+ * `message` and `withdrawalId` and deliberately does not return the amount -- a submission
+ * receipt needs no echo of a number the server has already committed, and returning it would be
+ * a second place the amount could disagree with the ledger. This function read `item.amount`
+ * anyway, so every "Withdrawal submitted" toast read "Your request to withdraw -- is being
+ * processed", and it overwrote the one line that actually distinguishes the two outcomes:
+ * "Withdrawal sent" versus "queued for review -- funds have not been sent yet".
+ *
+ * That distinction is the whole reason to announce a submission at all. A user who is told
+ * only that a request "is being processed" reasonably believes the money is on its way, and
+ * the provider may not have been handed the payout yet.
+ */
+function notifyWithdrawalSubmitted(result) {
     const title = 'Withdrawal submitted';
-    const message = `Your request to withdraw ${formatBalance(item.amount)} is being processed.`;
-    showToast(title, message, { tone: 'info' });
-    pushNotification({ title, message, tone: 'info', category: 'withdrawal' });
+    const message = String(result?.message || '').trim()
+        || 'Your withdrawal request has been received.';
+    // The id, so this notice also lands on the right row. Unlike a payout in flight -- which has
+    // no history row and could not be linked -- a *request* writes its ledger row in the same
+    // transaction that debits the balance, so the row saying "Withdrawal request queued" exists
+    // before this notification is ever built. That row is also the honest answer to the question
+    // this notice raises: where is my money right now.
+    const withdrawalId = result?.withdrawalId ?? null;
+    showToast(title, message, { tone: 'info', category: 'withdrawal', withdrawalId });
+    pushNotification({ title, message, tone: 'info', category: 'withdrawal', withdrawalId });
 }
 
 function notifyWithdrawalPaid(item) {
     const title = 'Withdrawal sent';
     const message = `${formatBalance(item.amount)} has been sent to your payment method.`;
-    showToast(title, message, { tone: 'success' });
-    pushNotification({ title, message, tone: 'success', category: 'withdrawal' });
+    // The withdrawal id, so both halves land on this payout's own receipt. A user who has been
+    // told their money was sent and then dropped on the account list is being asked to search
+    // for the one row it was in -- at the exact moment they most want to check it arrived.
+    showToast(title, message, { tone: 'success', category: 'withdrawal', withdrawalId: item.id ?? null });
+    pushNotification({ title, message, tone: 'success', category: 'withdrawal', withdrawalId: item.id ?? null });
 }
 
 function notifyWithdrawalFailed(item) {
     const title = 'Withdrawal failed';
-    const message = item.failureReason || 'Your withdrawal could not be completed.';
-    showToast(title, message, { tone: 'error' });
-    pushNotification({ title, message, tone: 'error', category: 'withdrawal' });
+    // Both spellings, because both call sites exist. This is called from the live poll with a raw
+    // API row (`failure_reason`) and the provider's payout error carries the actual reason --
+    // "wallet balance too low" or "invalid address" -- which is the only thing the user can act
+    // on. Reading the camelCase spelling that no payload uses is why the toast said only
+    // "Your withdrawal could not be completed" for every failure, and the one line that could
+    // have told them to check their address did not exist.
+    const reason = item.failure_reason || item.failureReason || item.payout_error;
+    const message = reason || 'Your withdrawal could not be completed.';
+    showToast(title, message, { tone: 'error', category: 'withdrawal', withdrawalId: item.id ?? null });
+    pushNotification({ title, message, tone: 'error', category: 'withdrawal', withdrawalId: item.id ?? null });
 }
 
 function notifySessionExpired() {
@@ -1172,12 +1607,20 @@ const liveState = {
      */
     lastKnownBalance: NaN,
     lastKnownDemoBalance: NaN,
-    /** Sum of deposit credits seen in the current update, so the balance delta can be
-     *  split between "money arrived" and "reward was credited". */
-    creditedDepositTotal: 0,
-    /** Sum of withdrawal refunds seen in the current update, so a returned withdrawal
-     * is not double-counted as a reward. */
-    refundedWithdrawalTotal: 0
+    /**
+     * Ledger rows already announced, by id.
+     *
+     * Needed because a credit can be announced by its deposit row, by its withdrawal refund
+     * row, or by the ledger entry that explains it -- and the same credit is present in more
+     * than one of those lists. Without this the $10 would be announced once as a deposit
+     * credit and again as a reward.
+     */
+    seenTransactionIds: new Set(),
+    /**
+     * Whether any update has been applied yet. The first one seeds the announcement state
+     * instead of reporting everything the account has already been credited.
+     */
+    seeded: false
 };
 
 /** How long to wait before the next check, given whether something is outstanding. */
@@ -1260,12 +1703,18 @@ async function syncNow() {
  * under the pointer, or replace a message they are reading.
  */
 function applyLiveUpdate(payload) {
-    const hadBalance = Number.isFinite(liveState.lastKnownBalance);
-    const hadDemo = Number.isFinite(liveState.lastKnownDemoBalance);
-
-    // Reset the per-update accumulators so they only reflect this poll.
-    liveState.creditedDepositTotal = 0;
-    liveState.refundedWithdrawalTotal = 0;
+    // The very first update establishes what already happened rather than reporting it.
+    //
+    // Without this, opening the page fires a toast for every reward the account has ever been
+    // paid -- twenty of them, at once, for a reward that arrived last month. The first payload
+    // is the state of the world as the page found it, so every row in it is marked seen without
+    // being announced, and only rows that appear *after* this point are events.
+    //
+    // This is the same seeding the deposit path does with `creditedDepositsSeen`, and it is why
+    // the flag is per-page-load rather than persisted: a reload should not replay history, but
+    // it should also announce a reward that landed while the tab was closed.
+    const firstUpdate = !liveState.seeded;
+    liveState.seeded = true;
 
     if (typeof payload.balance === 'string' || payload.balance === null) {
         const nextBalanceNum = payload.balance === null ? 0 : Number(payload.balance);
@@ -1316,12 +1765,32 @@ function applyLiveUpdate(payload) {
     // A credit that happened with no dialog open is announced rather than silently
     // redrawing a number, because the balance going up is the thing a user is waiting for
     // and they should not have to be watching the header to notice it.
+    //
+    // On the first update every row is seeded, whether or not it is announced. Without that,
+    // opening a tab for an account with any deposit history fired "Deposit credited" once per
+    // historical deposit -- the toast burst the `firstUpdate` note above describes, which had
+    // been applied to the ledger rows and never to these two loops. The guard is
+    // `isEventSinceLastSeen` rather than a blanket "skip the first update", so a credit that
+    // landed while the tab was closed is still announced: it happened after the last moment
+    // this browser was told about, which is the definition of an event.
     for (const item of deposits) {
         const status = String(item.status || '').toLowerCase();
         const credited = status === 'confirmed' || status === 'paid';
-        if (credited && !creditedDepositsSeen.has(item.id)) {
-            creditedDepositsSeen.add(item.id);
-            liveState.creditedDepositTotal += Number(item.amount) || 0;
+        // A deposit that will never be credited is as much of an event as one that was. The user
+        // has money out of their account and nothing to show for it, and the only thing this
+        // product says about that is a status word in a list. Its destination is the receipt
+        // rather than the history row, and the reason is structural rather than a preference: a
+        // failed deposit writes no ledger row, because no money moved, so there is no row in the
+        // list to scroll to. The receipt is the one page that can show what went wrong and when.
+        const rejected = status === 'failed' || status === 'expired';
+        if (!credited && !rejected) continue;
+
+        const state = credited ? 'credited' : 'rejected';
+        if (depositStateSeen(item.id, state)) continue;
+        depositStateSeen(item.id, state);
+        if (firstUpdate && !isEventSinceLastSeen(credited ? item.credited_at : item.updated_at)) continue;
+
+        if (credited) {
             // Announce the credit everywhere: when the dialog is open the user sees the
             // success screen, otherwise they get just the toast and bell so the money
             // arriving is an event, not a number they have to be watching for.
@@ -1330,6 +1799,8 @@ function applyLiveUpdate(payload) {
             } else {
                 notifyDepositConfirmed(item);
             }
+        } else {
+            notifyDepositRejected(item);
         }
     }
 
@@ -1338,63 +1809,117 @@ function applyLiveUpdate(payload) {
     // to learn their money left or was returned. Only the transitions into paid and failed
     // are announced -- a request sitting in `pending` is not an event, and saying so on
     // every poll would be noise.
+    //
+    // The event time differs per state on purpose. `paid_at` is when the money left, which is
+    // what the user cares about and what `isEventSinceLastSeen` should be comparing. A failure
+    // has no `paid_at`, and `updated_at` is the only record of when it was refused.
     for (const item of withdrawals) {
         const status = String(item.status || '').toLowerCase();
-        if (status === 'paid' && !withdrawalStateSeen(item.id, 'paid')) {
-            markWithdrawalSeen(item.id, 'paid');
+        const seenStatus = status === 'paid' ? 'paid' : status === 'failed' ? 'failed' : null;
+        if (!seenStatus || withdrawalStateSeen(item.id, seenStatus)) continue;
+        markWithdrawalSeen(item.id, seenStatus);
+        if (firstUpdate && !isEventSinceLastSeen(status === 'paid' ? item.paid_at : item.updated_at)) continue;
+        if (seenStatus === 'paid') {
             notifyWithdrawalPaid(item);
-        } else if (status === 'failed' && !withdrawalStateSeen(item.id, 'failed')) {
-            markWithdrawalSeen(item.id, 'failed');
-            liveState.refundedWithdrawalTotal += Number(item.amount) || 0;
+        } else {
             notifyWithdrawalFailed(item);
         }
     }
 
-    // A reward from a completed offer or survey arrives as a plain balance increase with
-    // no deposit or withdrawal row to explain it. Detect that by comparing the delta
-    // against the credits and refunds already announced in this update.
+    // A balance can go up for reasons that have nothing to do with finishing an offer: an
+    // operator correcting a row, a bonus, a migration, a test credit inserted by hand in the
+    // database. The previous version of this code compared the balance delta against the
+    // deposits and withdrawals it had already announced and, for anything left over, said
+    // "Reward credited -- $10.00 credited to your balance from a completed offer." That is a
+    // guess, and it was wrong every time the cause was not an offer: the only conclusion
+    // available from a number was a hard-coded one, and a hand-inserted $10 came back as an
+    // offer the user never completed.
     //
-    // `balance` can be `null` (demo-only accounts), in which case the numeric value used
-    // for the delta is 0 -- the important thing is that the demo balance delta below is
-    // still evaluated.
-    if (hadBalance && (typeof payload.balance === 'string' || payload.balance === null)) {
-        const prevBalance = liveState.lastKnownBalance;
-        const newBalance = payload.balance === null ? 0 : Number(payload.balance);
-        const delta = newBalance - prevBalance;
-        const accounted = liveState.creditedDepositTotal + liveState.refundedWithdrawalTotal;
-
-        if (delta > 0 && delta > accounted + 0.01) {
-            const rewardAmount = delta - accounted;
-            const adjusted = Math.max(0, rewardAmount);
-            const title = 'Reward credited';
-            const message = `${formatBalance(adjusted)} credited to your balance from a completed offer.`;
-            showToast(title, message, { tone: 'success' });
-            pushNotification({ title, message, tone: 'success', category: 'reward' });
+    // The server now sends the ledger rows that caused the change, so the cause is read rather
+    // than inferred. A `conversion` is an offer reward and is announced as one. Anything else
+    // -- an `adjustment`, a `bonus`, a row with no type this client knows -- is announced with
+    // whatever description the ledger carries, or not at all if there is nothing to say.
+    const transactions = Array.isArray(payload.transactions) ? payload.transactions : [];
+    let newLedgerRows = 0;
+    for (const entry of transactions) {
+        const id = String(entry?.id ?? '');
+        if (id && liveState.seenTransactionIds.has(id)) continue;
+        if (id) {
+            liveState.seenTransactionIds.add(id);
+            newLedgerRows += 1;
         }
+
+        // Seeded rather than announced on the first update. See the `firstUpdate` note above.
+        if (firstUpdate) continue;
+
+        const amount = Number(entry?.amount);
+        if (!Number.isFinite(amount) || amount <= 0) continue;
+
+        // Only a credit is an event worth announcing. A debit here is a withdrawal, and the
+        // withdrawal list already has its own announcement for that.
+        if (entry.transaction_type !== 'conversion') continue;
+        // The description is the ledger's own words for what paid out, which is more useful
+        // than a fixed sentence and is what makes an offer reward read as an offer reward.
+        const what = String(entry.description || '').trim() || 'a completed offer';
+        // Demo and real rewards are the same event with a different balance behind it, so they
+        // are announced from the same row. The only difference is which one the user can spend,
+        // and saying so is the difference between a useful notice and one that overstates what
+        // just happened to their money.
+        const isDemo = entry.is_demo === true;
+        const title = isDemo ? 'Demo reward credited' : 'Reward credited';
+        // "your demo balance", not "your balance" with "demo" in front of the amount. A demo
+        // credit does not reach the balance the user can spend, and the sentence is the only
+        // thing that says which balance changed -- so the two wordings have to differ in the
+        // phrase that carries the meaning, not by a word inserted earlier in the line. That also
+        // keeps them distinguishable to anything reading the text, which is what stops a demo
+        // reward being reported as spendable money.
+        const balanceLabel = isDemo ? 'your demo balance' : 'your balance';
+        const message = `${formatBalance(amount)} added to ${balanceLabel} from ${what}.`;
+        showToast(title, message, { tone: isDemo ? 'info' : 'success', category: 'reward' });
+        pushNotification({
+            title,
+            message,
+            tone: isDemo ? 'info' : 'success',
+            category: 'reward',
+            href: NOTIFICATION_TARGETS.reward.href
+        });
     }
 
-    // Track demo balance changes for demo reward notifications.
-    if (hadDemo && typeof payload.demoBalance === 'string' && payload.demoBalance !== String(liveState.lastKnownDemoBalance)) {
-        const prevDemo = liveState.lastKnownDemoBalance;
-        const newDemo = Number(payload.demoBalance);
-        const demoDelta = newDemo - prevDemo;
-        if (demoDelta > 0.01) {
-            const title = 'Demo reward credited';
-            const message = `${formatBalance(demoDelta)} demo added to your balance.`;
-            showToast(title, message, { tone: 'info' });
-            pushNotification({ title, message, tone: 'info', category: 'reward' });
-        }
-    }
-
-    // Update the tracked previous balances for the next comparison.
-    // `balance` can be `null` for demo-only accounts; coerce to 0 so the delta math
-    // above stays correct on the next poll.
+    // Update the tracked previous balances. Nothing announces from them any more -- the demo
+    // notice above reads a ledger row, so it is keyed on that row's id and cannot fire twice
+    // for one reward the way a difference between two numbers could.
+    // `balance` can be `null` for demo-only accounts; coerced so the value is a number.
     if (typeof payload.balance === 'string' || payload.balance === null) {
         liveState.lastKnownBalance = payload.balance === null ? 0 : Number(payload.balance);
     }
     if (typeof payload.demoBalance === 'string') {
         liveState.lastKnownDemoBalance = Number(payload.demoBalance);
     }
+
+    // Tell the history page that the ledger moved, so it refetches instead of waiting for a
+    // reload. This is the whole real-time path for that list: `/api/user/updates` already runs
+    // on a timer and already carries the rows that changed, so the list does not need a second
+    // poller of its own competing with it for the same request.
+    //
+    // Keyed on ledger rows this payload actually introduced, which is what the comment above
+    // this dispatch always claimed it did. `transactions.length > 0` is not that test: the
+    // endpoint returns the twenty most recent ledger rows, so for any account with a single
+    // transaction the length is twenty on every poll forever, and the list was refetching every
+    // five seconds for a result that could not differ. A deposit moving from `processing` to
+    // `confirmed` adds no ledger row, so it correctly does not refetch the transaction list --
+    // it changes the deposit list, which `applyLiveUpdate` has already redrawn above.
+    if (newLedgerRows > 0) {
+        window.dispatchEvent(new CustomEvent('offerNetwork:historyChanged', {
+            detail: { version: payload.version }
+        }));
+    }
+
+    // Everything in this payload has now been judged and either announced or deliberately
+    // skipped, so "now" is the point any later tab should measure new events against. Written
+    // at the end rather than the start, so a payload that throws partway through cannot leave
+    // a timestamp claiming the user was told about things the rest of this function never got
+    // to announce.
+    writeLastSeenAt(Date.now());
 }
 
 /**
@@ -1706,6 +2231,13 @@ function signOut({ leave = false } = {}) {
 }
 
 /**
+ * Whether this tab has already reacted to losing its session.
+ *
+ * Read and written only by `handleUnauthorized`, and never reset. See the note there.
+ */
+let sessionExpiryHandled = false;
+
+/**
  * What happens when the server says the token is no longer good.
  *
  * The token is checked only by the API, so an expired or revoked session is discovered
@@ -1720,6 +2252,20 @@ function signOut({ leave = false } = {}) {
  */
 function handleUnauthorized(error) {
     if (error.status !== 401) return false;
+
+    // Only the first 401 does the work. Several requests are in flight whenever this happens --
+    // the live sync, a history fetch, a balance read -- and they all come back 401 together.
+    // Each one used to run the whole handler: sign out, push a "Session expired" toast, push a
+    // bell entry, open the sign-in dialog. So an expired session produced a stack of identical
+    // toasts and several sign-in dialogs fighting over the same modal, and the visitor's first
+    // impression of signing in was a pile of duplicates.
+    //
+    // The flag is deliberately never reset. A tab that has lost its session has lost it, and
+    // signing in again navigates, so re-arming this would only serve the case where a new
+    // session in the same document expires again -- which is not reachable without a reload.
+    if (sessionExpiryHandled) return true;
+    sessionExpiryHandled = true;
+
     signOut();
     notifySessionExpired();
     // On the account page the sign-in dialog is already here, so it opens in place --
@@ -2317,9 +2863,14 @@ function csvField(value) {
  * Built in the browser from the same `/api/user/history` the page already renders, rather
  * than from a new server-side export. That is a deliberate choice: it is the identical data
  * the user is looking at, so the file and the screen cannot disagree, and there is no second
- * query to keep in step with the first. The cost is that it covers the history endpoint's
- * page size, which is stated in the confirmation rather than left to be discovered when the
- * sheet turns out to be short.
+ * query to keep in step with the first.
+ *
+ * The export asks for the endpoint's ceiling rather than the page's window. The list on the
+ * account page is five rows at a time for readability, which is the wrong number for a file --
+ * an export that quietly covered one page would be indistinguishable from an account with five
+ * transactions, and the user has no way to tell which they have. Five hundred is the endpoint's
+ * own `HISTORY_MAX_LIMIT`, and if a user ever exceeds it the count in the confirmation is the
+ * real number of rows written rather than the total, so a truncated file says so.
  */
 async function exportTransactions() {
     const status = document.getElementById('account-data-status');
@@ -2334,7 +2885,7 @@ async function exportTransactions() {
     }
 
     try {
-        const rows = await requestJson('/api/user/history', {
+        const rows = await requestJson('/api/user/history?limit=500', {
             headers: { Authorization: `Bearer ${token}` },
             cache: 'no-store'
         });
@@ -4853,11 +5404,284 @@ function describeHistorySubtitle(item, kind) {
             : new Date(item.created_at).toLocaleDateString();
     }
     if (item.status === 'confirming' || item.status === 'pending') {
+        // A partial payment is the case this branch was written for and the case it got
+        // wrong. The provider reported an arrival that is smaller than the invoice, and the
+        // row said only "Waiting for the payment provider to confirm" -- so a customer who had
+        // sent 0.0076 of an expected 0.0083 SOL, and who could see the money in their wallet,
+        // was told the system had not seen anything at all. The two amounts are what let them
+        // work out whether the shortfall is the fee or a wrong transfer, which is the only
+        // reason to look at the row.
+        const received = String(item.actually_paid ?? '').trim();
+        const expected = String(item.pay_amount ?? item.amount ?? '').trim();
+        if (received && Number(received) > 0) {
+            const ticker = String(item.pay_currency || item.asset_code || '').toUpperCase();
+            const receivedText = coinAmount(received, ticker);
+            const expectedText = coinAmount(expected, ticker);
+            return expectedText && expectedText !== receivedText
+                ? `${receivedText} of ${expectedText} received · still waiting for the rest`
+                : `${receivedText} received · waiting for the payment provider to confirm`;
+        }
         return 'Waiting for the payment provider to confirm';
     }
     return item.network
         ? `${item.asset_code} on ${item.network}`
         : new Date(item.created_at).toLocaleDateString();
+}
+
+/**
+ * The Cancel control on a cancellable withdrawal row.
+ *
+ * Confirmation is not optional here. Cancelling returns real money to the balance, and it is
+ * irreversible in the way that matters: a user who cancels a request they meant to keep has to
+ * ask for it again, wait again, and pay any fee twice. `confirm` is used rather than a custom
+ * dialog because it is the one prompt that cannot be styled into looking non-destructive, which
+ * is the point.
+ */
+function buildCancelWithdrawalButton(item) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'button button-ghost history-cancel';
+    button.textContent = 'Cancel';
+    // The accessible name carries the amount, because "Cancel" alone is ambiguous when the
+    // dialog lists several withdrawals and a screen reader user has just heard "Cancel" with
+    // no indication of what it applies to.
+    button.setAttribute(
+        'aria-label',
+        `Cancel withdrawal #${item.id} of ${formatBalance(item.amount)} and return it to your balance`
+    );
+
+    button.addEventListener('click', () => {
+        cancelWithdrawal(item, button);
+    });
+
+    return button;
+}
+
+/**
+ * Cancels a withdrawal and reflects the result.
+ *
+ * The button is disabled for the duration so a second click cannot race the first into two
+ * requests. The server is idempotent about the money -- the second attempt finds a `cancelled`
+ * row and refuses -- but two in-flight requests would produce one success and one confusing
+ * 409, and the user would see an error on an action that worked.
+ */
+async function cancelWithdrawal(item, button) {
+    const token = getSessionToken();
+    if (!token) return;
+
+    const amount = formatBalance(item.amount);
+    const confirmed = window.confirm(
+        `Cancel this withdrawal of ${amount}? `
+        + `${amount} goes straight back to your balance. `
+        + 'This cannot be undone, and sending it again means starting over.'
+    );
+    if (!confirmed) return;
+
+    if (button) button.disabled = true;
+    try {
+        const result = await requestJson(`/api/user/withdrawals/${encodeURIComponent(item.id)}/cancel`, {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${token}` }
+        });
+
+        if (result && result.balance !== undefined && result.balance !== null) {
+            applyBalance(result.balance, accountState.demoBalance ?? '0');
+        }
+        showToast('Withdrawal cancelled', `${amount} is back in your balance.`, {
+            tone: 'success',
+            // The account page is where the refund is visible in the list; without this the
+            // notice reported a balance change the user then had to go and find.
+            category: 'withdrawal'
+        });
+        refreshWithdrawalViews();
+    } catch (error) {
+        if (handleUnauthorized(error)) return;
+        showToast(
+            'Could not cancel this withdrawal',
+            error.message || 'Please try again, or contact support.',
+            { tone: 'error' }
+        );
+        // Re-enabled so a refusal the user can act on -- a payout that has already been sent --
+        // does not leave a dead control on the row.
+        if (button) button.disabled = false;
+    }
+}
+
+/**
+ * Reloads the withdrawal list wherever it is on screen.
+ *
+ * Both the dialog's own list and the live-sync copy come from the same data, and the row that
+ * was just cancelled should read "Refunded" in both. Repainted through the existing loaders
+ * rather than patched in place so a cancelled row cannot linger with a Cancel button on it.
+ */
+function refreshWithdrawalViews() {
+    if (isDialogOpen('withdraw-dialog')) {
+        loadPaymentHistory('/api/user/withdrawals', 'withdrawal-history', 'withdrawal');
+    }
+    syncNow();
+}
+
+/**
+ * The status badge for a withdrawal, which is not the same question as the status for a
+ * deposit.
+ *
+ * A withdrawal row has two independent lives: ours (`pending` -> `processing` -> `paid`) and
+ * the provider's payout. They disagree in the ordinary case, because the payout reaches
+ * `FINISHED` before our reconciler has run, and reading only the first gave "Processing" under
+ * a transfer that had already landed. Where the provider has spoken, its stage wins -- it is
+ * the finer and more recent fact -- and the refund ledger still wins over both, because
+ * "Refunded" is a claim about the user's balance and nothing else overrides it.
+ */
+function withdrawalBadgeLabel(item, payoutState) {
+    if (item.refunded_at) return 'Refunded';
+    if (payoutState === 'FINISHED') return 'Sent';
+    if (payoutState && ['FAILED', 'CANCELLED', 'CANCELED', 'REJECTED', 'REJECTED_NOT_CHECKED'].includes(payoutState)) {
+        return 'Not sent';
+    }
+    // Our own `processing` is only worth showing when the provider has not reported anything
+    // yet; otherwise it understates a transfer that is already queued or on the network.
+    if (String(item.status || '').toLowerCase() === 'processing' && payoutState) return 'In progress';
+    return statusLabels[String(item.status || '').toLowerCase()] || String(item.status || '');
+}
+
+/**
+ * Formats a coin amount with its ticker, tolerating a missing value.
+ *
+ * `payout_coin_amount` and `payout_fee_coin` are strings from the provider held as text, so
+ * they are shown exactly as recorded rather than run through a currency formatter that would
+ * round a 0.000612 SOL fee to $0.00 and make the user think they were charged nothing.
+ */
+function coinAmount(value, currency) {
+    const amount = String(value ?? '').trim();
+    if (!amount) return '';
+    const ticker = String(currency || '').trim().toUpperCase();
+    return ticker ? `${amount} ${ticker}` : amount;
+}
+
+/**
+ * A timestamp for the details list, or an empty string when it never happened.
+ *
+ * Absent rather than "Pending": a row that has not been sent yet has no submission time, and
+ * printing a dash for a fact that does not exist reads as a missing record.
+ */
+function detailTime(value) {
+    if (!value) return '';
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return '';
+    return date.toLocaleString();
+}
+
+/**
+ * The per-withdrawal detail disclosure.
+ *
+ * This is the answer to "I want to see all the status on a withdrawal". The history row has
+ * to stay one compact line in a list of twenty, and it is also the only place the amount sent
+ * on-chain, the network fee, the destination address and the transaction reference all exist --
+ * four numbers and two addresses that used to be visible nowhere in the product, so a user
+ * reconciling against their exchange wallet had nothing to compare.
+ *
+ * A native `<details>`/`<summary>` rather than a button and a div: it is already keyboard
+ * operable, already announced as a disclosure with its expanded state, and it needs no
+ * JavaScript to stay operable. The expanded state does have to be carried across a repaint,
+ * because `renderHistoryInto` rebuilds these rows on every live update -- see
+ * `openDetailIdsFor` -- so a hand-rolled toggle is not the alternative being avoided here, it
+ * is the same amount of state in a place with no accessibility built in.
+ */
+function buildWithdrawalDetails(item) {
+    const payoutCurrency = item.payout_currency || item.asset_code || '';
+    const rows = [
+        ['Amount requested', formatBalance(item.amount)],
+        ['Method', item.payment_method === 'crypto'
+            ? `${item.asset_code || ''}${item.network ? ` on ${item.network}` : ''}`.trim()
+            : (item.payment_method || 'Card')],
+        ['Sent', coinAmount(item.payout_coin_amount, payoutCurrency)],
+        ['Network fee', coinAmount(item.payout_fee_coin, payoutCurrency)],
+        ['Destination', item.payout_address || item.payment_address || ''],
+        ['Transaction reference', item.provider_reference || ''],
+        ['Requested', detailTime(item.created_at)],
+        ['Sent to provider', detailTime(item.payout_submitted_at)],
+        ['Confirmed', detailTime(item.paid_at)],
+        ['Refunded', detailTime(item.refunded_at)],
+        ['Payout stage', String(item.payout_status || '').replace(/_/g, ' ').toLowerCase()],
+        ['Reason', item.failure_reason || item.payout_error || '']
+    ].filter(([, value]) => value);
+    // Nothing but the amount is known until the user asks for it: a withdrawal that has not
+    // been claimed has no payout stage, no reference and no timestamps, and a disclosure that
+    // opened onto three near-empty lines is worse than no disclosure.
+    if (rows.length <= 2) return null;
+
+    const details = document.createElement('details');
+    details.className = 'history-detail';
+    // The id the render paths key the restored open state on. `id` is enough to key it, but
+    // `data-` says plainly that this is a hook and not a lookup, and it keeps the value out
+    // of the `id`/`for` pairing the label checks look at.
+    details.dataset.withdrawalId = String(item.id);
+
+    const summary = document.createElement('summary');
+    summary.className = 'history-detail-summary';
+    summary.textContent = 'Details';
+    details.append(summary);
+
+    const list = document.createElement('dl');
+    list.className = 'history-detail-list';
+    for (const [name, value] of rows) {
+        const term = document.createElement('dt');
+        term.className = 'history-detail-label';
+        term.textContent = name;
+        const definition = document.createElement('dd');
+        definition.className = 'history-detail-value';
+        // A destination address and a transaction reference are both unbreakable runs of
+        // 40-90 characters. Left as plain text they overflow the row and push the badge out
+        // of alignment, so they wrap; the full value is still in the DOM for copying.
+        definition.textContent = value;
+        if (name === 'Destination' || name === 'Transaction reference') {
+            definition.classList.add('history-detail-mono');
+        }
+        list.append(term, definition);
+    }
+
+    // The links out of the row: the receipt, and the blockchain.
+    //
+    // A settled withdrawal is the one row on this page that refers to money on a chain, and the
+    // transaction hash was previously visible only as a wall of monospace text with nothing to
+    // do with it. The whole point of having the hash is to be able to check it, so the ability
+    // to check it belongs next to the hash rather than in a second tab the user has to find.
+    //
+    // The urls are the server's, not built here: the chain table lives in one place, and a
+    // client-side copy is a second one to get wrong -- and a wrong one links to a transaction
+    // that was never on any chain.
+    const actions = document.createElement('div');
+    actions.className = 'history-detail-links';
+    let hasAction = false;
+
+    if (item.receipt_url) {
+        const receipt = document.createElement('a');
+        receipt.className = 'history-detail-link';
+        receipt.href = item.receipt_url;
+        receipt.textContent = 'View receipt';
+        actions.append(receipt);
+        hasAction = true;
+    }
+
+    const explorer = item.explorer || {};
+    if (explorer.transactionUrl) {
+        const tx = document.createElement('a');
+        tx.className = 'history-detail-link';
+        tx.href = explorer.transactionUrl;
+        tx.textContent = `View on ${explorer.explorerName || 'blockchain'}`;
+        // A new tab, and no opener. The explorer is a third party and this is the one link on
+        // the page that leaves the site entirely.
+        tx.target = '_blank';
+        tx.rel = 'noopener noreferrer';
+        actions.append(tx);
+        hasAction = true;
+    }
+    if (hasAction) {
+        list.append(actions);
+    }
+
+    details.append(list);
+    return details;
 }
 
 /**
@@ -4896,15 +5720,22 @@ function buildHistoryRow(item, kind) {
     // back, and it is only used when the ledger says so. The colour stays the
     // failure colour because the request was still rejected.
     const refunded = kind === 'withdrawal' && Boolean(item.refunded_at);
+    const payoutState = kind === 'withdrawal' ? String(item.payout_status || '').toUpperCase() : '';
     badge.className = `payment-status status-${refunded ? 'refunded' : status}`;
-    badge.textContent = refunded ? 'Refunded' : (statusLabels[status] || status);
+    badge.textContent = withdrawalBadgeLabel(item, payoutState);
 
     // A crypto withdrawal that is being sent by the provider carries its own progress, which
     // is finer-grained than our own `processing`: the user's money is somewhere specific
-    // between "queued" and "sent", and "Processing" alone gives them nothing to look at. Only
-    // shown while the payout is genuinely in flight -- a `paid` withdrawal has already been
-    // said to have arrived, and repeating "sent" under a "Paid" badge is noise.
-    const payoutLabel = kind === 'withdrawal' && status === 'processing' ? payoutProgressLabel(item.payout_status) : null;
+    // between "queued" and "sent", and "Processing" alone gives them nothing to look at.
+    //
+    // Rendered whenever the provider has reported a stage, and not only while our own status
+    // says `processing`. The screenshot that prompted this was a payout the provider had
+    // rejected while the row still read `processing` -- the one state where the user most
+    // needs the reason and the row was blank under the badge. A row with no `payout_status` at
+    // all gets nothing, because that is a withdrawal the provider machinery never touched.
+    const payoutLabel = kind === 'withdrawal' && payoutState && !refunded
+        ? payoutProgressLabel(payoutState, item)
+        : null;
     if (payoutLabel) {
         const progress = document.createElement('span');
         progress.className = 'payout-progress';
@@ -4913,6 +5744,24 @@ function buildHistoryRow(item, kind) {
     }
 
     row.append(details, badge);
+
+    // A withdrawal the user can still take back gets a Cancel control.
+    //
+    // Only rendered when the server says `cancellable`, which is that one gate computed in
+    // SQL by the same expression the cancel endpoint enforces. The client deliberately does not
+    // derive this from the status: a `processing` row can be either a payout on its way or a
+    // claim that was made and released, and only the payout columns tell them apart. Offering
+    // Cancel on the wrong one is a click away from refunding a transfer that is still moving.
+    if (kind === 'withdrawal' && item.cancellable === true) {
+        row.append(buildCancelWithdrawalButton(item));
+    }
+
+    // The full record, for the rows that have one. Appended after the row's controls so the
+    // disclosure sits last and the Cancel button stays where a user reaching for it expects.
+    if (kind === 'withdrawal') {
+        const detail = buildWithdrawalDetails(item);
+        if (detail) row.append(detail);
+    }
 
     // A crypto deposit that has not been paid yet is a live instruction, not a record. Closing
     // the panel by accident used to leave the customer with a row that said "waiting" and
@@ -4963,24 +5812,83 @@ function buildHistoryRow(item, kind) {
 /**
  * The provider's payout stage, in words a user can act on.
  *
+ * Every state the provider can report is mapped, not just the ones that were first observed.
+ * `SENDING` and `VERIFY_UNKNOWN` returned `null` and so rendered as an empty progress line: a
+ * withdrawal with a live payout and no text under it, which is indistinguishable from the row
+ * that has just come back from the API. An unmapped state is the one case that must never
+ * happen silently, so the fallback says the transfer is in progress and unrecognised rather
+ * than printing the provider's internal word at someone.
+ *
  * The provider's own vocabulary is deliberately not shown: `WAITING` and `REJECTED_NOT_CHECKED`
  * are internal states, and rendering them raw tells the user nothing about whether their money
- * is moving. Anything unrecognised falls back to the neutral "on its way" rather than
- * guessing at a stage, and an unknown outcome -- the one case where the app genuinely does not
- * know -- says so plainly instead of implying progress.
+ * is moving.
  */
-function payoutProgressLabel(payoutStatus) {
+function payoutProgressLabel(payoutStatus, item = {}) {
     switch (String(payoutStatus || '').toUpperCase()) {
         case 'CREATING':
         case 'NEW':
             return 'Preparing your payout.';
         case 'WAITING':
+            return 'Queued with the payout provider.';
         case 'PROCESSING':
+            return 'The payout provider is working on your payout.';
+        case 'SENDING':
             return 'Sent to the network. This can take a few minutes.';
         case 'SUBMISSION_UNKNOWN':
             return 'Confirming with the payout provider. No action is needed from you.';
+        case 'VERIFY_UNKNOWN':
+            return 'The payout provider is verifying the transfer. No action is needed from you.';
+        case 'FINISHED':
+            return 'The transfer was confirmed on the network.';
+        case 'FAILED':
+        case 'CANCELLED':
+        case 'CANCELED':
+        case 'REJECTED':
+        case 'REJECTED_NOT_CHECKED': {
+            // The provider's rejection reason is the one thing here the user can act on, so it
+            // is quoted rather than summarised away.
+            const reason = String(item.payout_error || '').trim();
+            return reason ? `The payout was not sent: ${reason}` : 'The payout was not sent.';
+        }
         default:
-            return null;
+            return 'Your payout is in progress.';
+    }
+}
+
+/**
+ * Which withdrawal disclosures the reader has opened in a given list.
+ *
+ * Both render paths below rebuild every row rather than patching the one that changed, and a
+ * rebuild destroys DOM state -- including the `open` attribute on a `<details>`. So a reader
+ * who opened a withdrawal to copy the transaction reference would have it snap shut under
+ * their cursor every time the poll returned, and the reference would never be readable for
+ * as long as it took to select it.
+ *
+ * Keyed by container and withdrawal id, so opening a row in the account page's list does not
+ * open the same row in the dialog's list: those are two views of the same row and the reader
+ * opened exactly one of them.
+ */
+function openDetailIdsFor(containerId) {
+    const container = document.getElementById(containerId);
+    if (!container) return new Set();
+    const open = new Set();
+    for (const element of container.querySelectorAll('details.history-detail[data-withdrawal-id][open]')) {
+        open.add(element.dataset.withdrawalId);
+    }
+    return open;
+}
+
+/**
+ * Re-opens the disclosures that were open before a rebuild.
+ *
+ * Assigning the `open` IDL attribute rather than `setAttribute('open', '')`, because the
+ * property is what the `open` state is actually read from; the attribute is a reflection of
+ * it, and writing the attribute alone is not equivalent on every engine.
+ */
+function restoreOpenDetails(container, openIds) {
+    if (!container || !openIds || openIds.size === 0) return;
+    for (const element of container.querySelectorAll('details.history-detail[data-withdrawal-id]')) {
+        if (openIds.has(element.dataset.withdrawalId)) element.open = true;
     }
 }
 
@@ -4993,6 +5901,7 @@ function payoutProgressLabel(payoutStatus) {
 function renderHistoryInto(containerId, items, kind, emptyText) {
     const container = document.getElementById(containerId);
     if (!container) return;
+    const openIds = openDetailIdsFor(containerId);
     if (!items.length) {
         container.textContent = emptyText;
         return;
@@ -5000,6 +5909,7 @@ function renderHistoryInto(containerId, items, kind, emptyText) {
     const fragment = document.createDocumentFragment();
     for (const item of items) fragment.append(buildHistoryRow(item, kind));
     container.replaceChildren(fragment);
+    restoreOpenDetails(container, openIds);
 }
 
 async function loadPaymentHistory(endpoint, containerId, kind) {
@@ -5015,6 +5925,9 @@ async function loadPaymentHistory(endpoint, containerId, kind) {
         const items = await requestJson(endpoint, {
             headers: { Authorization: `Bearer ${token}` }
         });
+        // Read before the rebuild below, for the same reason the live sync reads it: the open
+        // disclosures in this list are the reader's, and a poll must not take them away.
+        const openIds = openDetailIdsFor(containerId);
         container.replaceChildren();
 
         if (items.length === 0) {
@@ -5026,37 +5939,39 @@ async function loadPaymentHistory(endpoint, containerId, kind) {
 
         const fragment = document.createDocumentFragment();
         let settledCount = 0;
-        let newlyConfirmed = null;
         for (const item of items) {
             const status = String(item.status || '').toLowerCase();
-            const isCredited = status === 'confirmed' || status === 'paid';
-            if (isCredited) {
+            if (status === 'confirmed' || status === 'paid') {
                 settledCount += 1;
-                // The transition is what triggers the success screen. The first time this
-                // id is seen credited is the moment the money arrived; every poll after
-                // that is the same fact and must stay silent.
-                if (kind === 'deposit' && !creditedDepositsSeen.has(item.id)) {
-                    creditedDepositsSeen.add(item.id);
-                    newlyConfirmed = item;
-                }
-                if (kind === 'withdrawal') {
-                    const seenStatus =
-                        status === 'paid' ? 'paid' : status === 'failed' ? 'failed' : null;
-                    if (seenStatus && !withdrawalStateSeen(item.id, seenStatus)) {
-                        markWithdrawalSeen(item.id, seenStatus);
-                    }
-                }
             }
 
             fragment.append(buildHistoryRow(item, kind));
         }
         container.append(fragment);
+        restoreOpenDetails(container, openIds);
 
-        if (newlyConfirmed) await showDepositSuccess(newlyConfirmed);
-        // The balance is re-read only when something newly settled, so an open dialog
-        // polling every ten seconds is not issuing a balance request on every tick.
+        // No announcement happens here, and that is the point of this function being
+        // render-only.
+        //
+        // It used to mark a newly-settled withdrawal as seen and open the credit screen for a
+        // newly-credited deposit -- both without announcing anything itself, on the assumption
+        // the live sync was about to. The live sync is not "about to": it runs on a timer, and
+        // this list is fetched on a timer of its own and on every `historyChanged`. So opening
+        // the withdraw dialog before the next sync arrived consumed the notification
+        // permanently -- the row said "Withdrawal sent" and the user was never told, with no
+        // way left to be told, because the flag was already set. The same code could also open
+        // the success screen for a deposit credited last month, since this function had no way
+        // to tell an old credit from a new one.
+        //
+        // `applyLiveUpdate` is the single owner of announcements. It has the version stamp, it
+        // runs on every change, and it already decides what is an event by comparing timestamps
+        // rather than by guessing from a list. A list that renders cannot announce; a path that
+        // announces cannot be reached twice with the same event.
+        //
+        // The balance is re-read only when something newly settled, so an open dialog polling
+        // every ten seconds is not issuing a balance request on every tick.
         if (settledCount > 0) await refreshBalance();
-        return { settled: newlyConfirmed !== null, settledCount };
+        return { settled: settledCount > 0, settledCount };
     } catch (error) {
         container.textContent = error.message;
         return { settled: false, settledCount: 0 };
@@ -5073,7 +5988,22 @@ async function loadPaymentHistory(endpoint, containerId, kind) {
  */
 async function showDepositSuccess(deposit) {
     const dialog = document.getElementById('deposit-success-dialog');
-    if (!dialog || dialog.open) return;
+
+    // A modal can only show one deposit, and it is a modal: while it is open the user is
+    // looking at the previous one. Returning here used to mean the second deposit was never
+    // announced anywhere -- the caller had already marked this id as seen before calling, so
+    // the credit was not retried on a later poll either, and it disappeared silently. Two
+    // deposits landing together is exactly the case where losing one is worst, because the
+    // user is watching the first arrive and has no way to notice the second.
+    //
+    // So the modal is the preferred presentation and the toast is the fallback, not the
+    // alternative being skipped. The toast is what carries the notification either way, so
+    // this does not announce the same credit twice -- `notifyDepositConfirmed` is called on
+    // both paths below.
+    if (!dialog || dialog.open) {
+        notifyDepositConfirmed(deposit);
+        return;
+    }
 
     const amountEl = document.getElementById('deposit-success-amount');
     if (amountEl) amountEl.textContent = formatBalance(deposit.amount);

@@ -509,6 +509,74 @@ test('a batch carries the callback URL, so a finished payout is noticed', async 
 });
 
 /**
+ * The batch id is what makes a payout send itself, and it is read from a response field whose
+ * name the provider does not keep stable across versions.
+ *
+ * This is here because the whole test file stubbed the create response as
+ * `{ batch_withdrawal_id: 'batch-1' }` -- the shape the code was written against. Every test
+ * therefore agreed with the implementation and none of them could notice that a live create
+ * answers with a top-level `id` instead. The result was a real withdrawal whose batch was
+ * created, held by the provider, and never verified: the app took its "created but not
+ * verified" branch, and a human had to type a 2FA code into the dashboard for the money to
+ * move. NOWPayments' own SDK reads `payout['id']` for the same value, which is what settled
+ * the question of which spelling is real.
+ */
+test('the batch id is read from whichever field the provider used to report it', async () => {
+    const entries = [{ payoutId: 'wd-5', address: 'bc1qexample', currency: 'btc', amount: 0.001 }];
+    const shapes = [
+        {
+            id: '5006836498',
+            withdrawals: [{ id: '5007985324', status: 'creating', unique_external_id: 'wd-5' }]
+        },
+        { batch_withdrawal_id: '5006836498' },
+        { batchWithdrawalId: '5006836498' },
+        { batch_id: '5006836498' },
+        { batchId: '5006836498' }
+    ];
+
+    for (const payoutBody of shapes) {
+        const { result } = await withPayoutFetch(
+            () => nowPayments.submitPayoutBatch(entries, { logger: { log() {}, warn() {}, error() {} } }),
+            { payoutBody }
+        );
+        assert.equal(
+            result.batchId,
+            '5006836498',
+            `batch id not read from ${JSON.stringify(Object.keys(payoutBody))}`
+        );
+    }
+
+    // The `id` shape is the one a live account actually returns, and the per-withdrawal id
+    // inside it is what proves the response was otherwise read correctly: getting the entry id
+    // right while missing the batch id is what made this look like a provider fault.
+    const live = await withPayoutFetch(
+        () => nowPayments.submitPayoutBatch(entries, { logger: { log() {}, warn() {}, error() {} } }),
+        { payoutBody: shapes[0] }
+    );
+    assert.equal(live.result.withdrawals[0].providerWithdrawalId, '5007985324');
+});
+
+/**
+ * A create response with no batch id anywhere is the failure that costs a real withdrawal, so
+ * it cannot pass quietly. The key names are the whole diagnosis and they are gone afterwards.
+ */
+test('a create response with no batch id says so loudly, naming the keys it did send', async () => {
+    const entries = [{ payoutId: 'wd-5', address: 'bc1qexample', currency: 'btc', amount: 0.001 }];
+    const errors = [];
+    const { result } = await withPayoutFetch(
+        () => nowPayments.submitPayoutBatch(entries, {
+            logger: { log() {}, warn() {}, error: (message) => errors.push(message) }
+        }),
+        { payoutBody: { withdrawals: [{ id: '5007985324', status: 'creating' }] } }
+    );
+
+    assert.equal(result.batchId, null, 'there is genuinely no batch id in this response');
+    assert.equal(errors.length, 1, 'the missing batch id must be reported, not swallowed');
+    assert.match(errors[0], /wd-5/, 'the operator has to know which withdrawal is affected');
+    assert.match(errors[0], /withdrawals/, 'and which fields the provider did send');
+});
+
+/**
  * `POST /v1/payout` has a closed schema: anything beyond the documented fields is refused
  * with `withdrawals[0].<field> is not allowed`, and one extra field costs the whole batch.
  * `payoutId` was sent for a long time on the assumption the provider would echo it back, and
@@ -642,7 +710,8 @@ test('the payout vocabulary covers the states a real payout passes through and e
  */
 test('a refused payout minimum is reported once, and then not retried per coin', async () => {
     const saved = Object.fromEntries(
-        ['NOWPAYMENTS_API_KEY', 'NOWPAYMENTS_IPN_SECRET'].map((key) => [key, process.env[key]])
+        ['NOWPAYMENTS_API_KEY', 'NOWPAYMENTS_IPN_SECRET', 'FIXIE_URL', 'NOWPAYMENTS_PAYOUT_PROXY']
+            .map((key) => [key, process.env[key]])
     );
     const originalFetch = undici.fetch;
     const warnings = [];
@@ -653,6 +722,12 @@ test('a refused payout minimum is reported once, and then not retried per coin',
 
     process.env.NOWPAYMENTS_API_KEY = 'test-key';
     process.env.NOWPAYMENTS_IPN_SECRET = 'test-ipn-secret';
+    // The warning branches on whether the request actually used the proxy, so the proxy has to
+    // be configured AND enabled here. A deployment with the IP whitelist off sets
+    // NOWPAYMENTS_PAYOUT_PROXY=off in `.env`, and that value is in the environment for the whole
+    // run -- this test is about the proxy-in-play branch, so it opts in rather than assuming.
+    process.env.FIXIE_URL = 'http://user:pass@fixie.example:443';
+    process.env.NOWPAYMENTS_PAYOUT_PROXY = 'on';
     console.warn = (...args) => warnings.push(args.join(' '));
     console.log = (...args) => recovery.push(args.join(' '));
 
@@ -808,17 +883,39 @@ test('a transport failure says why, not just that it happened', async () => {
         // costs an operator an hour of guessing and names nothing they can act on.
         assert.match(line, /ENOTFOUND/, 'the error code did not reach the log');
         assert.match(line, /fixie\.example/, 'the underlying host did not reach the log');
-        // And whether the proxy is even configured, which is the first thing to check and
-        // otherwise invisible from outside.
-        assert.match(line, /FIXIE_URL is unset/, 'the log does not say the proxy is not in play');
+        // And whether the proxy is even in play, which is the first thing to check and otherwise
+        // invisible from outside.
+        assert.match(line, /went out directly/, 'the log does not say the request went out direct');
 
-        // With the proxy configured, the same failure should not claim it went out direct.
+        // With the proxy configured *and the production base URL in use*, the same failure should
+        // claim the opposite. The two facts are separate: `FIXIE_URL` being set does not mean a
+        // request used it, and a log that assumes it does sends the operator to debug a proxy
+        // that was never touched.
         nowPayments.resetAddressValidationAvailability();
+        const priorBaseUrl = process.env.NOWPAYMENTS_API_BASE_URL;
         process.env.FIXIE_URL = 'http://user:pass@fixie.example:443';
+        // Opted back in explicitly. A deployment with no IP whitelist sets this to `off` in
+        // `.env`, and that value is in the environment for the whole test run -- so a test that
+        // wants to exercise the proxy has to say so rather than rely on the variable merely
+        // being present.
+        process.env.NOWPAYMENTS_PAYOUT_PROXY = 'on';
+        process.env.NOWPAYMENTS_API_BASE_URL = nowPayments.PRODUCTION_BASE_URL;
         warnings.length = 0;
         await nowPayments.validatePayoutAddress('bc1qexample', 'btc', { logger });
         assert.match(warnings[0], /went out via FIXIE_URL/);
-        assert.ok(!/FIXIE_URL is unset/.test(warnings[0]));
+        assert.ok(!/went out directly/.test(warnings[0]));
+
+        // The same proxy configured against a non-production base URL: the dispatcher is skipped
+        // by design, so the log must say the request went out direct. Claiming otherwise is the
+        // misdiagnosis this assertion exists to prevent.
+        nowPayments.resetAddressValidationAvailability();
+        process.env.NOWPAYMENTS_API_BASE_URL = 'https://sandbox.nowpayments.io';
+        warnings.length = 0;
+        await nowPayments.validatePayoutAddress('bc1qexample', 'btc', { logger });
+        assert.match(warnings[0], /went out directly/,
+            'a request that skipped the proxy was reported as having used it');
+        if (priorBaseUrl === undefined) delete process.env.NOWPAYMENTS_API_BASE_URL;
+        else process.env.NOWPAYMENTS_API_BASE_URL = priorBaseUrl;
     } finally {
         undici.fetch = originalFetch;
         nowPayments.resetAddressValidationAvailability();
@@ -827,6 +924,168 @@ test('a transport failure says why, not just that it happened', async () => {
             else process.env[key] = value;
         }
     }
+});
+
+test('a proxy that rejects the credentials is named as such, not as a cancellation', () => {
+    // The exact chain undici produces when the proxy answers 407 to a CONNECT. It is three
+    // levels deep and only the deepest one names a cause:
+    //
+    //   TypeError "fetch failed"
+    //     cause: Error "Request was cancelled."                       <- names nothing
+    //       cause: Error "Proxy response (407) !== 200 when HTTP Tunneling"   <- the answer
+    //
+    // `describeTransportFailure` read two levels, so the operator saw "Request was cancelled"
+    // and no status code -- a symptom, with the one field that identifies the fault discarded.
+    // "Request was cancelled." is also undici's generic wrapper for every transport failure, so
+    // it is dropped in favour of anything more specific.
+    const error = Object.assign(new Error('could not be completed'), {
+        proxyUsed: true,
+        cause: Object.assign(new Error('Request was cancelled.'), {
+            cause: new Error('Proxy response (407) !== 200 when HTTP Tunneling')
+        })
+    });
+
+    const line = nowPayments.describeTransportFailure(error);
+    assert.match(line, /407/, 'the proxy status code did not reach the log line');
+    assert.doesNotMatch(line, /Request was cancelled/,
+        'the generic wrapper was reported instead of the reason underneath it');
+    // One fault, one fix, and the operator is told what it is rather than left to recognise it.
+    assert.match(line, /username or password/i, 'the log does not say what to check');
+});
+
+test('a cause chain deeper than undici currently nests is still walked', () => {
+    // The walk is a loop with a depth cap precisely so a future undici that adds a level does
+    // not silently drop the answer again. Asserted by building a chain deeper than the real
+    // one, and by a self-referential chain, which an unbounded walk would spin on forever.
+    const deep = Object.assign(new Error('wrapper'), {
+        cause: Object.assign(new Error('middle'), {
+            cause: Object.assign(new Error('innermost'), {
+                cause: Object.assign(new Error('the real reason'), {
+                    cause: Object.assign(new Error('even deeper'), {
+                        cause: new Error('the actual fault')
+                    })
+                })
+            })
+        })
+    });
+    const line = nowPayments.describeTransportFailure(deep, { proxyUsed: false });
+    assert.match(line, /the real reason/, 'a deeply nested cause was dropped');
+
+    const looping = new Error('loops');
+    looping.cause = looping;
+    assert.doesNotThrow(() => nowPayments.describeTransportFailure(looping, { proxyUsed: false }));
+});
+
+test('a transport failure that is not a proxy fault is reported without proxy advice', () => {
+    // The 407 advice is specific to a 407. A DNS failure or a refused socket must not be given
+    // instructions about credentials it has nothing to do with.
+    const dns = Object.assign(new Error('fetch failed'), {
+        proxyUsed: false,
+        cause: Object.assign(new Error('getaddrinfo ENOTFOUND nowpayments.example'), { code: 'ENOTFOUND' })
+    });
+    const line = nowPayments.describeTransportFailure(dns);
+    assert.match(line, /ENOTFOUND/);
+    assert.doesNotMatch(line, /username or password/i,
+        'proxy credential advice was given for a non-proxy failure');
+});
+
+test('a 407 from the proxy stops the proxy being used again in this process', async () => {
+    // The failure mode this closes: one expired Fixie plan, or one typo in `FIXIE_URL`, made
+    // *every* payout fail -- each one paying a connection timeout, failing, and being reported
+    // as an indistinct transport error. A 407 is a configuration fault; waiting cannot change
+    // the answer. After one, the app routes directly so the payout queue keeps moving, and the
+    // operator gets a single line naming the cause.
+    const saved = { ...process.env };
+    const originalFetch = undici.fetch;
+    const errors = [];
+    const priorError = console.error;
+    process.env.NOWPAYMENTS_API_KEY = 'test-key';
+    process.env.NOWPAYMENTS_EMAIL = 'ops@example.com';
+    process.env.NOWPAYMENTS_PASSWORD = 'secret';
+    process.env.NOWPAYMENTS_API_BASE_URL = nowPayments.PRODUCTION_BASE_URL;
+    process.env.FIXIE_URL = 'http://user:pass@fixie.example:443';
+    // Explicit, for the same reason as the transport-failure test: a deployment with the IP
+    // whitelist off sets this in `.env`, so the proxy cannot be assumed merely from FIXIE_URL
+    // being present. This test is about what the proxy does when it is used.
+    process.env.NOWPAYMENTS_PAYOUT_PROXY = 'on';
+    console.error = (line) => errors.push(String(line));
+
+    try {
+        nowPayments.resetPayoutProxyState();
+        nowPayments.resetAuthTokenCache();
+
+        // Undici's exact shape for a proxy that refuses the CONNECT.
+        const proxy407 = () => {
+            const outer = new Error('fetch failed');
+            outer.cause = Object.assign(new Error('Request was cancelled.'), {
+                cause: new Error('Proxy response (407) !== 200 when HTTP Tunneling')
+            });
+            throw outer;
+        };
+
+        let calls = 0;
+        undici.fetch = async () => { calls += 1; proxy407(); };
+
+        // First failure: trips the breaker.
+        await assert.rejects(() => nowPayments.getAuthToken());
+        assert.equal(errors.length, 1, 'the breaker did not report itself');
+        assert.match(errors[0], /407/, 'the log does not name the status');
+        assert.match(errors[0], /username or password|wrong|lapsed/i,
+            'the log does not say what is wrong');
+        // It has to say what happens next, or the operator cannot tell whether payouts still run.
+        assert.match(errors[0], /directly/i, 'the log does not say the fallback');
+        assert.match(errors[0], /NOWPAYMENTS_PAYOUT_PROXY=off/,
+            'the log does not mention the opt-out for a deployment with no whitelist');
+
+        // Second failure: no longer goes through the proxy at all, so no second timeout.
+        await assert.rejects(() => nowPayments.getAuthToken());
+        assert.equal(calls, 2, 'the breaker did not stop the second request being attempted');
+        assert.equal(errors.length, 1, 'the breaker reported itself more than once');
+
+        // And the opt-out is what an operator sets once the whitelist is off.
+        process.env.NOWPAYMENTS_PAYOUT_PROXY = 'off';
+        assert.equal(nowPayments.payoutProxyDisabled(), true);
+        for (const value of ['false', '0', 'direct']) {
+            process.env.NOWPAYMENTS_PAYOUT_PROXY = value;
+            assert.equal(nowPayments.payoutProxyDisabled(), true, `${value} did not disable the proxy`);
+        }
+        // Unset is unchanged behaviour, which is the contract every existing deployment relies on.
+        delete process.env.NOWPAYMENTS_PAYOUT_PROXY;
+        assert.equal(nowPayments.payoutProxyDisabled(), false, 'an unset value disabled the proxy');
+    } finally {
+        console.error = priorError;
+        undici.fetch = originalFetch;
+        nowPayments.resetPayoutProxyState();
+        nowPayments.resetAuthTokenCache();
+        for (const [key, value] of Object.entries(saved)) {
+            if (value === undefined) delete process.env[key];
+            else process.env[key] = value;
+        }
+    }
+});
+
+test('a provider 407 is not mistaken for a broken proxy', () => {
+    // The breaker disables a *working* proxy if it misreads a provider answer, and the
+    // consequence is that every subsequent payout goes out from an address the provider may
+    // refuse. So the detector has to be specific: a 407 that is not about proxy tunnelling is
+    // somebody else's status code.
+    const providerRefusal = Object.assign(new Error('fetch failed'), {
+        cause: new Error('the server responded with status 407')
+    });
+    assert.equal(nowPayments.mentionsProxyAuthFailure(providerRefusal), false);
+
+    const proxyRefusal = Object.assign(new Error('fetch failed'), {
+        cause: Object.assign(new Error('Request was cancelled.'), {
+            cause: new Error('Proxy response (407) !== 200 when HTTP Tunneling')
+        })
+    });
+    assert.equal(nowPayments.mentionsProxyAuthFailure(proxyRefusal), true);
+
+    assert.equal(nowPayments.mentionsProxyAuthFailure(null), false);
+    assert.equal(
+        nowPayments.mentionsProxyAuthFailure(Object.assign(new Error('x'), { cause: new Error('getaddrinfo ENOTFOUND') })),
+        false
+    );
 });
 
 test('an unreachable validator is asked once, not once per withdrawal', async () => {

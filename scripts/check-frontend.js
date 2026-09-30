@@ -27,6 +27,11 @@ const pages = [
     'account.html',
     'history.html',
     'deposit-receipt.html',
+    // The withdrawal receipt is the same shape of page, and was added after the coverage note
+    // above was written, so it is listed explicitly rather than left to the list growing by
+    // accident. A page absent from here is a page whose classes, ids and control names are
+    // never checked at all.
+    'withdrawal-receipt.html',
     'reset-password.html',
     'privacy.html',
     'terms.html',

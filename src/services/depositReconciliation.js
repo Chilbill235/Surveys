@@ -3,6 +3,8 @@ const pool = require('../config/db');
 const {
     creditConfirmedDeposit,
     applyDepositStatus,
+    recordPartialPayment,
+    hasUncreditedArrival,
     targetStatusFor,
     knownProviderStatuses,
     isPaymentFullyPaid
@@ -199,8 +201,18 @@ async function reconcileNowPaymentsDeposit(deposit, summary, logger) {
         return;
     }
 
+    // What the provider says has arrived is recorded before anything is decided from the
+    // status, and for every status rather than only the short ones. Recording it first means the
+    // final total is on the row even on the pass that credits the deposit -- after the credit
+    // the row is closed and the write is correctly refused -- so "what did they actually send"
+    // survives on a settled deposit instead of only on the ones still short.
+    await recordProgress(deposit, providerPayment, summary, logger);
+
     const targetStatus = targetStatusFor(paymentStatus);
     if (targetStatus === 'confirming') {
+        // Nothing else changes here. The deposit stays `confirming` and is re-read on the next
+        // sweep, which is the whole of the "keep tracking a short payment" behaviour: the
+        // customer can send the remainder to the same address and the payment then finishes.
         logger.log(`Deposit ${deposit.id}: provider status is "${paymentStatus}" - leaving pending.`);
         summary.unchanged += 1;
         return;
@@ -215,6 +227,21 @@ async function reconcileNowPaymentsDeposit(deposit, summary, logger) {
         return;
     }
 
+    // The provider has given up on a payment that nonetheless has money in it. The amount is
+    // recorded and the row is left alone: closing it here would mark the deposit `failed`, email
+    // the customer that it did not go through, and leave real crypto sitting on an address this
+    // app gave them with no row pointing at it. That is the one outcome here that destroys
+    // money, and it is recoverable by a person in seconds from the row this leaves behind.
+    if (targetStatus === 'failed' && hasUncreditedArrival(providerPayment)) {
+        logger.error(
+            `Deposit ${deposit.id}: provider reports "${paymentStatus}" but ` +
+            `${providerPayment.actually_paid} ${providerPayment.pay_currency || 'units'} already arrived. ` +
+            'Leaving it open for an operator rather than failing a deposit that was partly paid.'
+        );
+        summary.skipped += 1;
+        return;
+    }
+
     await applyProviderOutcome(
         deposit,
         targetStatus,
@@ -223,6 +250,42 @@ async function reconcileNowPaymentsDeposit(deposit, summary, logger) {
         summary,
         logger
     );
+}
+
+/**
+ * Stores what the provider reported as received, without letting a storage failure stop the
+ * sweep. Recording progress is bookkeeping; the credit decision that follows is not, and a
+ * failed bookkeeping write must not turn a finished payment into an unreconciled one.
+ */
+async function recordProgress(deposit, providerPayment, summary, logger) {
+    try {
+        const result = await recordPartialPayment(deposit.id, {
+            actuallyPaid: providerPayment.actually_paid,
+            payCurrency: providerPayment.pay_currency,
+            payAmount: providerPayment.pay_amount
+        });
+        if (result.short) {
+            logger.log(
+                `Deposit ${deposit.id}: short by ` +
+                `${formatShortfall(providerPayment)} - still tracking it.`
+            );
+        }
+        return result;
+    } catch (error) {
+        logger.error(`Deposit ${deposit.id}: could not record payment progress (${error.message}).`);
+        summary.skipped += 1;
+        return { recorded: false, short: false };
+    }
+}
+
+/** The coin still owed, for an operator reading a log line. */
+function formatShortfall(providerPayment) {
+    const paid = Number(providerPayment.actually_paid);
+    const required = Number(providerPayment.pay_amount);
+    if (!Number.isFinite(paid) || !Number.isFinite(required)) return 'an unknown amount';
+    const unit = String(providerPayment.pay_currency || '').trim();
+    const owed = required - paid;
+    return `${unit ? `${unit} ` : ''}${owed > 0 ? owed : 0} (${paid} of ${required} received)`;
 }
 
 /**

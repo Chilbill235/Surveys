@@ -76,8 +76,9 @@ function validateRuntimeConfiguration() {
     // only in production meant a developer never found out locally.
     if (!process.env.CRON_SECRET) {
         console.warn(
-            'Warning: CRON_SECRET is not set, so /api/maintenance/reconcile-deposits is disabled ' +
-            'and will answer 503. Set CRON_SECRET to enable the scheduled recovery job.'
+            'Warning: CRON_SECRET is not set, so /api/maintenance/reconcile-deposits and ' +
+            '/api/maintenance/reconcile-payouts are disabled and will answer 503. Set CRON_SECRET ' +
+            'to enable the scheduled recovery jobs.'
         );
     }
 

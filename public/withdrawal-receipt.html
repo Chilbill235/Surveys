@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="theme-color" content="#131c4a" media="(prefers-color-scheme: dark)">
+    <meta name="theme-color" content="#2449d8" media="(prefers-color-scheme: light)">
+    <meta name="robots" content="noindex">
+    <meta name="description" content="Receipt and payout status for a RewardZone withdrawal.">
+    <title>Withdrawal receipt | RewardZone</title>
+    <link rel="stylesheet" href="/style.css">
+<link rel="icon" href="/favicon.ico" sizes="any">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="icon" href="/icon-192.png" sizes="192x192" type="image/png">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="manifest" href="/site.webmanifest">
+<!-- clock.js first: it builds #topbar-clock and #live-indicator into the header, and the
+     scripts below look them up once the DOM is ready. Deferred scripts run in document
+     order, so putting it ahead of them is what makes those lookups resolve. -->
+<script src="/clock.js" defer></script>
+    <script src="/session-gate.js" defer></script>
+    <script src="/withdrawal-receipt.js" defer></script>
+</head>
+<body data-requires-session="true">
+    <div class="toast-region" id="toast-region" aria-live="polite"></div>
+    <header class="topbar">
+        <a class="brand" href="/" aria-label="RewardZone home">
+            <img class="brand-mark" src="/brand.gif" alt="" width="36" height="36">
+            <span>reward<span class="brand-light">zone</span><span class="brand-tm" aria-hidden="true">&#8482;</span></span>
+        </a>
+        <div class="account-tools">
+            <a class="button button-light" href="/account">Back to account</a>
+        </div>
+    </header>
+
+    <main class="page-shell receipt-shell">
+        <!-- aria-live so a screen reader announces the outcome the moment it lands. This page
+             polls while a payout is in flight, so the state can change under the reader without
+             them having to reload, and that is the one thing a receipt must not do quietly. -->
+        <section class="receipt-card" id="receipt-card" aria-labelledby="receipt-heading" aria-live="polite" aria-busy="true">
+            <p class="eyebrow"><span class="eyebrow-dot" aria-hidden="true"></span> Withdrawal receipt</p>
+
+            <div class="receipt-state" id="receipt-state">
+                <span class="receipt-state-mark" id="receipt-mark" aria-hidden="true"></span>
+                <h1 class="display" id="receipt-heading">Loading your withdrawal...</h1>
+                <p class="receipt-lead" id="receipt-lead">Checking the payout provider.</p>
+            </div>
+
+            <dl class="receipt-facts" id="receipt-facts" hidden></dl>
+
+            <div class="receipt-actions" id="receipt-actions" hidden>
+                <a class="button button-accent button-wide" href="/account">Back to account</a>
+                <a class="button button-light button-wide" id="receipt-copy-link" href="#">Copy this link</a>
+            </div>
+
+            <p class="fine-print" id="receipt-footnote" hidden></p>
+        </section>
+    </main>
+</body>
+</html>

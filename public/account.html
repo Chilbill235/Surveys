@@ -260,7 +260,31 @@
                 <div id="history-container">
                     <p id="history-loading" class="body-text">Loading your history&hellip;</p>
                     <p id="history-error" class="body-text is-error" hidden>Could not load your history.</p>
+                    <!--
+                        Shown when a notification link asked for a row and the walk through the
+                        list finished without finding it. Silence here is the bug: the reader clicks
+                        "your withdrawal is on its way", the page does not move, and nothing says
+                        why -- which is indistinguishable from the link being broken. It is a
+                        separate element from `history-page-status` because that one is rewritten
+                        by every pagination render and would erase this on the next repaint.
+                    -->
+                    <p class="history-target-missing" id="history-target-missing" role="status" aria-live="polite" hidden></p>
                     <div id="history-list" hidden></div>
+                    <!--
+                        Pagination for the list above. It is hidden rather than absent whenever
+                        the whole history fits on one page, so a user with three transactions
+                        never sees "Page 1 of 1" -- a control that cannot do anything is noise,
+                        and the arrow keys on it would move focus nowhere.
+                    -->
+                    <nav id="history-pagination" class="history-pagination" aria-label="Transaction history pages" hidden>
+                        <button type="button" class="button button-ghost history-page-button" id="history-page-prev">
+                            <span aria-hidden="true">&larr;</span> Previous
+                        </button>
+                        <p class="history-page-status" id="history-page-status" aria-live="polite"></p>
+                        <button type="button" class="button button-ghost history-page-button" id="history-page-next">
+                            Next <span aria-hidden="true">&rarr;</span>
+                        </button>
+                    </nav>
                     <!-- Two different states share this block, and the copy is swapped between
                          them by `history.js`. "Your account has no transactions" and "your
                          deposits tab is empty" are not the same message: the first is answered

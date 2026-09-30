@@ -1,7 +1,7 @@
 const Stripe = require('stripe');
 const QRCode = require('qrcode');
 const pool = require('../config/db');
-const { creditConfirmedDeposit, applyDepositStatus, targetStatusFor, knownProviderStatuses, isPaymentFullyPaid } = require('../services/depositCredit');
+const { creditConfirmedDeposit, applyDepositStatus, recordPartialPayment, hasUncreditedArrival, targetStatusFor, knownProviderStatuses, isPaymentFullyPaid } = require('../services/depositCredit');
 const { resolvePublicBaseUrl, isPubliclyReachable } = require('../services/publicBaseUrl');
 const { parseAmountInRange, amountsMatch, formatUsd } = require('../services/money');
 const nowPayments = require('../services/nowPayments');
@@ -202,6 +202,29 @@ function ipnBodyFrom(req) {
     } catch {
         return null;
     }
+}
+
+/**
+ * Whether a callback's `parent_payment_id` names a real parent payment.
+ *
+ * A parent payment is reported as `parent_payment_id: null`, and "no parent" has to be
+ * recognisable no matter how the provider chose to serialise that null. The dashboard's
+ * "All-Strings" webhook format is why this is a question: with it selected, a JSON `null` can
+ * arrive as the string `"null"`, and every non-empty string is truthy. Reading truthiness there
+ * would classify the *parent* as a child payment, acknowledge it without crediting the deposit,
+ * and leave the balance unchanged for a payment that had actually completed -- on every crypto
+ * deposit, from one dropdown.
+ *
+ * So the string forms of "absent" are treated as absent, and a real id is anything else. A
+ * genuine parent id is numeric, so the digit test costs nothing and rejects a stray `"undefined"`
+ * or `"[]"` from a provider that stringifies more aggressively than the documentation says.
+ */
+function hasParentPayment(value) {
+    if (value === null || value === undefined) return false;
+    const text = String(value).trim();
+    if (text === '') return false;
+    if (text.toLowerCase() === 'null' || text.toLowerCase() === 'undefined') return false;
+    return /^\d+$/.test(text);
 }
 
 /** The API key, or null when it is missing or still a placeholder. */
@@ -1062,7 +1085,17 @@ async function nowPaymentsIpn(req, res) {
     // acknowledged as understood rather than rejected, because a 400 is a failed
     // delivery the provider would keep retrying, and the deposit it belongs to is
     // credited by the parent's own `finished` callback regardless.
-    if (ipn.parent_payment_id) {
+    //
+    // Presence is decided by `hasParentPayment` rather than by truthiness. The dashboard
+    // offers an "All-Strings" webhook format, in which every value arrives as a string --
+    // and a JSON `null` can then arrive as `"null"` or `""` rather than as `null`. Both are
+    // falsy-or-truthy in ways that matter: the truthiness test below read `"null"` as a real
+    // parent id, so the *parent* payment would be acknowledged as a child and returned
+    // without crediting anything. Since a parent has no parent's parent, its own `finished`
+    // callback is the only one that can settle the deposit, so the money arrived, the user was
+    // told nothing, and the balance never moved. One dashboard dropdown would have been able
+    // to do that to every crypto deposit on the site.
+    if (hasParentPayment(ipn.parent_payment_id)) {
         ipnLog.record({
             outcome: 'accepted',
             detail: 'Child payment acknowledged; the parent callback settles the deposit.',
@@ -1127,7 +1160,19 @@ async function nowPaymentsIpn(req, res) {
         // customer was quoted is the check that makes this a payment rather than a
         // status string, and it is the same check the reconciler applies.
         if (targetStatusFor(paymentStatus) === 'confirmed' && !isPaymentFullyPaid(ipn)) {
-            await client.query('ROLLBACK');
+            // Recorded before the rollback, on this transaction's client, because this is the
+            // exact case the column is for: the provider says the payment is finished and the
+            // customer is still short. Refusing the credit is right -- the money is not all
+            // there -- but refusing it without recording how much did arrive leaves a
+            // permanently unanswerable question about a deposit the customer is still funding.
+            if (ipn.actually_paid !== undefined && ipn.actually_paid !== null) {
+                await recordPartialPayment(deposit.id, {
+                    actuallyPaid: ipn.actually_paid,
+                    payCurrency: ipn.pay_currency,
+                    payAmount: ipn.pay_amount
+                }, client);
+            }
+            await client.query('COMMIT');
             const detail = `Reported ${paymentStatus} but actually_paid (${ipn.actually_paid}) does not cover pay_amount (${ipn.pay_amount}).`;
             console.error(`NOWPayments reported deposit ${deposit.id} as ${paymentStatus} but actually_paid does not cover pay_amount.`);
             ipnLog.record({ outcome: 'refused', detail, paymentId, orderId: depositId, status: paymentStatus });
@@ -1165,6 +1210,33 @@ async function nowPaymentsIpn(req, res) {
         const targetStatus = targetStatusFor(paymentStatus);
         let credited = null;
         let statusChanged = false;
+
+        // Recorded on the caller's own client, inside this transaction, for two reasons. The row
+        // is held FOR UPDATE here, so a second connection would block on the lock this
+        // transaction already holds. And a short payment is the case this exists for: the
+        // customer can top up the same address later, and until the total that actually arrived
+        // is on the row there is no way to answer "how much is still owed" without going back to
+        // the provider by hand.
+        if (ipn.actually_paid !== undefined && ipn.actually_paid !== null) {
+            await recordPartialPayment(deposit.id, {
+                actuallyPaid: ipn.actually_paid,
+                payCurrency: ipn.pay_currency,
+                payAmount: ipn.pay_amount
+            }, client);
+        }
+
+        // The provider has given up on a payment that nonetheless has money in it. Marking it
+        // `failed` here would email the customer that the deposit did not go through while most
+        // of it sits on an address this app gave them, and the row that would say otherwise is
+        // the row this just wrote. Left open, an operator sees the amount and settles it.
+        if (targetStatus === 'failed' && hasUncreditedArrival(ipn)) {
+            await client.query('COMMIT');
+            const detail = `Reported ${paymentStatus} but ${ipn.actually_paid} ${ipn.pay_currency || 'units'} already arrived; left open for an operator.`;
+            console.error(`NOWPayments reported deposit ${deposit.id} as ${paymentStatus} with money already received.`);
+            ipnLog.record({ outcome: 'accepted', detail, paymentId, orderId: depositId, status: paymentStatus });
+            return res.status(200).send('Partially received; left open for review.');
+        }
+
         if (targetStatus === 'confirmed') {
             // creditConfirmedDeposit is the only thing that writes 'confirmed', and
             // it also flips credited_at, so the status and the credit cannot diverge.

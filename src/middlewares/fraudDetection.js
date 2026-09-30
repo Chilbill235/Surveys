@@ -143,6 +143,68 @@ function normaliseAddress(value) {
     return address.toLowerCase();
 }
 
+/**
+ * Whether an address is one that can exist on the public internet.
+ *
+ * proxycheck.io has no answer for a private, loopback, link-local or reserved address. It does
+ * not refuse them as a policy -- it rejects them as malformed input, answering with
+ * `{"status":"error","message":"No valid IP Addresses supplied."}`. That response is
+ * indistinguishable from a quota or auth failure once it has been flattened into
+ * `verdict: 'unknown'`, so with `PROXYCHECK_REQUIRED=true` it refused every click with
+ * "Fraud checks are temporarily unavailable."
+ *
+ * That is a guaranteed outage in any of the places these addresses actually appear:
+ *
+ *   - local development, where `req.ip` is `::ffff:127.0.0.1` -> `127.0.0.1`
+ *   - a container or VM on a private network
+ *   - any deployment whose proxy reports a private address because `trust proxy` is not
+ *     configured, so every request arrives looking like it came from the inside
+ *
+ * The check is skipped for these, deliberately, rather than treated as a failure. There is
+ * nothing to look up: no VPN can be hiding behind `10.0.0.1`. The velocity check still runs, so
+ * the control is not lost -- it is the part that is actually meaningful for an address that
+ * only ever resolves to the same machine.
+ */
+function isPubliclyRoutableAddress(address) {
+    if (typeof address !== 'string' || address === '') return false;
+    const text = address.trim().toLowerCase();
+
+    // IPv6 loopback (::1), unspecified (::), and unique-local (fc00::/7). Link-local fe80::/10
+    // is matched by the same prefix test as the unique-local range, which is why it is checked
+    // here rather than assumed to be covered.
+    //
+    // A `2000::/3` global unicast address falls through every test below and is reported
+    // public, which is the answer for `2001:4860:4860::8888` and the rest of the global
+    // range. Only the ranges that cannot leave the local network are rejected here.
+    if (text === '::1' || text === '::') return false;
+    if (/^f[cd][0-9a-f]{2}:/.test(text)) return false;
+    if (/^fe[89ab][0-9a-f]:/.test(text)) return false;
+    // IPv4-mapped and IPv4-compatible IPv6, e.g. ::ffff:127.0.0.1.
+    if (/^::(ffff:)?/.test(text)) {
+        const embedded = text.replace(/^::(ffff:)?/, '');
+        if (embedded !== '' && /^\d{1,3}(\.\d{1,3}){3}$/.test(embedded)) {
+            return isPubliclyRoutableAddress(embedded);
+        }
+        return false;
+    }
+
+    const ipv4 = text.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+    if (!ipv4) {
+        // An IPv6 address that survived the range checks above is global unicast, and the
+        // provider can be asked about it. A hostname is not an address at all: nothing to look
+        // up, and sending it would only produce another "no valid IP addresses" 503.
+        return /^[0-9a-f:]+$/.test(text) && text.includes(':');
+    }
+    const [a, b] = ipv4.slice(1).map(Number);
+    if (a === 0 || a === 10 || a === 127) return false;
+    if (a === 169 && b === 254) return false;              // link-local
+    if (a === 172 && b >= 16 && b <= 31) return false;     // private
+    if (a === 192 && b === 168) return false;              // private
+    if (a === 100 && b >= 64 && b <= 127) return false;    // carrier-grade NAT
+    if (a >= 224) return false;                             // multicast, reserved, broadcast
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // Proxy check cache
 // ---------------------------------------------------------------------------
@@ -199,6 +261,7 @@ function cacheSet(ip, value, ttlMs = PROXY_CACHE_TTL_MS) {
 function resetFraudCache() {
     proxyCache.clear();
     missingKeyWarned = false;
+    unroutableWarned = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -207,6 +270,13 @@ function resetFraudCache() {
 
 /** Warns once per process about a missing key, so the log is not spammed per click. */
 let missingKeyWarned = false;
+
+/**
+ * Warns once per process about an unroutable peer address, for the same reason. Distinct from
+ * `missingKeyWarned` because it reports a configuration problem with the deployment's address
+ * reporting rather than an unconfigured provider, and the two call for different fixes.
+ */
+let unroutableWarned = false;
 
 // ---------------------------------------------------------------------------
 // Proxy check
@@ -385,28 +455,45 @@ async function fraudDetection(req, res, next) {
     // --- Proxy / VPN check --------------------------------------------------
 
     if (process.env.PROXYCHECK_KEY) {
-        const lookup = await lookupProxy(ipAddress);
-        req.fraud.proxy = lookup.verdict;
-        if (lookup.type) req.fraud.proxyType = lookup.type;
-
-        if (lookup.verdict === 'proxy') {
-            await logFraud(userId, ipAddress, `VPN/Proxy detected: ${lookup.type}`);
-            return refuse(res, 403, 'VPNs and proxies are not allowed.');
-        }
-
-        if (lookup.verdict === 'unknown') {
-            // The distinction the old code could not make: a provider that could not be
-            // reached is not the same as a provider that answered "clean".
-            const tag = lookup.cached ? 'cached ' : '';
-            console.warn(`Proxy check returned ${tag}unknown (${lookup.reason}) for ${ipAddress}.`);
-            if (proxyCheckRequired()) {
-                return refuse(res, 503, 'Fraud checks are temporarily unavailable.');
+        // An address that cannot exist on the public internet has no proxy verdict to give,
+        // and the provider rejects it as malformed input rather than answering about it. Asking
+        // anyway produced a 503 on every click from a local dev server, a private network, or any
+        // deployment whose `trust proxy` setting leaves `req.ip` as the proxy's own address.
+        // Skipping is not the same as failing open on a real check: the velocity check below
+        // still runs, and there is no VPN behind `127.0.0.1` to find.
+        if (!isPubliclyRoutableAddress(ipAddress)) {
+            req.fraud.proxy = 'not-routable';
+            if (!unroutableWarned) {
+                unroutableWarned = true;
+                console.warn(
+                    `Proxy check skipped: ${ipAddress} is not a publicly routable address, so ` +
+                    'there is no VPN or proxy verdict to look up. Clicks are still velocity-checked.'
+                );
             }
-            await logFraud(
-                userId,
-                ipAddress,
-                `Proxy check unavailable (${lookup.reason}); click allowed (PROXYCHECK_REQUIRED is not set)`
-            );
+        } else {
+            const lookup = await lookupProxy(ipAddress);
+            req.fraud.proxy = lookup.verdict;
+            if (lookup.type) req.fraud.proxyType = lookup.type;
+
+            if (lookup.verdict === 'proxy') {
+                await logFraud(userId, ipAddress, `VPN/Proxy detected: ${lookup.type}`);
+                return refuse(res, 403, 'VPNs and proxies are not allowed.');
+            }
+
+            if (lookup.verdict === 'unknown') {
+                // The distinction the old code could not make: a provider that could not be
+                // reached is not the same as a provider that answered "clean".
+                const tag = lookup.cached ? 'cached ' : '';
+                console.warn(`Proxy check returned ${tag}unknown (${lookup.reason}) for ${ipAddress}.`);
+                if (proxyCheckRequired()) {
+                    return refuse(res, 503, 'Fraud checks are temporarily unavailable.');
+                }
+                await logFraud(
+                    userId,
+                    ipAddress,
+                    `Proxy check unavailable (${lookup.reason}); click allowed (PROXYCHECK_REQUIRED is not set)`
+                );
+            }
         }
     } else if (proxyCheckRequired()) {
         // Asked to fail closed but cannot: say so distinctly, because the difference
@@ -456,4 +543,5 @@ module.exports.normaliseAddress = normaliseAddress;
 // without standing up a database, and for a configuration change that should not have to
 // wait out the cache TTL.
 module.exports.resetFraudCache = resetFraudCache;
-module.exports.__private = { normaliseAddress, isScriptedClient, checkProxyVerdict };
+module.exports.isPubliclyRoutableAddress = isPubliclyRoutableAddress;
+module.exports.__private = { normaliseAddress, isScriptedClient, checkProxyVerdict, isPubliclyRoutableAddress };

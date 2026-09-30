@@ -209,6 +209,10 @@ app.get('/receipt/deposit/:id', (req, res) => {
     sendHtml(res, 'deposit-receipt.html');
 });
 
+app.get('/receipt/withdrawal/:id', (req, res) => {
+    sendHtml(res, 'withdrawal-receipt.html');
+});
+
 app.get(['/demo', '/demo/'], (req, res) => {
     if (!isDemoModeEnabled()) {
         return res.status(404).send('Page not found.');

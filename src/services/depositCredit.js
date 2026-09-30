@@ -117,11 +117,15 @@ async function creditConfirmedDeposit(client, deposit, description) {
     }
 
     const ledgerInsert = await client.query(
-        `INSERT INTO balance_transactions (user_id, amount, transaction_type, source_id, description)
-         VALUES ($1, $2, 'deposit', $3, $4)
+        `INSERT INTO balance_transactions (user_id, amount, transaction_type, source_id, description, deposit_id)
+         VALUES ($1, $2, 'deposit', $3, $4, $5)
          ON CONFLICT (transaction_type, source_id) DO NOTHING
          RETURNING id`,
-        [userId, amount, deposit.ledger_source_id, description]
+        // `source_id` is the provider's identifier and cannot say which of our deposits it was,
+        // so the link to the deposit is carried separately. Without it a ledger row could only
+        // ever say "a deposit was credited", never which one, and the history list could not
+        // offer a receipt for the row it is showing. See migration 027.
+        [userId, amount, deposit.ledger_source_id, description, deposit.id]
     );
 
     if (ledgerInsert.rowCount !== 1) {
@@ -171,9 +175,101 @@ async function applyDepositStatus(client, depositId, status, providerPaymentId =
     return result.rowCount > 0;
 }
 
+/**
+ * Records what the provider says has arrived, without deciding anything about the deposit.
+ *
+ * A short payment is not a failure the provider reports as one. The payment sits at
+ * `partially_paid`, the customer can send the remainder to the same address, and the payment
+ * then finishes and is credited in full. So this function deliberately changes no status and
+ * touches no balance: it exists so the shortfall is *recorded* while it is happening, which is
+ * the difference between a deposit an operator can see and one they can only reconstruct by
+ * asking the provider.
+ *
+ * The comparison against `pay_amount` is the same relative one `isPaymentFullyPaid` uses, for
+ * the same reason, and it is reused rather than reimplemented so the two cannot disagree about
+ * what counts as short. A provider that reports a total below the quote is short by definition;
+ * one that reports it at or above is not, whatever the status string says.
+ *
+ * `underpaid_at` is set once and never moved, so it answers "how long has this been short"
+ * rather than "when was it last looked at". It is not cleared when the shortfall closes: the
+ * record that a deposit was once underpaid is worth keeping, and the column is only read for
+ * deposits that are still short.
+ *
+ * Safe to call on a credited deposit, and on one whose row has already been closed: the guard
+ * is `credited_at IS NULL`, so a late callback about money that has been credited cannot
+ * rewrite history, and a repeat callback writes the same value again.
+ *
+ * `client` is injectable because the callback path holds the row `FOR UPDATE` inside an open
+ * transaction. Taking a second connection for this write would block on the lock the calling
+ * transaction already holds -- the process waiting on itself -- so the caller must pass its own
+ * client when it has one. The default is for the read-only callers that have no transaction.
+ */
+async function recordPartialPayment(depositId, { actuallyPaid, payCurrency, payAmount } = {}, client = pool) {
+    const id = Number(depositId);
+    if (!Number.isInteger(id) || id <= 0) return { recorded: false, short: false };
+
+    // A missing or unparseable figure is not a shortfall and not a payment; recording either
+    // would put a number on the row that the provider never asserted. A callback stripped of
+    // its fields is exactly what a misconfigured proxy produces, and it must leave no trace
+    // beyond the refusal that already happened upstream.
+    //
+    // The absence check is explicit rather than left to `Number()`, because `Number(null)` and
+    // `Number('')` are both exactly 0: a body with `"actually_paid": null` would otherwise store
+    // a hard zero on the deposit and read as "the customer sent nothing", which is a claim about
+    // the payment rather than an absence of one.
+    if (actuallyPaid === null || actuallyPaid === undefined || actuallyPaid === '' ||
+        typeof actuallyPaid === 'boolean') {
+        return { recorded: false, short: false };
+    }
+    const paid = Number(actuallyPaid);
+    if (!Number.isFinite(paid) || paid < 0) return { recorded: false, short: false };
+
+    const currency = String(payCurrency || '').trim().toLowerCase().slice(0, 24) || null;
+    const required = Number(payAmount);
+    // Only a shortfall can be measured against a quote. With no quote to compare, the amount is
+    // still worth recording, but whether it is short is unknown and must not be guessed.
+    const short = Number.isFinite(required) && required > 0
+        ? !isPaymentFullyPaid({ actually_paid: paid, pay_amount: required })
+        : false;
+
+    const result = await client.query(
+        `UPDATE deposits
+         SET actually_paid = $1,
+             pay_currency = COALESCE($2, pay_currency),
+             underpaid_at = CASE WHEN $3 AND underpaid_at IS NULL THEN NOW() ELSE underpaid_at END,
+             updated_at = NOW()
+         WHERE id = $4
+           AND credited_at IS NULL
+         RETURNING id`,
+        [paid, currency, short, id]
+    );
+
+    return { recorded: result.rowCount > 0, short };
+}
+
+/**
+ * Whether a provider answer means money arrived that this app has not credited.
+ *
+ * The provider reports `failed` or `expired` for a payment that was abandoned part-way, and the
+ * honest reading of that is not "nothing happened". When `actually_paid` is positive the
+ * customer has already sent real crypto to an address this app gave them, and the correct
+ * response is to keep the row and its amount on file for a person rather than to close it as a
+ * clean failure -- which is what would otherwise produce a "your deposit did not go through"
+ * email about a deposit that is mostly in the address.
+ *
+ * Deliberately conservative: it needs a positive amount, so the ordinary abandoned deposit
+ * that received nothing still fails normally and unattended.
+ */
+function hasUncreditedArrival(payload) {
+    const paid = Number(payload?.actually_paid);
+    return Number.isFinite(paid) && paid > 0;
+}
+
 module.exports = {
     creditConfirmedDeposit,
     applyDepositStatus,
+    recordPartialPayment,
+    hasUncreditedArrival,
     targetStatusFor,
     creditingProviderStatuses,
     failingProviderStatuses,

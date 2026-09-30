@@ -184,7 +184,8 @@ with `contentSecurityPolicy: false`, and with `frameguard: false`:
 | `PROXYCHECK_KEY` | optional | VPN/proxy fraud checks on click tracking. |
 | `PROXYCHECK_REQUIRED` | optional | `true` refuses clicks while a proxy check cannot run. Default `false`: the click is tracked and the gap logged. |
 | `FRAUD_VELOCITY_THRESHOLD`, `FRAUD_VELOCITY_WINDOW_SECONDS` | optional | How many clicks one address may record in a window before it is treated as automated. |
-| `FIXIE_URL` | optional | Residential proxy used for provider calls. Empty means calls go out directly. |
+| `FIXIE_URL` | optional | Fixed-egress proxy for NOWPayments **payout** calls, which are restricted to a whitelist of IP addresses. Needed on a serverless host, whose outbound address changes on every cold start. Leave empty once the provider's IP whitelist is switched off. |
+| `NOWPAYMENTS_PAYOUT_PROXY` | optional | `off` (or `false`/`0`/`direct`) never routes payouts through `FIXIE_URL`, even when that variable is still present. Set it when the provider no longer restricts payouts by IP — a stale or expired proxy otherwise fails every payout. |
 | `OFFERS_TEST_REAL` | optional | `true` lets a demo offer marked `pays_real_money` move a **real** balance instead of `demo_balance`. Off by default: a deployment that never sets it cannot move cash through the demo flow. |
 | `OFFERS_INCLUDE_DEMO` | optional | `true` enables the demo offers, the `/demo` page, and the demo reward flow. Unset means enabled outside production only. |
 | `CRON_SECRET` | recommended | Protects scheduled deposit reconciliation. |
@@ -399,11 +400,29 @@ A withdrawal is already debited when it is requested, so this changes only *who 
    impossible to tell whether the provider accepted the batch, so the claim is *held* in
    `SUBMISSION_UNKNOWN` rather than released. Releasing it would let the next run duplicate a
    transfer; failing it would refund a user whose money may already be moving.
-4. **Only a `FINISHED` callback marks a withdrawal paid**, and only a `REJECTED` one refunds
+4. **A duplicate `unique_external_id` is held, not released.** The id sent to the provider is
+   `wd-<withdrawal id>`, derived from the row rather than generated, so it is identical on every
+   attempt to send the same withdrawal — which is what makes a repeated send impossible. The
+   cost is that once *any* attempt has reached the provider, the id is spent for good and
+   `POST /v1/payout` answers `400 unique_external_id already exists` from then on.
+
+   That refusal arrives as a 4xx, so the general rule above would release the claim — and this
+   is the one 4xx where that is exactly backwards. The refusal is evidence that a payout under
+   this id *exists*. Releasing sends the row back to `pending`, the next run re-claims it, the
+   next send is refused identically, and the loop repeats on every scheduler tick: the log
+   reads `1 claimed, 1 resolved [74:released]` while the balance stays debited and the money
+   never moves. It is also a double-payment hazard, because a row released to `pending` is one
+   the app will send under a fresh id the moment one is supplied.
+
+   So this case is detected by the provider's own wording (`isDuplicateExternalId`) and held
+   like a transport failure whose answer is unknown. See
+   [When something is stuck](#when-something-is-stuck) — it needs a person, because the only
+   way to learn the existing payout's batch id is the dashboard.
+5. **Only a `FINISHED` callback marks a withdrawal paid**, and only a `REJECTED` one refunds
    it. Both go through the same `sendWithdrawal` / `reverseWithdrawal` the operator endpoints
    use, so a `paid` withdrawal still cannot be refunded and a refund is still a balance
    write plus a ledger row in one transaction.
-5. **Only crypto, filtered in SQL.** The claim query carries `payment_method = 'crypto'`, so
+6. **Only crypto, filtered in SQL.** The claim query carries `payment_method = 'crypto'`, so
    a PayPal address cannot reach the provider even if a caller asks for it.
 
 The network fee is estimated and recorded per payout, but it is charged against the NOWPayments
@@ -418,9 +437,38 @@ equivalent of what they requested.
    `NOWPAYMENTS_EMAIL`, `NOWPAYMENTS_PASSWORD`, and `NOWPAYMENTS_IPN_SECRET`.
    The IPN secret is what tells the app a payout finished — without it a sent withdrawal sits
    in `processing` and the user is told their money is in flight when it is not.
-3. **Redeploy.** `db/migrations/009_auto_payouts.sql` adds the payout columns and the unique
+
+   The secret is generated on the NOWPayments dashboard, under **Set up IPN** → *Your IPN secret
+   key*. Copy it into `NOWPAYMENTS_IPN_SECRET` (it is 32 characters) and never regenerate it
+   without updating the environment: a rotated secret invalidates the signature on every callback
+   in flight, and they are refused as `Signature did not match` until the new one is deployed.
+
+3. **Set the dashboard's Webhook URL** to
+   `https://<your-domain>/api/payments/nowpayments/ipn`, with `APP_BASE_URL` set to the same
+   public HTTPS origin.
+
+   This is a safety net rather than the main path. Both the deposit create and the payout batch
+   submit pass their own `ipn_callback_url`, built from `APP_BASE_URL`, so callbacks normally
+   arrive without the dashboard setting. It is still worth setting: it is what covers a payment
+   created outside the API, and it is where a delivery failure shows up. If `APP_BASE_URL` is
+   localhost the app refuses to build a callback at all rather than posting the provider a dead
+   address — a deposit would then never be credited, with no error anywhere.
+
+   **Webhook format:** either option is now safe. *All-Strings* used to be a hazard and was
+   hardened — the handler decided "is this a child payment?" by testing `parent_payment_id` for
+   truth, and that field is `null` for an ordinary parent payment. Under All-Strings a JSON
+   `null` arrives as the string `"null"`, so the parent was read as a child, acknowledged with
+   a 200, and credited nothing: the money arrived and the balance never moved, on every crypto
+   deposit, from one dropdown. The check is now an explicit test for a real parent id. Everything
+   else the callback reads is coerced with `String()`/`Number()`, so the format is inert.
+
+   **Recurring notifications:** leave it on. It is the provider's retry schedule for callbacks
+   that fail to deliver, and it is what rescues a payout whose callback was missed while the
+   service was down. A 5-minute interval costs nothing when nothing is wrong.
+
+4. **Redeploy.** `db/migrations/009_auto_payouts.sql` adds the payout columns and the unique
    index on `batch_id`; the build applies it.
-4. **Check readiness** — this sends nothing:
+5. **Check readiness** — this sends nothing:
    ```bash
    npm run withdrawals -- preflight
    ```
@@ -455,6 +503,19 @@ the script or a scheduler that can send a POST.
 Anything in `SUBMISSION_UNKNOWN` is listed by `npm run withdrawals -- list` and needs a human
 decision, which is the point: it is the one state where the app cannot safely choose.
 
+One `SUBMISSION_UNKNOWN` needs more than the others. When the provider answers
+`400 unique_external_id already exists`, the log says so explicitly and names the external id
+(`wd-<withdrawal id>`). The run will not fix it and re-running will not either — the id is
+spent for good, so the same refusal comes back every time. Settle it from the NOWPayments
+dashboard:
+
+- **A payout exists under that external id.** It is the one this app sent. Mark it with
+  `npm run withdrawals -- paid <id> <provider-reference>`, or let the callback land if the batch
+  was verified.
+- **No payout exists under it.** The row is safe to release, but nothing in the app will do it
+  for you — the id stays spent, so re-sending would be refused the same way. Use the operator
+  endpoints, and expect to send the payout under a fresh external id.
+
 ### Resolving a withdrawal
 
 A request is a debit the moment it is stored, so it has to end somewhere. Two operator
@@ -481,6 +542,44 @@ still debited and nothing in the app able to notice.
 
 Both actions are single-shot. A second call reports `409` rather than repeating the write,
 because a retried operator action and a contradictory one are different problems.
+
+### Cancelling your own withdrawal
+
+`POST /api/user/withdrawals/:id/cancel` lets a user take back a request that is going nowhere,
+and the withdraw dialog offers a **Cancel** button on any row the server marks `cancellable`. It
+is a refund — the balance goes straight back — so the interesting part is when it is *refused*.
+
+A user cannot be asked to read a provider dashboard first, so this is deliberately **narrower**
+than the operator refund above rather than a thinner version of it. The operator rule is "refuse
+anything with a `provider_reference`", because that is the record that a payout was submitted.
+That guard is not enough on its own: `provider_reference` is only written when a payout reaches
+`paid`, so **every stage before that leaves it NULL** — claimed, batch submitted, in flight, or
+parked because the provider never answered. A crypto withdrawal in `WAITING` is therefore
+invisible to it, and refunding one credits the balance while the transfer completes, paying the
+same person twice with a ledger that agrees with itself throughout.
+
+So a cancel is allowed only while the row carries no evidence that a payout was ever *started*:
+
+| Column | Means |
+| --- | --- |
+| `payout_claimed_at` | A payout run has claimed this row. |
+| `payout_status` | The provider or the claimer has written a payout state onto it. |
+| `batch_id` / `payout_provider_id` | A batch exists at the provider under this id. |
+| `payout_submitted_at` | A submission was recorded. |
+| `provider_reference` | A payout was submitted or finished. |
+
+`payout_claimed_at` is the one that makes this safe rather than merely cautious. It is written
+by the claim `UPDATE` in the same statement that moves the row to `processing`, and cleared only
+on a *release* — a provable refusal. So "no claim is live" holds even across a crash mid-run: a
+row claimed by a process that then died is refused, which is correct, because that process may
+have sent the payout before it went down.
+
+The refusals are worded separately because they are not the same problem. `already-sent` is the
+only one the app cannot resolve itself, so it says the balance was **not** refunded and that
+support can confirm it — a message that left the refund unmentioned would be read as "your money
+is on its way back" by exactly the users who most want to believe it. The same predicate is
+computed in SQL for the list endpoint's `cancellable` flag, so the button and the rule that
+enforces it cannot drift apart.
 
 #### Calling them
 
@@ -732,6 +831,34 @@ not repainted, so the live indicator does not flicker on every idle poll.
 
 The indicator above the balance states which of those is happening: live, waiting on a
 provider, stale, just credited, or failed.
+
+### The transaction list pages on the server
+
+`GET /api/user/history` returns five rows at a time — `?limit=` and `?offset=`, with the true
+total for the current tab in the `X-Total-Count` header — and the account page pages through
+them with Previous/Next. The response body is still a bare array of transactions, because the
+CSV export iterates it directly; the count is a header rather than an envelope for exactly that
+reason.
+
+Two decisions are load-bearing, and both are about the filter tabs rather than the paging:
+
+- **The `type` filter is applied in SQL, not to the page that came back.** Fetching one page and
+  filtering it to deposits counts the wrong rows: the tab would show three of twenty under a
+  header claiming twenty, and "page 2" would skip or repeat rows depending on where the
+  deposits happened to fall. `?type=` is matched against a fixed list, and an unrecognised value
+  is refused rather than treated as no filter — silently returning everything would hide a client
+  bug behind a list that looks right.
+- **The count and the page come from one query**, via `COUNT(*) OVER ()`, so they cannot
+  describe different moments. A page past the end has no rows to carry the window function's
+  count, so it asks for the count separately rather than substituting its own offset, which
+  would invent a screenful of pages that do not exist.
+
+The list refreshes in real time by listening for `applyLiveUpdate`'s `historyChanged` event
+rather than running a timer of its own. `/api/user/updates` already polls, already answers `304`
+when the ledger is still, and already carries the rows that moved, so a second poller would cost
+a request every twenty seconds to learn nothing. The CSV export asks for `limit=500` instead:
+five rows is right for a list and wrong for a file, and an export that quietly covered one page
+would be indistinguishable from an account with five transactions.
 
 ### Two layouts, not one layout that shrinks
 

@@ -1,6 +1,8 @@
 const { notificationRows } = require('./helpers/notificationRows');
 const assert = require('node:assert/strict');
 const { createHmac, randomUUID } = require('node:crypto');
+const fs = require('node:fs');
+const path = require('node:path');
 const { after, before, test } = require('node:test');
 const jwt = require('jsonwebtoken');
 const Stripe = require('stripe');
@@ -1003,6 +1005,14 @@ test('NOWPayments deposit addresses persist and signed confirmations credit once
         // passes -- which is the failure mode the strict stub exists to prevent.
         const notification = notificationRows(normalized);
         if (notification) return notification;
+        // The partial-payment progress write, issued on the callback's own transaction client.
+        // `credited_at IS NULL` is the guard that makes it harmless here, and answering it
+        // rather than letting it throw is what keeps a signed callback answering 200; the
+        // deposit test that cares whether progress is recorded asserts on the real service
+        // directly (test/depositPartialPayment.test.js) instead of through this stub.
+        if (/UPDATE deposits\s+SET actually_paid/.test(normalized)) {
+            return { rows: [{ id: values[3] }], rowCount: 1 };
+        }
         throw new Error(`Unexpected test query: ${normalized}`);
     }
 
@@ -1374,6 +1384,14 @@ test('a non-finished NOWPayments status never credits, and a malformed signature
         // passes -- which is the failure mode the strict stub exists to prevent.
         const notification = notificationRows(normalized);
         if (notification) return notification;
+        // The partial-payment progress write, issued on the callback's own transaction client.
+        // `credited_at IS NULL` is the guard that makes it harmless here, and answering it
+        // rather than letting it throw is what keeps a signed callback answering 200; the
+        // deposit test that cares whether progress is recorded asserts on the real service
+        // directly (test/depositPartialPayment.test.js) instead of through this stub.
+        if (/UPDATE deposits\s+SET actually_paid/.test(normalized)) {
+            return { rows: [{ id: values[3] }], rowCount: 1 };
+        }
         throw new Error(`Unexpected test query: ${normalized}`);
     }
 
@@ -1786,6 +1804,14 @@ test('reconciliation credits a card deposit whose Stripe webhook was lost', asyn
         // passes -- which is the failure mode the strict stub exists to prevent.
         const notification = notificationRows(normalized);
         if (notification) return notification;
+        // The partial-payment progress write, issued on the callback's own transaction client.
+        // `credited_at IS NULL` is the guard that makes it harmless here, and answering it
+        // rather than letting it throw is what keeps a signed callback answering 200; the
+        // deposit test that cares whether progress is recorded asserts on the real service
+        // directly (test/depositPartialPayment.test.js) instead of through this stub.
+        if (/UPDATE deposits\s+SET actually_paid/.test(normalized)) {
+            return { rows: [{ id: values[3] }], rowCount: 1 };
+        }
         throw new Error(`Unexpected test query: ${normalized}`);
     }
 
@@ -2000,6 +2026,80 @@ test('the scheduled reconciliation endpoint distinguishes misconfiguration from 
     }
 });
 
+/**
+ * Payouts need the same scheduled recovery deposits have, and for the same reason.
+ *
+ * `reconcilePayouts` was correct and tested the whole time, and `server.js` runs it on a
+ * timer -- but the deployed app does not run `server.js`. Vercel serves `api/index.js`, which
+ * has no timer, so the in-process loop was a development-only safety net. A payout that
+ * finished on-chain with its callback undeliverable therefore left the withdrawal in
+ * `processing`, the balance debited, and the user told nothing, until a human noticed. This
+ * endpoint is what makes the recovery reachable in production, so it is asserted here rather
+ * than left to a cron entry nobody tests.
+ */
+test('payout reconciliation is reachable on a schedule, behind the same secret', async () => {
+    const priorEnvironment = process.env.NODE_ENV;
+    const priorSecret = process.env.CRON_SECRET;
+    const originalQuery = pool.query;
+    const secret = 'cron-secret-for-the-test-suite';
+    const route = '/api/maintenance/reconcile-payouts';
+
+    process.env.NODE_ENV = 'test';
+    process.env.CRON_SECRET = secret;
+    // An empty in-flight set, so the pass is a no-op rather than a settlement.
+    pool.query = async () => ({ rows: [] });
+
+    try {
+        const authorized = await fetch(`${origin}${route}`, {
+            headers: { Authorization: `Bearer ${secret}` }
+        });
+        assert.equal(authorized.status, 200);
+        const body = await authorized.json();
+        assert.equal(body.ok, true);
+        assert.deepEqual(body.summary.outcomes, [], 'a pass with nothing in flight settles nothing');
+        assert.equal(body.summary.settled, 0);
+
+        // POST, so the job can also be triggered by hand.
+        const posted = await fetch(`${origin}${route}`, {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${secret}` }
+        });
+        assert.equal(posted.status, 200);
+        await posted.json();
+
+        // Same undiscoverability contract as the deposit endpoint: in production a wrong or
+        // missing secret must not be distinguishable from a path that does not exist.
+        process.env.NODE_ENV = 'production';
+        for (const headers of [{ Authorization: 'Bearer wrong-secret' }, {}]) {
+            const rejected = await fetch(`${origin}${route}`, { headers });
+            assert.equal(rejected.status, 404, `expected 404 for ${JSON.stringify(headers)}`);
+        }
+        delete process.env.CRON_SECRET;
+        const unconfigured = await fetch(`${origin}${route}`);
+        assert.equal(unconfigured.status, 503);
+        assert.match((await unconfigured.json()).detail, /CRON_SECRET/);
+    } finally {
+        pool.query = originalQuery;
+        if (priorEnvironment === undefined) delete process.env.NODE_ENV;
+        else process.env.NODE_ENV = priorEnvironment;
+        if (priorSecret === undefined) delete process.env.CRON_SECRET;
+        else process.env.CRON_SECRET = priorSecret;
+    }
+});
+
+test('vercel.json schedules payout reconciliation, not just deposits', () => {
+    // A cron entry for a route that no longer exists is silently ignored, and a route with no
+    // cron entry is the situation this endpoint was added to fix. The two are checked together
+    // so neither can drift from the other.
+    const config = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'vercel.json'), 'utf8'));
+    const paths = (config.crons || []).map((entry) => entry.path);
+    assert.ok(paths.includes('/api/maintenance/reconcile-payouts'),
+        `payout reconciliation is not scheduled; crons are ${paths.join(', ') || '(none)'}`);
+    for (const entry of config.crons || []) {
+        assert.ok(entry.schedule, `${entry.path} has no schedule`);
+    }
+});
+
 test('engage route requires an aff_sub click ID instead of serving the offers page', async () => {
     const response = await fetch(`${origin}/offer/engage`);
     assert.equal(response.status, 400);
@@ -2009,6 +2109,7 @@ test('engage route requires an aff_sub click ID instead of serving the offers pa
 test('click creation returns the configured absolute aff_sub URL and redirects to the advertiser', async () => {
     const priorEnvironment = process.env.NODE_ENV;
     const priorProxyKey = process.env.PROXYCHECK_KEY;
+    const priorRequired = process.env.PROXYCHECK_REQUIRED;
     const priorJwtSecret = process.env.JWT_SECRET;
     const priorAppBaseUrl = process.env.APP_BASE_URL;
     const jwtSecret = 'click-flow-test-secret';
@@ -2018,6 +2119,12 @@ test('click creation returns the configured absolute aff_sub URL and redirects t
     process.env.JWT_SECRET = jwtSecret;
     delete process.env.APP_BASE_URL;
     delete process.env.PROXYCHECK_KEY;
+    // Clearing only the key is not enough: a deployment (and this .env) sets
+    // PROXYCHECK_REQUIRED=true, which makes an absent key refuse every click with a 503
+    // before the aff_sub redirect is ever built. The contract under test is unobservable
+    // while that posture is in force, so both halves are cleared here and restored below,
+    // which is the same pairing the proxy-posture tests use.
+    delete process.env.PROXYCHECK_REQUIRED;
 
     pool.query = async (query, values) => {
         if (query.includes('SELECT token_version')) return { rows: [{ token_version: 0, is_banned: false }] };
@@ -2076,6 +2183,8 @@ test('click creation returns the configured absolute aff_sub URL and redirects t
         else process.env.NODE_ENV = priorEnvironment;
         if (priorProxyKey === undefined) delete process.env.PROXYCHECK_KEY;
         else process.env.PROXYCHECK_KEY = priorProxyKey;
+        if (priorRequired === undefined) delete process.env.PROXYCHECK_REQUIRED;
+        else process.env.PROXYCHECK_REQUIRED = priorRequired;
         if (priorJwtSecret === undefined) delete process.env.JWT_SECRET;
         else process.env.JWT_SECRET = priorJwtSecret;
         if (priorAppBaseUrl === undefined) delete process.env.APP_BASE_URL;
