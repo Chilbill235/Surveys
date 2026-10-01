@@ -19,7 +19,12 @@ const EMAIL = 'depositor@example.com';
 /** The two shapes: the bare user lookup, and the deposit joined to its owner. */
 const PATTERNS = [
     /SELECT\s+email,\s*balance,\s*money_emails_enabled\s+FROM\s+users/i,
-    /FROM\s+deposits\s+d\s+JOIN\s+users\s+u\s+ON\s+u\.id\s*=\s*d\.user_id/i
+    /FROM\s+deposits\s+d\s+JOIN\s+users\s+u\s+ON\s+u\.id\s*=\s*d\.user_id/i,
+    // The durable notification write, answered here for the same reason as the reads above. It is
+    // recorded through `recordInBackground`, which swallows its own failures, so a stub that does
+    // not answer this insert produces a green run in which no notification is ever written --
+    // the failure the notification path is supposed to catch.
+    /INSERT\s+INTO\s+notifications/i
 ];
 
 /**
@@ -35,6 +40,24 @@ function notificationRows(query, options = {}) {
     if (!PATTERNS.some((pattern) => pattern.test(text))) return null;
 
     const balance = options.balance !== undefined ? String(options.balance) : '0.00';
+
+    // The insert is `ON CONFLICT ... RETURNING *`, and the conflict path returns no rows. A row
+    // is returned here so a caller that needs the new id gets one, which is the normal path.
+    if (/INSERT\s+INTO\s+notifications/i.test(text)) {
+        return {
+            rows: [{
+                id: options.notificationId !== undefined ? options.notificationId : 1,
+                category: null,
+                tone: 'info',
+                title: null,
+                message: null,
+                href: null,
+                record_id: null,
+                read_at: null,
+                created_at: '2026-09-30T12:00:00.000Z'
+            }]
+        };
+    }
 
     if (/JOIN\s+users/i.test(text)) {
         return {

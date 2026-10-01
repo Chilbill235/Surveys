@@ -6,6 +6,7 @@ const path = require('node:path');
 const { after, before, test } = require('node:test');
 const jwt = require('jsonwebtoken');
 const Stripe = require('stripe');
+const nowPayments = require('../src/services/nowPayments');
 // Import the Express app directly, not server.js: server.js is the entry point that
 // binds a port, and requiring it here would collide with a running dev server
 // (`EADDRINUSE`) every time the suite runs.
@@ -1345,6 +1346,14 @@ test('a non-finished NOWPayments status never credits, and a malformed signature
     // callback in this test is in.
     let knownBatch = null;
 
+    // Stub getPayoutStatus to return a hash when the callback triggers the sentinel fallback.
+    // This allows the callback path to fetch the real transaction hash for the withdrawal receipt.
+    const originalGetPayoutStatus = nowPayments.getPayoutStatus;
+    nowPayments.getPayoutStatus = async (id) => ({
+        payout_status: 'FINISHED',
+        hash: 'SolanaTxHash1111111111111111111111111111111111111111111111111111111111111111'
+    });
+
     function runStubbedQuery(query, values = []) {
         const normalized = query.replace(/\s+/g, ' ').trim();
         if (/^(BEGIN|COMMIT|ROLLBACK)$/i.test(normalized)) return { rows: [] };
@@ -1375,7 +1384,7 @@ test('a non-finished NOWPayments status never credits, and a malformed signature
         // batch this database has no record of must be acknowledged and must change nothing.
         // `knownBatch` is set later to make one of them match, so that a finished payout for a
         // batch we do know can be shown to actually move the withdrawal.
-        if (/SELECT id, status, payout_status FROM withdrawals WHERE batch_id/i.test(normalized)) {
+        if (/SELECT id, status, payout_status(, payout_provider_id)? FROM withdrawals WHERE batch_id/i.test(normalized)) {
             return { rows: knownBatch ? [knownBatch] : [] };
         }
         if (/UPDATE withdrawals SET status = 'paid', provider_reference = \$1/i.test(normalized)) {
@@ -1516,7 +1525,7 @@ test('a non-finished NOWPayments status never credits, and a malformed signature
         // The batch lookup is made to match this time, and the payout vocabulary is used
         // rather than the deposit's own -- `FINISHED` here means sent, which is the collision
         // that `classifyIpnBody` exists to prevent.
-        knownBatch = { id: 31, status: 'processing', payout_status: 'PROCESSING' };
+        knownBatch = { id: 31, status: 'processing', payout_status: 'PROCESSING', payout_provider_id: 'p-31' };
         const finishedBody = { ...payoutBody, batch_withdrawal_id: '999', status: 'FINISHED' };
         const finishedSignature = createHmac('sha512', ipnSecret)
             .update(JSON.stringify(sortKeysDeep(finishedBody)))
@@ -1533,6 +1542,7 @@ test('a non-finished NOWPayments status never credits, and a malformed signature
         assert.equal(balance, 25);
     } finally {
 
+        nowPayments.getPayoutStatus = originalGetPayoutStatus;
         pool.query = originalQuery;
         pool.connect = originalConnect;
         if (priorEnvironment === undefined) delete process.env.NODE_ENV;
@@ -2659,6 +2669,9 @@ test('withdrawal review endpoints resolve a request and refuse to do it twice', 
     let withdrawalStatus = 'pending';
     let balance = 0;
     const ledger = [];
+    // The notification writes this endpoint makes, in order, so the refund can be asserted on
+    // rather than merely permitted.
+    const notifications = [];
     const client = {
         query: async (query, params = []) => {
             const normalized = query.replace(/\s+/g, ' ').trim();
@@ -2698,7 +2711,7 @@ test('withdrawal review endpoints resolve a request and refuse to do it twice', 
     // waits forever instead of failing. The listing goes through pool.query, so it has to
     // be replaced too, and anything unrecognised throws rather than reaching the database:
     // this test is about the review endpoints, not about what is in the live ledger.
-    pool.query = async (query) => {
+    pool.query = async (query, params = []) => {
         if (/SELECT w\.id, w\.user_id, u\.email/.test(query)) {
             return {
                 rows: withdrawalStatus === 'pending' || withdrawalStatus === 'processing'
@@ -2707,6 +2720,24 @@ test('withdrawal review endpoints resolve a request and refuse to do it twice', 
                         status: withdrawalStatus, created_at: new Date() }]
                     : []
             };
+        }
+        // The refund's notification. Answered rather than left to the `throw` below, because the
+        // write goes through `recordInBackground` and swallows its own failures: unanswered, this
+        // endpoint would return 200, the balance would be credited, the suite would be green, and
+        // the user would never be told their money came back.
+        //
+        // The category is recorded from the *parameters*, not the text: it is a placeholder, so
+        // asserting on the SQL would check for the literal word `withdrawal_failed` in a statement
+        // that never contains it.
+        if (/INSERT INTO notifications/i.test(query)) {
+            notifications.push({ category: params[1], recordId: params[6], title: params[3] });
+            return { rows: [{ id: 1 }], rowCount: 1 };
+        }
+        // The conflict path of the same write. A non-empty answer here is what a *repeat* event
+        // looks like -- the insert matched an existing row, so the caller gets that row's id back
+        // rather than nothing.
+        if (/SELECT \* FROM notifications/i.test(query)) {
+            return { rows: [{ id: 1, category: 'withdrawal_failed', tone: 'warning', title: 'Withdrawal returned', message: null, href: null, record_id: '12', read_at: null, created_at: new Date() }], rowCount: 1 };
         }
         throw new Error(`Unexpected pool.query: ${query}`);
     };
@@ -2737,6 +2768,15 @@ test('withdrawal review endpoints resolve a request and refuse to do it twice', 
         assert.equal(refundBody.refunded, '500.00');
         assert.equal(balance, 500);
         assert.deepEqual(ledger, ['withdrawal:12']);
+
+        // An operator refund is still the user's money coming back, and it is the one moment where
+        // a balance goes *up* for a withdrawal. Nothing else in the interface would say so, so the
+        // bell entry is the only place it is recorded.
+        assert.deepEqual(
+            notifications,
+            [{ category: 'withdrawal_failed', recordId: '12', title: 'Withdrawal returned' }],
+            'the refund did not record exactly one notification for the user'
+        );
 
         // Repeating it must not credit the balance twice, and must not claim success.
         const repeated = await fetch(`${origin}/api/maintenance/withdrawals/12/refund?secret=withdrawal-cron-secret`, {

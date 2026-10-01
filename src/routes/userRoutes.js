@@ -7,6 +7,7 @@ const paymentController = require('../controllers/paymentController');
 const { rateLimitByIp } = require('../services/security');
 const { register: registerMethod } = require('./methodRegistry');
 const emailPreferences = require('../services/emailPreferences');
+const notificationService = require('../services/notificationService');
 const profile = require('../services/profile');
 const withdrawalResolution = require('../services/withdrawalResolution');
 const { explorerLinks } = require('../services/explorerLinks');
@@ -148,15 +149,18 @@ function withDepositDetails(deposit) {
     return {
         ...deposit,
         receipt_url: `/receipt/deposit/${deposit.id}`,
-        // A deposit gets an address link and never a transaction link, and that is a statement
-        // about what the provider tells us rather than an omission. The NOWPayments callback
-        // carries the payment id, the amounts and the status -- and no on-chain transaction hash
-        // for an incoming payment, because the provider is the one transacting, not us. So the
-        // only honest explorer link is to the address, which is what lets someone watch the
-        // payment they just sent actually land.
+        // The transaction link comes first in the sense that matters: it is the link a reader
+        // wants, and it is built whenever the provider published a hash. `tx_hash` is null for a
+        // provider that does not surface one, and then the only link is the address -- which is a
+        // true statement about what is known, rather than a substitute for the transaction.
+        //
+        // Both are returned, in one object, so a client cannot show the address while claiming to
+        // show the payment. Which one is *primary* is a client decision, and both clients here make
+        // the same one: the transaction when there is one.
         explorer: explorerLinks({
             assetCode: deposit.asset_code,
             network: deposit.network,
+            transactionReference: deposit.tx_hash,
             address: deposit.deposit_address
         })
     };
@@ -449,6 +453,134 @@ router.get('/balance', async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// Notifications
+// ---------------------------------------------------------------------------
+
+/**
+ * The reader's notifications, and the mutations the bell performs on them.
+ *
+ * These exist because the bell used to be built in the browser out of `sessionStorage`, which made
+ * every notification a property of one tab. A deposit that credited while the tab was closed was
+ * never announced, the same account on a phone showed an empty bell next to a balance that said
+ * otherwise, and marking something read on one device left it unread on the next.
+ *
+ * The routes are thin on purpose. Every query in them is scoped to `req.user.id`, and the
+ * authorisation argument lives in one place -- the service -- rather than being restated per route
+ * where one of them can be forgotten.
+ *
+ * Read state is a `PUT` rather than a `POST` to a verb like `/read`: marking a notification read is
+ * idempotent, it has no side effect beyond the row it names, and it should be safe for a client
+ * that retries it. `COALESCE(read_at, NOW())` in the service is what actually makes it idempotent.
+ */
+/**
+ * Record a notification the client announced in the browser.
+ *
+ * The server writes the events it observes itself -- a deposit credit, a payout sent, a refund.
+ * This route covers the ones only the client can see: a session expiring, a balance the live poll
+ * cannot attribute to a deposit or a withdrawal. Without it the server's list and the reader's
+ * bell would be two different lists, and the bell would be the shorter one after a reload.
+ *
+ * The service deduplicates on (user_id, category, record_id), so a client that announces the same
+ * event twice -- the webhook writes it, the client sees it in the next poll and writes it again --
+ * produces one notification. That is why this is a `POST` and not a `PUT`: there is no
+ * client-chosen id, and the identity of the event is derived, so there is nothing to be idempotent
+ * against.
+ */
+router.post('/notifications', async (req, res) => {
+    const { category, tone, title, message, href, recordId } = req.body || {};
+    if (!category || typeof category !== 'string') {
+        return res.status(400).json({ error: 'A notification needs a category.' });
+    }
+    if (!title || typeof title !== 'string' || title.length > 200) {
+        return res.status(400).json({ error: 'A notification needs a title.' });
+    }
+
+    try {
+        const result = await notificationService.record({
+            userId: req.user.id,
+            category: category.slice(0, 40),
+            // Constrained to the tones the renderer knows. An unknown tone would render as an
+            // unstyled row, and this is a client-supplied value.
+            tone: ['info', 'success', 'warning', 'error'].includes(tone) ? tone : 'info',
+            title: title.slice(0, 200),
+            message: typeof message === 'string' ? message.slice(0, 500) : null,
+            href: typeof href === 'string' && href.startsWith('/') ? href.slice(0, 300) : null,
+            // Only same-site paths are stored. A notification is rendered as a link, and this is
+            // the one place a stored value can be a URL the reader did not intend to follow.
+            recordId: recordId === null || recordId === undefined ? null : String(recordId).slice(0, 120)
+        });
+        return res.status(result.created ? 201 : 200).json(result.notification);
+    } catch (error) {
+        console.error('[POST /api/user/notifications]', error);
+        return res.status(500).json({ error: 'Could not save the notification.' });
+    }
+});
+
+router.get('/notifications', async (req, res) => {
+    try {
+        const result = await notificationService.list(req.user.id, {
+            limit: req.query.limit,
+            offset: req.query.offset,
+            unreadOnly: String(req.query.unread || '') === 'true'
+        });
+        // The same convention as the history lists: a bare array in the body, the total in a
+        // header. The client pages with limit/offset and needs the unread count for the badge, and
+        // a wrapped object would be a second shape for the same idea.
+        res.set('X-Total-Count', String(result.total));
+        res.set('X-Unread-Count', String(result.unread));
+        res.set('Cache-Control', 'no-store');
+        return res.json(result.notifications);
+    } catch (error) {
+        console.error('[GET /api/user/notifications]', error);
+        return res.status(500).json({ error: 'Could not load notifications.' });
+    }
+});
+
+router.put('/notifications/:id/read', async (req, res) => {
+    try {
+        const notification = await notificationService.markRead(req.user.id, req.params.id);
+        // 404 rather than 403 for somebody else's notification: the caller cannot tell the
+        // difference, and telling them would confirm that the id exists.
+        if (!notification) return res.status(404).json({ error: 'Notification not found.' });
+        return res.json(notification);
+    } catch (error) {
+        console.error('[PUT /api/user/notifications/:id/read]', error);
+        return res.status(500).json({ error: 'Could not update the notification.' });
+    }
+});
+
+router.put('/notifications/read-all', async (req, res) => {
+    try {
+        const updated = await notificationService.markAllRead(req.user.id);
+        return res.json({ updated });
+    } catch (error) {
+        console.error('[PUT /api/user/notifications/read-all]', error);
+        return res.status(500).json({ error: 'Could not update notifications.' });
+    }
+});
+
+router.delete('/notifications/:id', async (req, res) => {
+    try {
+        const removed = await notificationService.remove(req.user.id, req.params.id);
+        if (!removed) return res.status(404).json({ error: 'Notification not found.' });
+        return res.status(204).end();
+    } catch (error) {
+        console.error('[DELETE /api/user/notifications/:id]', error);
+        return res.status(500).json({ error: 'Could not dismiss the notification.' });
+    }
+});
+
+router.delete('/notifications', async (req, res) => {
+    try {
+        const removed = await notificationService.clearAll(req.user.id);
+        return res.json({ removed });
+    } catch (error) {
+        console.error('[DELETE /api/user/notifications]', error);
+        return res.status(500).json({ error: 'Could not clear notifications.' });
+    }
+});
+
+// ---------------------------------------------------------------------------
 // Live updates
 // ---------------------------------------------------------------------------
 
@@ -532,7 +664,7 @@ router.get('/updates', async (req, res) => {
                 // money arrived.
                 `SELECT id, amount, asset_code, currency_code, network, deposit_address,
                         checkout_url, status, credited_at, created_at, updated_at,
-                        pay_amount, actually_paid, pay_currency, underpaid_at
+                        pay_amount, actually_paid, pay_currency, underpaid_at, tx_hash
                  FROM deposits
                  WHERE user_id = $1
                  ORDER BY created_at DESC, id DESC
@@ -736,7 +868,10 @@ router.get('/withdrawals', async (req, res) => {
  * reading is the one who cannot tell the two apart.
  */
 const DEPOSIT_COLUMNS = 'id, amount, pay_amount, actually_paid, pay_currency, underpaid_at, expires_at, ' +
-    'asset_code, currency_code, network, deposit_address, checkout_url, status, credited_at, created_at';
+    // `tx_hash` is here so the explorer link below has something to build a *transaction* link
+    // from. Without this column the receipt could only ever offer the address the payment was sent
+    // to, which is the answer to a different question.
+    'tx_hash, asset_code, currency_code, network, deposit_address, checkout_url, status, credited_at, created_at';
 
 router.get('/deposits', async (req, res) => {
     try {

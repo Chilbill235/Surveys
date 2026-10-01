@@ -1,6 +1,7 @@
 const pool = require('../config/db');
 const payoutEmails = require('./payoutEmails');
 const { COLUMN, isMoneyEmailEnabled } = require('./emailPreferences');
+const eventNotifications = require('./eventNotifications');
 
 /**
  * The terminal states a withdrawal can be moved to, and which of them keep the money.
@@ -401,6 +402,19 @@ async function reverseWithdrawal(withdrawalId, reason, { emailReason, descriptio
 
 /** Fires the "your money was sent" message, if there is an address to send it to. */
 async function notifySent(withdrawal) {
+    // The durable notification first, and deliberately above every email check below.
+    //
+    // "Money emails switched off" means the reader does not want mail. It does not mean they do
+    // not want to be told their withdrawal left, and the bell is not an email: it is a live status
+    // on a page they are already signed in to. Putting this after the preference check would have
+    // tied the in-app notification to an email setting, which is a different thing the reader
+    // never agreed to conflate.
+    eventNotifications.withdrawalPaid({
+        userId: withdrawal?.user_id,
+        withdrawalId: withdrawal?.id,
+        amount: withdrawal?.amount
+    });
+
     const email = String(withdrawal?.user_email || '').trim();
     if (!email) return;
     if (!isMoneyEmailEnabled(withdrawal?.user_money_emails)) {
@@ -419,6 +433,17 @@ async function notifySent(withdrawal) {
 
 /** Fires the "your money is back" message, if there is an address to send it to. */
 async function notifyRefunded(withdrawal, reason) {
+    // Above the email preference check, for the same reason as `notifySent`: this is the bell, not
+    // an email, and a reader who has turned money mail off still needs to be told their balance
+    // went back up. The `reason` is not carried into the notification -- it is the provider's
+    // wording, it is for an operator, and the bell's job is to say the money is safe.
+    eventNotifications.withdrawalFailed({
+        userId: withdrawal?.user_id,
+        withdrawalId: withdrawal?.id,
+        amount: withdrawal?.amount,
+        refunded: true
+    });
+
     const email = String(withdrawal?.user_email || '').trim();
     if (!email) return;
     if (!isMoneyEmailEnabled(withdrawal?.user_money_emails)) {

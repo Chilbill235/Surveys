@@ -277,12 +277,16 @@ function renderFacts(withdrawal) {
     // The explorer links go last, as their own block. They are the reason someone opens this
     // page -- "verify it actually went" -- and burying them in a list of labels is how they
     // end up unused.
+    //
+    // Transaction first, and the destination address only alongside it as a second, differently
+    // labelled thing. The address is what the user already has in the field above; the transaction
+    // is the one they do not, and it is the only one that says whether the money actually moved.
     const txLink = explorerCell(
-        explorer.transactionUrl ? `View on ${explorer.explorerName}` : '',
+        explorer.transactionUrl ? `View transaction on ${explorer.explorerName}` : '',
         explorer.transactionUrl
     );
     const addressLink = explorerCell(
-        explorer.addressUrl ? `Open destination on ${explorer.explorerName}` : '',
+        explorer.addressUrl ? `View destination address on ${explorer.explorerName}` : '',
         explorer.addressUrl
     );
     if (txLink || addressLink) {

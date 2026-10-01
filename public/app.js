@@ -341,7 +341,14 @@ function toastAlreadyShown(title, message) {
  */
 const NOTIFICATION_TARGETS = {
     deposit: { href: '/account', label: 'View transactions' },
+    deposit_failed: { href: '/account', label: 'View transactions' },
     withdrawal: { href: '/account', label: 'View withdrawals' },
+    // The three withdrawal stages, so a stage notification that arrives without a record id still
+    // has somewhere to go. The stages exist to keep the dedup index from collapsing them into one;
+    // that is a storage concern and has nothing to say about where the link points.
+    withdrawal_requested: { href: '/account', label: 'View withdrawals' },
+    withdrawal_paid: { href: '/account', label: 'View withdrawals' },
+    withdrawal_failed: { href: '/account', label: 'View withdrawals' },
     reward: { href: '/account', label: 'View transactions' },
     survey: { href: '/offers', label: 'Browse offers' },
     magic: { href: '/offers', label: 'Sign in' }
@@ -379,8 +386,30 @@ function notificationTarget({ category, href, recordId, depositId, withdrawalId 
     if (category === 'deposit' && record) {
         return { href: `/account#${historyRowId('deposit', record)}`, label: 'View in history' };
     }
-    if (category === 'withdrawal' && record) {
+    // A deposit that failed or expired writes no ledger row, so there is no history row to scroll
+    // to and the same link would land on a page with nothing on it. The receipt is the one place
+    // that can show what went wrong and when. This is a separate category on the wire rather than a
+    // flag on the same one so that a stored `href` cannot quietly take priority over the derivation
+    // above, which is the bug this function exists to prevent.
+    if (category === 'deposit_failed' && record) {
+        return { href: `/receipt/deposit/${encodeURIComponent(record)}`, label: 'View receipt' };
+    }
+    // All withdrawal stages link to the same history row. Grouped rather than written out
+    // three times because the three categories exist only to stop the dedup index swallowing one
+    // stage behind another, and the moment they are listed separately someone will "simplify"
+    // them back to one -- which reintroduces a notification that silently never appears.
+    if (record && (category === 'withdrawal'
+        || category === 'withdrawal_requested'
+        || category === 'withdrawal_processing'
+        || category === 'withdrawal_sending'
+        || category === 'withdrawal_confirming'
+        || category === 'withdrawal_paid'
+        || category === 'withdrawal_failed')) {
         return { href: `/account#${historyRowId('withdrawal', record)}`, label: 'View in history' };
+    }
+    // Deposit pending/processing stages link to the deposit receipt (no history row until credited)
+    if (record && (category === 'deposit_pending' || category === 'deposit_processing')) {
+        return { href: `/receipt/deposit/${encodeURIComponent(record)}`, label: 'View deposit' };
     }
     // The caller's own href, for a case that genuinely is not a record link: a rejected deposit
     // writes no ledger row, so there is nothing in the history list to scroll to and the receipt
@@ -637,6 +666,91 @@ function followNotificationTarget(href) {
     window.location.assign(href);
 }
 
+/**
+ * The server's copy of this notification, if it is one the server knows about.
+ *
+ * The bell used to be built entirely in this browser, which made every notification a property of
+ * this tab: gone when it closed, absent on a phone, and read-state that disagreed between devices.
+ * The record now lives in the database, so a locally-announced event is written back to it and the
+ * list is rehydrated from the API. Without this write-back the two halves would disagree -- the
+ * server's list would only ever hold what the server itself happened to observe, which is not the
+ * same set, and a notification that appeared while this tab was open would be missing next time.
+ *
+ * Fire and forget, like every other notification write here. The entry is already in the local
+ * store and already rendered, so a failed write costs persistence and nothing else; blocking the
+ * render on a round trip would make the bell slower, which is the opposite of the point.
+ */
+function persistNotification(entry) {
+    const token = getSessionToken();
+    if (!token) return;
+
+    const recordId = entry.recordId;
+    // Nothing to deduplicate against without one, and a notification with no record is one the
+    // server's partial unique index does not cover, so writing it would risk a duplicate every
+    // time. Money events all have one; the session-expiry warning is the counterexample and is
+    // deliberately not written.
+    if (recordId === null || recordId === undefined || entry.category === 'session') return;
+
+    fetch(`/api/user/notifications`, {
+        method: 'POST',
+        headers: {
+            Authorization: `Bearer ${token}`,
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+            category: entry.category,
+            tone: entry.tone,
+            title: entry.title,
+            message: entry.message,
+            href: entry.href,
+            recordId: String(recordId)
+        })
+    }).then(async (response) => {
+        // 409 is the server saying it already has this one, which is the expected outcome when the
+        // webhook and this tab both noticed the same event. Not an error worth surfacing.
+        if (response.ok || response.status === 409) return;
+        if (response.status === 401) return;
+        const body = await response.json().catch(() => ({}));
+        console.warn('Could not save notification to the server:', body.error || response.status);
+    }).catch(() => {
+        // Offline, or the tab was closed mid-request. The local copy stands.
+    });
+}
+
+/**
+ * Replace the local list with the server's.
+ *
+ * Runs once on load. The server list is the source of truth for anything that happened before this
+ * page existed, and it is *replaced* rather than merged: a merge would keep the sessionStorage
+ * entries forever alongside the server's, so the bell would grow every visit and the same event
+ * would appear twice once both copies had it.
+ *
+ * A failure leaves the local store alone. That is the right direction -- if the API is unreachable
+ * the reader should still see whatever this tab knows, and a cleared bell is a worse outcome than
+ * a slightly stale one.
+ */
+async function hydrateNotifications() {
+    const token = getSessionToken();
+    if (!token) return;
+
+    let list;
+    try {
+        const response = await fetch('/api/user/notifications?limit=50', {
+            headers: { Authorization: `Bearer ${token}` }
+        });
+        if (!response.ok) return;
+        list = await response.json();
+    } catch {
+        return;
+    }
+    if (!Array.isArray(list)) return;
+
+    notificationStore = list;
+    saveNotifications(notificationStore);
+    renderNotificationBell();
+    if (notificationDropdown && !notificationDropdown.hidden) renderNotificationList();
+}
+
 function pushNotification({ title, message, tone = 'info', href = null, category = null, depositId = null, withdrawalId = null }) {
     // Collapse an event that arrived twice, and only that.
     //
@@ -671,7 +785,7 @@ function pushNotification({ title, message, tone = 'info', href = null, category
         break;
     }
 
-    notificationStore.push({
+    const entry = {
         id: Date.now() + Math.random(),
         title,
         message,
@@ -686,8 +800,10 @@ function pushNotification({ title, message, tone = 'info', href = null, category
         v: NOTIFICATION_SHAPE_VERSION,
         read: false,
         timestamp: Date.now()
-    });
+    };
+    notificationStore.push(entry);
     saveNotifications(notificationStore);
+    persistNotification(entry);
     renderNotificationBell();
     if (notificationDropdown && !notificationDropdown.hidden) {
         renderNotificationList();
@@ -699,18 +815,56 @@ function markNotificationRead(id) {
         n.id === id ? { ...n, read: true } : n
     );
     saveNotifications(notificationStore);
+    persistReadState([id]);
 }
 
 function markAllNotificationsRead() {
     notificationStore = notificationStore.map((n) => ({ ...n, read: true }));
     saveNotifications(notificationStore);
+    // Every id, so locally-originated entries that were never persisted simply fail to match and
+    // the server is asked about the ones it issued.
+    persistReadState(notificationStore.map((n) => n.id));
     renderNotificationList();
     renderNotificationBell();
+}
+
+/**
+ * Tell the server that these notifications are read.
+ *
+ * Local first, always. The reader clicked "mark all read" and the list has to reflect that in this
+ * frame; waiting on a request to repaint is the lag this whole area is trying to remove. The
+ * request goes out afterwards and its failure is not surfaced -- the next load rehydrates from the
+ * server and would show them unread again, which is the correct outcome for a write that did not
+ * happen, and much better than a button that appears not to work.
+ *
+ * Only ids the server issued are sent. A notification that came from the local store and was never
+ * persisted has no server id, and asking to read it would be a guaranteed 404.
+ */
+function persistReadState(ids) {
+    const token = getSessionToken();
+    if (!token) return;
+    const serverIds = ids.filter((id) => typeof id === 'string' && /^\d+$/.test(id));
+    if (serverIds.length === 0) return;
+
+    const send = (method, path) => fetch(path, {
+        method,
+        headers: { Authorization: `Bearer ${token}` }
+    }).catch(() => {});
+
+    if (serverIds.length === 1) {
+        send('PUT', `/api/user/notifications/${encodeURIComponent(serverIds[0])}/read`);
+    } else {
+        send('PUT', '/api/user/notifications/read-all');
+    }
 }
 
 function clearAllNotifications() {
     notificationStore = [];
     saveNotifications(notificationStore);
+    // "Clear all" is a delete, not a read: the reader asked for these to be gone, and leaving the
+    // rows server-side would make the next load put the same list straight back.
+    const token = getSessionToken();
+    if (token) fetch('/api/user/notifications', { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } }).catch(() => {});
     if (notificationDropdown && !notificationDropdown.hidden) renderNotificationList();
     renderNotificationBell();
 }
@@ -718,6 +872,13 @@ function clearAllNotifications() {
 function dismissNotification(id) {
     notificationStore = notificationStore.filter((n) => n.id !== id);
     saveNotifications(notificationStore);
+    const token = getSessionToken();
+    if (token && typeof id === 'string' && /^\d+$/.test(id)) {
+        fetch(`/api/user/notifications/${encodeURIComponent(id)}`, {
+            method: 'DELETE',
+            headers: { Authorization: `Bearer ${token}` }
+        }).catch(() => {});
+    }
     if (notificationDropdown && !notificationDropdown.hidden) renderNotificationList();
     renderNotificationBell();
 }
@@ -894,6 +1055,13 @@ function closeNotificationDropdown() {
 
 function initNotifications() {
     renderNotificationBell();
+
+    // Pull the server's list in the background. Deliberately after the first render rather than
+    // instead of it: the local store is painted immediately so the bell is never blank while a
+    // request is in flight, and then the server's copy replaces it once it arrives. Waiting for the
+    // request before the first render would put a network round trip in front of the header.
+    hydrateNotifications();
+
     for (const bell of notificationBells) {
         bell.addEventListener('click', (event) => {
             event.stopPropagation();
@@ -978,8 +1146,13 @@ function notifyDepositRejected(item) {
     const href = item.id === null || item.id === undefined
         ? null
         : `/receipt/deposit/${encodeURIComponent(item.id)}`;
-    showToast(title, message, { tone: 'error', category: 'deposit', href });
-    pushNotification({ title, message, tone: 'error', category: 'deposit', href });
+    const depositId = item.id ?? null;
+    showToast(title, message, { tone: 'error', category: 'deposit_failed', href, depositId });
+    // `deposit_failed`, not `deposit`, for the same reason the withdrawals are split by stage: the
+    // dedup index is (user, category, record id), so a rejected deposit sharing the credited
+    // deposit's category would be swallowed by whichever was written first. The server records
+    // this event as `deposit_failed` too, so this collapses into one entry rather than two.
+    pushNotification({ title, message, tone: 'error', category: 'deposit_failed', href, depositId });
 }
 
 /**
@@ -1007,8 +1180,11 @@ function notifyWithdrawalSubmitted(result) {
     // before this notification is ever built. That row is also the honest answer to the question
     // this notice raises: where is my money right now.
     const withdrawalId = result?.withdrawalId ?? null;
-    showToast(title, message, { tone: 'info', category: 'withdrawal', withdrawalId });
-    pushNotification({ title, message, tone: 'info', category: 'withdrawal', withdrawalId });
+    showToast(title, message, { tone: 'info', category: 'withdrawal_requested', withdrawalId });
+    // The category is the stage, not the kind, and it has to match what the server writes for the
+    // same event. A client `withdrawal` and a server `withdrawal_requested` are two rows in the
+    // dedup index rather than one, so the reader is told they requested a withdrawal twice.
+    pushNotification({ title, message, tone: 'info', category: 'withdrawal_requested', withdrawalId });
 }
 
 function notifyWithdrawalPaid(item) {
@@ -1017,8 +1193,8 @@ function notifyWithdrawalPaid(item) {
     // The withdrawal id, so both halves land on this payout's own receipt. A user who has been
     // told their money was sent and then dropped on the account list is being asked to search
     // for the one row it was in -- at the exact moment they most want to check it arrived.
-    showToast(title, message, { tone: 'success', category: 'withdrawal', withdrawalId: item.id ?? null });
-    pushNotification({ title, message, tone: 'success', category: 'withdrawal', withdrawalId: item.id ?? null });
+    showToast(title, message, { tone: 'success', category: 'withdrawal_paid', withdrawalId: item.id ?? null });
+    pushNotification({ title, message, tone: 'success', category: 'withdrawal_paid', withdrawalId: item.id ?? null });
 }
 
 function notifyWithdrawalFailed(item) {
@@ -1031,8 +1207,8 @@ function notifyWithdrawalFailed(item) {
     // says the thing they can act on: whether the money is back.
     const message = withdrawalFailureText(item)
         || 'We were not able to send this withdrawal. Any amount taken from your balance has been returned.';
-    showToast(title, message, { tone: 'error', category: 'withdrawal', withdrawalId: item.id ?? null });
-    pushNotification({ title, message, tone: 'error', category: 'withdrawal', withdrawalId: item.id ?? null });
+    showToast(title, message, { tone: 'error', category: 'withdrawal_failed', withdrawalId: item.id ?? null });
+    pushNotification({ title, message, tone: 'error', category: 'withdrawal_failed', withdrawalId: item.id ?? null });
 }
 
 function notifySessionExpired() {
@@ -1926,7 +2102,11 @@ function announceLedgerRefund(entry, amount) {
     const options = match
         ? {
             tone: 'info',
-            category: 'withdrawal',
+            // `withdrawal_failed`, not `withdrawal`: the live ledger poll sees the refund the
+            // server already recorded as a failed withdrawal, and any other category is a second
+            // row in the dedup index -- so the reader would see the refund announced once by the
+            // server and once by this poll.
+            category: 'withdrawal_failed',
             withdrawalId: match[1]
         }
         : { tone: 'info', category: 'reward' };
@@ -5785,7 +5965,12 @@ async function cancelWithdrawal(item, button) {
             tone: 'success',
             // The account page is where the refund is visible in the list; without this the
             // notice reported a balance change the user then had to go and find.
-            category: 'withdrawal'
+            category: 'withdrawal',
+            // And the id, so the same event the server records as `withdrawal_failed` when it
+            // refunds the row collapses into one bell entry. A bare category here is a link to
+            // the account page with nothing to scroll to, and -- because the write-back needs a
+            // record id -- a notification that is never persisted at all.
+            withdrawalId: item.id ?? null
         });
         refreshWithdrawalViews();
     } catch (error) {
@@ -5987,12 +6172,23 @@ function buildWithdrawalDetails(item) {
         hasAction = true;
     }
 
+    // The explorer link, transaction first.
+    //
+    // Only the transaction is offered when there is one. A wallet address is a different page on
+    // the same site, answering "has anything arrived here" rather than "did my payment go
+    // through", and putting the two side by side under one label is how a reader ends up checking
+    // an address and concluding their money is missing when it is sitting in a transaction they
+    // never opened. The address link is offered only when there is no transaction to show.
     const explorer = item.explorer || {};
-    if (explorer.transactionUrl) {
+    const hasTx = Boolean(explorer.transactionUrl);
+    const explorerHref = explorer.transactionUrl || explorer.addressUrl;
+    if (explorerHref) {
         const tx = document.createElement('a');
         tx.className = 'history-detail-link';
-        tx.href = explorer.transactionUrl;
-        tx.textContent = `View on ${explorer.explorerName || 'blockchain'}`;
+        tx.href = explorerHref;
+        tx.textContent = hasTx
+            ? `View transaction on ${explorer.explorerName || 'blockchain'}`
+            : `View deposit address on ${explorer.explorerName || 'blockchain'}`;
         // A new tab, and no opener. The explorer is a third party and this is the one link on
         // the page that leaves the site entirely.
         tx.target = '_blank';
@@ -6015,6 +6211,103 @@ function buildWithdrawalDetails(item) {
  * copies of this markup is how a row ends up showing "Refunded" in one place and "Failed"
  * in the other.
  */
+/**
+ * The full record for a deposit, and the explorer link out of it.
+ *
+ * A deposit row had no disclosure at all, so the only way to see a blockchain link for one was to
+ * open the receipt -- which is a second page, from a second click, for the one fact a person is
+ * looking for when they look at a deposit row: did this arrive, and can I check it myself. A
+ * withdrawal got exactly this treatment; a deposit, which is the row people check far more often,
+ * did not.
+ *
+ * Shaped like `buildWithdrawalDetails` and keyed on `data-deposit-id`, so the two disclosures
+ * restore their open state independently. A single `data-record-id` would collide: a withdrawal of
+ * id 12 and a deposit of id 12 are different records in different tables, and a shared key would
+ * open both when the reader opened one.
+ */
+function buildDepositDetails(item) {
+    const status = String(item.status || '').toLowerCase();
+    // An unpaid deposit is a live instruction, not a record, and the row already says "waiting"
+    // with the address on it. What is not known yet is everything the disclosure would show, so
+    // opening onto a near-empty list is the same dead end the withdrawal one avoids.
+    const rows = [
+        ['Amount', formatBalance(item.amount)],
+        item.pay_amount ? ['Sent', `${item.pay_amount} ${item.pay_currency || item.asset_code || ''}`.trim()] : null,
+        // Recorded when the provider reported less than the quote. The difference between what was
+        // sent and what was credited is the question a short payment raises, and without the two
+        // side by side the answer has to be worked out by hand from the receipt.
+        item.actually_paid !== null && item.actually_paid !== undefined
+            ? ['Actually received', `${item.actually_paid} ${item.pay_currency || item.asset_code || ''}`.trim()]
+            : null,
+        ['Network', item.network || ''],
+        ['Address', item.deposit_address || ''],
+        ['Created', detailTime(item.created_at)],
+        status === 'confirmed' || status === 'paid' ? ['Credited', detailTime(item.credited_at)] : null
+    ].filter((row) => row && row[1]);
+
+    // An unpaid deposit is skipped entirely: the row already carries the address and the "waiting"
+    // status, and there is no record to disclose.
+    if (item.deposit_address && (status === 'pending' || status === 'confirming')) return null;
+    if (rows.length <= 2) return null;
+
+    const details = document.createElement('details');
+    details.className = 'history-detail';
+    details.dataset.depositId = String(item.id);
+
+    const summary = document.createElement('summary');
+    summary.className = 'history-detail-summary';
+    summary.textContent = 'Details';
+    details.append(summary);
+
+    const list = document.createElement('dl');
+    list.className = 'history-detail-list';
+    for (const [name, value] of rows) {
+        const term = document.createElement('dt');
+        term.className = 'history-detail-label';
+        term.textContent = name;
+        const definition = document.createElement('dd');
+        definition.className = 'history-detail-value';
+        // A wallet address or a transaction hash is one unbreakable run of 40-90 characters. Left
+        // as plain text they overflow the row, so they wrap; the full value is still in the DOM
+        // for copying.
+        definition.textContent = value;
+        if (name === 'Address' || name === 'Transaction reference') {
+            definition.classList.add('history-detail-mono');
+        }
+        list.append(term, definition);
+    }
+    details.append(list);
+
+    // The transaction, not the address. The address is what the reader already has on the row; the
+    // transaction is the thing they cannot get from this page any other way, and it is the only
+    // one that says whether the payment actually went through. The address is offered only when
+    // there is no transaction, and labelled as an address so the two are never confused.
+    //
+    // The urls are the server's, not built here: the chain table lives in one place and a
+    // client-side copy is a second one to get wrong.
+    const explorer = item.explorer || {};
+    const hasTx = Boolean(explorer.transactionUrl);
+    const href = explorer.transactionUrl || explorer.addressUrl;
+    if (href) {
+        const actions = document.createElement('div');
+        actions.className = 'history-detail-links';
+        const link = document.createElement('a');
+        link.className = 'history-detail-link';
+        link.href = href;
+        link.textContent = hasTx
+            ? `View transaction on ${explorer.explorerName || 'blockchain'}`
+            : `View deposit address on ${explorer.explorerName || 'blockchain'}`;
+        // A new tab, and no opener: the explorer is a third party, and this is the one link on the
+        // page that leaves the site entirely.
+        link.target = '_blank';
+        link.rel = 'noopener noreferrer';
+        actions.append(link);
+        details.append(actions);
+    }
+
+    return details;
+}
+
 function buildHistoryRow(item, kind) {
     const status = String(item.status || '').toLowerCase();
 
@@ -6084,6 +6377,10 @@ function buildHistoryRow(item, kind) {
     // disclosure sits last and the Cancel button stays where a user reaching for it expects.
     if (kind === 'withdrawal') {
         const detail = buildWithdrawalDetails(item);
+        if (detail) row.append(detail);
+    }
+    if (kind === 'deposit') {
+        const detail = buildDepositDetails(item);
         if (detail) row.append(detail);
     }
 
@@ -6282,8 +6579,14 @@ function openDetailIdsFor(containerId) {
     const container = document.getElementById(containerId);
     if (!container) return new Set();
     const open = new Set();
+    // Both disclosure kinds, keyed by their own attribute. A shared key would collide across the
+    // two id spaces -- withdrawal 12 and deposit 12 are different records -- so the two attributes
+    // are read separately and re-opened by the matching one.
     for (const element of container.querySelectorAll('details.history-detail[data-withdrawal-id][open]')) {
-        open.add(element.dataset.withdrawalId);
+        open.add(`w:${element.dataset.withdrawalId}`);
+    }
+    for (const element of container.querySelectorAll('details.history-detail[data-deposit-id][open]')) {
+        open.add(`d:${element.dataset.depositId}`);
     }
     return open;
 }
@@ -6298,7 +6601,10 @@ function openDetailIdsFor(containerId) {
 function restoreOpenDetails(container, openIds) {
     if (!container || !openIds || openIds.size === 0) return;
     for (const element of container.querySelectorAll('details.history-detail[data-withdrawal-id]')) {
-        if (openIds.has(element.dataset.withdrawalId)) element.open = true;
+        if (openIds.has(`w:${element.dataset.withdrawalId}`)) element.open = true;
+    }
+    for (const element of container.querySelectorAll('details.history-detail[data-deposit-id]')) {
+        if (openIds.has(`d:${element.dataset.depositId}`)) element.open = true;
     }
 }
 

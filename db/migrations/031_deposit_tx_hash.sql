@@ -1,0 +1,22 @@
+-- The on-chain transaction hash for a deposit.
+--
+-- A deposit was only ever given an address link, because the reasoning at the time was that the
+-- provider's callback carries no on-chain hash for an incoming payment -- the provider is the one
+-- transacting. That reasoning is right about a deposit whose provider has not published a hash, and
+-- wrong as a blanket rule: the hash appears in the callback and the status response on the chains
+-- where the provider surfaces it, and it was simply never read. The result was that a user who
+-- paid, waited, and then went to check had a wallet address to look at and no transaction, on a
+-- page whose entire purpose is "did my money arrive".
+--
+-- Nullable, and deliberately not backfilled. A hash that was never stored cannot be recovered
+-- from a deposit address without querying the chain for every payment that ever arrived at every
+-- address this app has issued, and an address is reused across many payments on some providers --
+-- so a guess would produce a confident link to somebody else's transaction. A missing hash renders
+-- as no transaction link, which is the honest outcome.
+ALTER TABLE deposits ADD COLUMN IF NOT EXISTS tx_hash TEXT;
+
+-- The explorer link is built per row on every history and receipt request, so this is not a lookup
+-- index for its own sake: it is here so a partial index can be added later without another
+-- migration if deposits ever need to be paged by "has a hash". Kept as a plain column with no
+-- constraint beyond NULL-or-text, because the hash format is the chain's, not ours, and this app
+-- supports ten of them.

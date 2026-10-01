@@ -16,6 +16,7 @@ const {
 const nowPayments = require('../services/nowPayments');
 const withdrawalCode = require('../services/withdrawalCode');
 const autoPayouts = require('../services/autoPayouts');
+const eventNotifications = require('../services/eventNotifications');
 
 // ---------------------------------------------------------------------------
 // Schema prerequisites
@@ -878,6 +879,17 @@ async function requestWithdrawal(req, res) {
         // `finally` below do not release it a second time.
         client.release();
         client = null;
+
+        // The withdrawal is real and the balance is debited, so the reader has committed money
+        // that is now sitting in a queue. Recording that is the first thing they would want to
+        // know and the thing they cannot otherwise tell from a balance: the debit alone looks
+        // identical to a charge. It is recorded after the commit for the same reason the payout
+        // dispatch below is -- a failure here must not undo a withdrawal the user really made.
+        eventNotifications.withdrawalSubmitted({
+            userId,
+            withdrawalId,
+            amount
+        });
 
         // The withdrawal is now real and the balance is debited, so the payout is attempted
         // from here rather than waiting for a scheduled run: the user asked to be paid, and

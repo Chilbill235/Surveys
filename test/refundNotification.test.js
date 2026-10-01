@@ -132,11 +132,13 @@ test('a refund notice links to the withdrawal that explains it', () => {
     );
 
     // And a refund with no recognisable source falls back to a category rather than inventing an
-    // id -- a link to a row that cannot exist is worse than no link.
+    // id -- a link to a row that cannot exist is worse than no link. The refund's own category is
+    // `withdrawal_failed` because that is what the server records the same refund as; anything
+    // else is a second row in the dedup index and the reader sees the refund twice.
     const fallback = app.slice(app.indexOf('function announceLedgerRefund('));
     assert.match(
         fallback,
-        /\? \{[^}]*category: 'withdrawal'[^}]*\}\s*\n\s*: \{[^}]*category: 'reward'/,
+        /\? \{[^}]*category: 'withdrawal_failed'[^}]*\}\s*\n\s*: \{[^}]*category: 'reward'/,
         'an unidentifiable refund does not fall back to a category'
     );
 });

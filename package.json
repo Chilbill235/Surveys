@@ -8,6 +8,7 @@
     "test": "node --test",
     "migrate": "node scripts/migrate.js",
     "reconcile": "node scripts/reconcile-deposits.js",
+    "backfill:deposit-tx": "node scripts/backfill-deposit-tx.js",
     "audit:balance": "node scripts/audit-balance.js",
     "audit:sql": "node scripts/audit-sql.js",
     "withdrawals": "node scripts/withdrawals.js",

@@ -55,6 +55,9 @@ const db = {
     balance: '500.00',
     reachedDebit: false,
     withdrawn: null,
+    // The durable notifications the request writes, in order. Asserted on below so a test can say
+    // what the reader was actually told, which is more meaningful than "a row was inserted".
+    notifications: [],
     emailed: null,
     emailsSent: 0,
     // Set by a test to simulate a provider that accepts the request but delivers nothing.
@@ -73,6 +76,7 @@ function resetDb() {
     db.balance = '500.00';
     db.reachedDebit = false;
     db.withdrawn = null;
+    db.notifications = [];
     db.emailed = null;
     db.emailsSent = 0;
     db.emailDelivery = 'sent';
@@ -195,6 +199,21 @@ async function runStubbedQuery(query, values = []) {
     }
 
     if (/INSERT INTO balance_transactions/i.test(sql)) return { rows: [], rowCount: 1 };
+
+    // The durable notification write. Answered rather than left to the `throw` below for two
+    // reasons: it is a real query the request now makes, and `recordInBackground` swallows its
+    // failures -- an unanswered insert would print an error into the output and leave the suite
+    // green with no notification ever written, which is the exact failure a notification test
+    // is supposed to catch.
+    if (/INSERT INTO notifications/i.test(sql)) {
+        db.notifications.push({
+            category: values[1],
+            recordId: values[6],
+            title: values[3],
+            read: false
+        });
+        return { rows: [{ id: db.notifications.length, created_at: '2026-09-30T12:00:00Z' }], rowCount: 1 };
+    }
 
     throw new Error(`Unexpected query: ${sql.slice(0, 120)}`);
 }
@@ -333,6 +352,32 @@ test('the real code is accepted and reaches the withdrawal', async () => {
     assert.equal(response.status, 200);
     assert.equal(db.reachedDebit, true);
     assert.equal(db.withdrawn.amount, 25);
+});
+
+test('a refused withdrawal tells the reader nothing, and an accepted one records the request', async () => {
+    // The bell is how a reader learns their money left the account: the debit on its own is
+    // indistinguishable from a charge, and the request is the last point at which the server still
+    // knows the request succeeded. Recording it after the commit is what makes the notification
+    // survive the tab closing.
+    const code = await issueCode();
+
+    const accepted = await postWithdrawal(withdrawal({ code }));
+    assert.equal(accepted.status, 200);
+    assert.deepEqual(
+        db.notifications.map((n) => n.category),
+        ['withdrawal_requested'],
+        'an accepted withdrawal must record exactly one request notification'
+    );
+    assert.equal(db.notifications[0].recordId, '77', 'the notification must name the withdrawal it is about');
+    assert.equal(db.notifications[0].read, false, 'a new notification starts unread');
+
+    // A refusal must not tell the reader their money was sent, and a failed write must not have
+    // taken the request down with it -- the response above is already a 200, so this asserts the
+    // row is absent rather than the request survived.
+    resetDb();
+    const refused = await postWithdrawal(withdrawal({ code: '000000' }));
+    assert.equal(refused.status, 400);
+    assert.deepEqual(db.notifications, [], 'a refused withdrawal recorded a notification');
 });
 
 test('a spent code cannot be replayed for a second withdrawal', async () => {

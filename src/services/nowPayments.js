@@ -31,6 +31,11 @@
 const { createHmac, timingSafeEqual } = require('node:crypto');
 const undici = require('undici');
 const { realCredential } = require('./credentials');
+// The identifier test, imported rather than restated. `explorerLinks` is a pure module with no
+// imports of its own, so this cannot cycle, and reusing its rule is the point: a value accepted
+// here is a value the link builder will accept, so a stored hash can never be one that builds a
+// dead link.
+const { isExplorerIdentifier } = require('./explorerLinks');
 const { ProxyAgent } = undici;
 
 const PRODUCTION_BASE_URL = 'https://api.nowpayments.io';
@@ -776,6 +781,59 @@ async function createPayment({
 async function getPaymentStatus(paymentId) {
     if (!paymentId) throw new NowPaymentsError('A payment id is required to read payment status.');
     return request('GET', `/v1/payment/${encodeURIComponent(paymentId)}`, { timeoutMs: 12000 });
+}
+
+/**
+ * The on-chain transaction hash for an incoming payment, or null.
+ *
+ * A deposit used to be given nothing but a link to the address it was paid to, on the reasoning
+ * that the provider does not transacting on the customer's behalf and so has no hash to give.
+ * That is simply false: the provider publishes `payin_hash`, the hash of the transaction the
+ * customer sent to the address it issued them. It was never read, so a user who paid and then went
+ * to verify -- the entire reason anybody opens a receipt twice -- found a wallet address and no
+ * transaction.
+ *
+ * The list below is ordered, and the order is the point. `payin_hash` is the customer's payment
+ * and is what a reader means by "the transaction". `payout_hash` is the provider's own onward
+ * settlement and is a real field on the same object, holding a value like
+ * `partner_liability_tx_05cd3ae6...` -- 64 hex characters, which passes every character test an
+ * explorer identifier has to pass. Linking to it builds a confident solscan URL for a transaction
+ * that was never on Solana, and the reader only finds out by being told so by a third party. It is
+ * rejected by name below rather than by relying on it being absent from the accept list, because
+ * the next person to read this payload will see the field and reasonably reach for it.
+ *
+ * Both shapes are accepted because the status response and the IPN differ: the status endpoint
+ * returns the payment at the top level on some deployments and nested under `payment` on others.
+ * The caller should not have to know which one it is holding.
+ */
+function depositTxHashFrom(payload) {
+    if (!payload || typeof payload !== 'object') return null;
+    const source = (payload.payment && typeof payload.payment === 'object') ? payload.payment : payload;
+
+    // The customer's payment, and the only one of these a reader should ever be sent to.
+    const preferred = [
+        source?.payin_hash, source?.payinHash, source?.payin_tx_hash
+    ];
+
+    // Everything else the provider might publish, for the deployments that spell it generically.
+    const fallbacks = [
+        source?.tx_hash, source?.txHash, source?.transaction_hash, source?.transactionHash,
+        source?.txid, source?.tx_id, source?.hash,
+        // A few chains nest it one level deeper, and an incoming payment's hash is sometimes only
+        // on the transaction object rather than the payment.
+        source?.transaction?.hash, source?.transaction?.tx_hash, source?.transaction?.txid,
+        source?.payment_details?.tx_hash, source?.payment_details?.hash
+    ];
+
+    for (const candidate of [...preferred, ...fallbacks]) {
+        if (typeof candidate !== 'string') continue;
+        const trimmed = candidate.trim();
+        // The same identifier test the explorer link uses, so nothing is stored that could not be
+        // linked to. Imported rather than copied: a second copy of this rule is a second copy to
+        // drift, and the failure is a stored hash that produces a dead link forever.
+        if (isExplorerIdentifier(trimmed)) return trimmed;
+    }
+    return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -1692,5 +1750,8 @@ module.exports = {
     // real proxy and the "is this a 407 or a provider refusal" distinction can be pinned.
     resetPayoutProxyState,
     mentionsProxyAuthFailure,
-    payoutProxyDisabled
+    payoutProxyDisabled,
+    // Exported so the value can be pinned without a provider. A deposit that stored a wallet
+    // address where a hash belonged is a bug nobody sees in a log line.
+    depositTxHashFrom
 };

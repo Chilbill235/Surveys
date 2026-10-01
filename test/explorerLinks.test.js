@@ -291,15 +291,17 @@ test('a submitted withdrawal is linked to its own history row', () => {
         /withdrawalId = result\?\.withdrawalId/,
         'a submitted withdrawal is not linked to the row that already exists for it'
     );
-    // And the toast and the bell must agree, or one of them lands somewhere else.
+    // And the toast and the bell must agree, or one of them lands somewhere else. The category is
+    // the stage, matching what the server records, so the two collapse into one bell entry rather
+    // than telling the reader they requested a withdrawal twice.
     assert.match(
         body[1],
-        /showToast\(title, message, \{ tone: 'info', category: 'withdrawal', withdrawalId \}\)/,
+        /showToast\(title, message, \{ tone: 'info', category: 'withdrawal_requested', withdrawalId \}\)/,
         'the toast has no id'
     );
     assert.match(
         body[1],
-        /pushNotification\(\{ title, message, tone: 'info', category: 'withdrawal', withdrawalId \}\)/,
+        /pushNotification\(\{ title, message, tone: 'info', category: 'withdrawal_requested', withdrawalId \}\)/,
         'the bell has no id'
     );
 });

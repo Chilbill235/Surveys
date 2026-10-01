@@ -98,6 +98,27 @@ function setMessage(title, lead, state) {
     if (mark) mark.dataset.state = state;
 }
 
+/**
+ * A link to a block explorer, or null when there is nothing to link to.
+ *
+ * The server decides whether a link exists and the value is only ever used as an `href`, so this
+ * trusts `explorer.transactionUrl` and `explorer.addressUrl` rather than building one here. A
+ * second copy of the chain table in the client is a second copy to get wrong, and a wrong one
+ * produces a confident link to a transaction that was never on any chain.
+ */
+function explorerLink(label, url) {
+    if (!url || !label) return null;
+    const link = document.createElement('a');
+    link.className = 'receipt-link';
+    link.href = url;
+    link.textContent = label;
+    // A new tab, and no opener: the explorer is a third party, and `noopener` is the difference
+    // between "can read this page" and "cannot".
+    link.target = '_blank';
+    link.rel = 'noopener noreferrer';
+    return link;
+}
+
 function renderFacts(deposit) {
     const facts = document.getElementById('receipt-facts');
     if (!facts) return;
@@ -131,21 +152,33 @@ function renderFacts(deposit) {
         list.append(dt, dd);
     }
 
-    // The explorer link to the address the customer paid. A deposit gets this and never a
-    // transaction link, because the provider's callback carries no on-chain hash for an incoming
-    // payment -- the provider is the one transacting. The address is what lets someone watch the
-    // money they just sent actually arrive, which is the reason to open a receipt twice.
+    // The explorer links.
+    //
+    // The transaction comes first, and it is the reason this block exists. Somebody opens a
+    // deposit receipt twice: once to see that it worked, and once to *check* -- and "check" means
+    // the transaction they sent, not the address they sent it to. Those are different pages and
+    // only one of them answers the question.
+    //
+    // A deposit used to be given the address link and nothing else, on the reasoning that the
+    // provider does not transacting on the customer's behalf and so has no hash to give. That is
+    // true for some chains and not for others, and it was applied as a blanket rule, so a deposit
+    // that did have a hash could not show it. The server now passes one whenever the provider
+    // published it, and the address is what remains when it did not -- which is a true statement
+    // about what is known, and is labelled as an address so it is never mistaken for the payment.
     const explorer = deposit.explorer || {};
-    if (explorer.addressUrl) {
+    const txLink = explorerLink(
+        explorer.transactionUrl ? `View transaction on ${explorer.explorerName}` : '',
+        explorer.transactionUrl
+    );
+    const addressLink = explorerLink(
+        explorer.addressUrl ? `View deposit address on ${explorer.explorerName}` : '',
+        explorer.addressUrl
+    );
+    if (txLink || addressLink) {
         const links = document.createElement('div');
         links.className = 'receipt-links';
-        const link = document.createElement('a');
-        link.className = 'receipt-link';
-        link.href = explorer.addressUrl;
-        link.textContent = `View this address on ${explorer.explorerName}`;
-        link.target = '_blank';
-        link.rel = 'noopener noreferrer';
-        links.append(link);
+        if (txLink) links.append(txLink);
+        if (addressLink) links.append(addressLink);
         list.append(links);
     }
 

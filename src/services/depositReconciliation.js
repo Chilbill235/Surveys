@@ -12,6 +12,7 @@ const {
 const { amountsMatch } = require('./money');
 const nowPayments = require('./nowPayments');
 const { notifyDepositCredited, notifyDepositFailed } = require('./depositEmails');
+const eventNotifications = require('./eventNotifications');
 const { realCredential } = require('./credentials');
 
 /**
@@ -60,7 +61,7 @@ async function fetchProviderPayment(paymentId) {
  * failure is logged and counted as a skip rather than rethrown, because one unusable
  * deposit should not abort a sweep over many.
  */
-async function applyProviderOutcome(deposit, targetStatus, ledgerSourceId, description, summary, logger) {
+async function applyProviderOutcome(deposit, targetStatus, ledgerSourceId, description, summary, logger, txHash = null) {
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
@@ -68,6 +69,19 @@ async function applyProviderOutcome(deposit, targetStatus, ledgerSourceId, descr
         let amount = null;
 
         let statusChanged = false;
+
+        // The on-chain hash, on the caller's own client and inside this transaction, before the
+        // status is written. Captured whichever path confirmed the deposit, because the sweep is
+        // the path that catches a callback which never arrived, and a receipt that can only link
+        // to the address it was paid to is why somebody opens a receipt twice and still cannot
+        // answer "did it land". COALESCE so a hash already captured by the IPN is never erased by
+        // a later status read that happens to omit it.
+        if (txHash) {
+            await client.query(
+                'UPDATE deposits SET tx_hash = COALESCE(tx_hash, $1), updated_at = NOW() WHERE id = $2',
+                [txHash, deposit.id]
+            );
+        }
 
         if (targetStatus === 'confirmed') {
             const result = await creditConfirmedDeposit(client, {
@@ -94,6 +108,17 @@ async function applyProviderOutcome(deposit, targetStatus, ledgerSourceId, descr
             notifyDepositCredited({ depositId: deposit.id }).catch((error) => {
                 logger.error(`Deposit ${deposit.id}: receipt email failed (${error.message}).`);
             });
+            // And the durable notification. The sweep is the path that catches a callback which
+            // never arrived, so it is very often the *only* path that runs -- which makes it the
+            // most important place to record the event and, before this, the place that left the
+            // reader with a balance that had gone up and a bell that had not rung. The unique index
+            // on (user_id, category, record_id) means a sweep that races the webhook writes one
+            // notification, not two.
+            eventNotifications.depositCredited({
+                userId: deposit.user_id,
+                depositId: deposit.id,
+                amount
+            });
         } else if (targetStatus === 'confirmed') {
             logger.log(`Deposit ${deposit.id}: already credited by another process.`);
             summary.skipped += 1;
@@ -107,6 +132,11 @@ async function applyProviderOutcome(deposit, targetStatus, ledgerSourceId, descr
             if (statusChanged && targetStatus === 'failed') {
                 notifyDepositFailed({ depositId: deposit.id }).catch((error) => {
                     logger.error(`Deposit ${deposit.id}: failure notice failed (${error.message}).`);
+                });
+                eventNotifications.depositFailed({
+                    userId: deposit.user_id,
+                    depositId: deposit.id,
+                    amount
                 });
             }
         }
@@ -248,7 +278,13 @@ async function reconcileNowPaymentsDeposit(deposit, summary, logger) {
         `nowpayments:${deposit.provider_payment_id}`,
         'Confirmed NOWPayments deposit (reconciled)',
         summary,
-        logger
+        logger,
+        // The sweep is frequently the *only* path that confirms a deposit -- it exists for the
+        // callback that never arrived -- so a hash captured only in the IPN handler would be
+        // missing on exactly the deposits nobody was watching, and those receipts would fall back
+        // to an address link. Read from the status response here for the same reason the credit is
+        // taken from it.
+        nowPayments.depositTxHashFrom(providerPayment)
     );
 }
 

@@ -5,6 +5,7 @@ const payoutEmails = require('./payoutEmails');
 const payoutOptions = require('./payoutOptions');
 const { resolvePublicBaseUrl } = require('./publicBaseUrl');
 const { COLUMN, isMoneyEmailEnabled } = require('./emailPreferences');
+const eventNotifications = require('./eventNotifications');
 
 /**
  * Automatic crypto payouts via the NOWPayments Mass Payouts API.
@@ -341,6 +342,14 @@ async function submitClaimedPayouts(claimed) {
     // told -- the alternative is a balance that has silently dropped by the full amount with
     // no message until the confirmation arrives, which is when people file a ticket.
     notifyWithdrawalsStarted(claimed);
+    // Fire sending notification (non-blocking)
+    for (const entry of claimed) {
+        eventNotifications.withdrawalSending({
+            userId: entry.userId,
+            withdrawalId: entry.id,
+            amount: entry.amountUsd
+        }).catch(() => {});
+    }
 
     const outcomes = claimed.map((entry) =>
         summarizeOutcome(entry, { verdict: 'sent', detail: `Batch ${batchId} verified.` })
@@ -973,7 +982,7 @@ async function withdrawalForExternalId(externalId) {
     const id = withdrawalIdFromPayoutId(externalId);
     if (id === null) return null;
     const result = await pool.query(
-        'SELECT id, status, payout_status FROM withdrawals WHERE id = $1',
+        'SELECT id, status, payout_status, payout_provider_id FROM withdrawals WHERE id = $1',
         [id]
     );
     return result.rows[0] ?? null;
@@ -988,7 +997,7 @@ async function withdrawalForExternalId(externalId) {
  */
 async function withdrawalForBatch(batchId) {
     const result = await pool.query(
-        'SELECT id, status, payout_status FROM withdrawals WHERE batch_id = $1',
+        'SELECT id, status, payout_status, payout_provider_id FROM withdrawals WHERE batch_id = $1',
         [batchId]
     );
     return result.rows.length === 1 ? result.rows[0] : null;
@@ -1020,6 +1029,12 @@ async function applyResolvedPayout(withdrawal, status, batchId, error, reference
                         OR payout_status NOT IN ${UNRESOLVED_PAYOUT_STATES} ${HELD_PAYOUT_STATES})`,
                 [status, withdrawal.id]
             );
+            // Fire confirming notification for progress states (WAITING, SENDING, etc.)
+            eventNotifications.withdrawalConfirming({
+                userId: withdrawal.user_id,
+                withdrawalId: withdrawal.id,
+                amount: withdrawal.amount
+            }).catch(() => {});
         }
         return 'in-progress';
     }
@@ -1031,7 +1046,25 @@ async function applyResolvedPayout(withdrawal, status, batchId, error, reference
         // than none: it looks like a value and cannot be looked up. The caller's reference wins
         // when it has one (a transaction hash, or the individual payout id), and the batch id is
         // only the last resort.
-        const resolved = reference || (batchId ? `batch:${batchId}` : null);
+        let resolved = reference || (batchId ? `batch:${batchId}` : null);
+
+        // If the reference is a sentinel (payout: or batch:), the callback didn't give us a
+        // transaction hash. Fetch the payout status from the provider to get the on-chain hash.
+        // This ensures the user gets a real transaction link (/tx/) instead of only an address link.
+        const isSentinel = resolved && (resolved.startsWith('payout:') || resolved.startsWith('batch:'));
+        if (isSentinel && withdrawal.payout_provider_id) {
+            try {
+                const providerStatus = await nowPayments.getPayoutStatus(withdrawal.payout_provider_id);
+                const providerHash = providerStatus?.hash ?? providerStatus?.payout_hash ?? providerStatus?.payoutHash
+                    ?? providerStatus?.txid ?? providerStatus?.tx_id ?? providerStatus?.transaction_hash ?? providerStatus?.transactionHash;
+                if (typeof providerHash === 'string' && providerHash.trim()) {
+                    resolved = providerHash.trim();
+                }
+            } catch (error) {
+                console.warn(`Could not fetch payout hash for withdrawal ${withdrawal.id}: ${error.message}`);
+            }
+        }
+
         if (!resolved) {
             return 'unchanged';
         }
@@ -1104,7 +1137,7 @@ async function recordTerminalPayoutStatus(withdrawalId, status) {
  */
 async function reconcilePayouts({ limit = 20, logger = console } = {}) {
     const pending = await pool.query(
-        `SELECT id, batch_id, payout_provider_id, payout_status, payout_claimed_at
+        `SELECT id, user_id, amount, batch_id, payout_provider_id, payout_status, payout_claimed_at
          FROM withdrawals
          WHERE payout_status IS NOT NULL
            AND payout_status NOT IN ${UNRESOLVED_PAYOUT_STATES}
@@ -1151,7 +1184,7 @@ async function reconcilePayouts({ limit = 20, logger = console } = {}) {
         }
 
         const outcome = await applyResolvedPayout(
-            { id: row.id, payout_status: row.payout_status },
+            { id: row.id, user_id: row.user_id, amount: row.amount, payout_status: row.payout_status },
             status,
             row.batch_id || '',
             payoutErrorFrom(payout, lookupId),
@@ -1314,6 +1347,12 @@ async function claimOneRow(client, row, convertToCoin) {
     );
 
     if (result.rows.length === 0) return {};
+    // Fire processing notification (non-blocking)
+    eventNotifications.withdrawalProcessing({
+        userId: row.user_id,
+        withdrawalId: row.id,
+        amount: row.amount
+    }).catch(() => {});
     return {
         claimed: {
             id: row.id,

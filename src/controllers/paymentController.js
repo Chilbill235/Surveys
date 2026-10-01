@@ -7,6 +7,7 @@ const { parseAmountInRange, amountsMatch, formatUsd } = require('../services/mon
 const nowPayments = require('../services/nowPayments');
 const { applyPayoutCallback } = require('../services/autoPayouts');
 const { notifyDepositInstructions, notifyDepositCredited, notifyDepositFailed } = require('../services/depositEmails');
+const eventNotifications = require('../services/eventNotifications');
 const ipnLog = require('../services/ipnLog');
 const { realCredential, placeholderProblems } = require('../services/credentials');
 const stripeErrors = require('../services/stripeErrors');
@@ -902,6 +903,12 @@ async function createDeposit(req, res) {
         }).catch((error) => {
             console.error(`Deposit ${deposit.id}: instructions email failed:`, error.message);
         });
+        // Fire deposit pending notification (non-blocking)
+        eventNotifications.depositPending({
+            userId: req.user.id,
+            depositId: deposit.id,
+            amount
+        }).catch(() => {});
 
         return res.status(201).json({
             depositId: deposit.id,
@@ -1171,6 +1178,12 @@ async function nowPaymentsIpn(req, res) {
                     payCurrency: ipn.pay_currency,
                     payAmount: ipn.pay_amount
                 }, client);
+                // Fire deposit processing notification (non-blocking)
+                eventNotifications.depositProcessing({
+                    userId: deposit.user_id,
+                    depositId: deposit.id,
+                    amount: deposit.amount
+                }).catch(() => {});
             }
             await client.query('COMMIT');
             const detail = `Reported ${paymentStatus} but actually_paid (${ipn.actually_paid}) does not cover pay_amount (${ipn.pay_amount}).`;
@@ -1223,6 +1236,12 @@ async function nowPaymentsIpn(req, res) {
                 payCurrency: ipn.pay_currency,
                 payAmount: ipn.pay_amount
             }, client);
+            // Fire deposit processing notification (non-blocking)
+            eventNotifications.depositProcessing({
+                userId: deposit.user_id,
+                depositId: deposit.id,
+                amount: deposit.amount
+            }).catch(() => {});
         }
 
         // The provider has given up on a payment that nonetheless has money in it. Marking it
@@ -1235,6 +1254,22 @@ async function nowPaymentsIpn(req, res) {
             console.error(`NOWPayments reported deposit ${deposit.id} as ${paymentStatus} with money already received.`);
             ipnLog.record({ outcome: 'accepted', detail, paymentId, orderId: depositId, status: paymentStatus });
             return res.status(200).send('Partially received; left open for review.');
+        }
+
+        // The on-chain hash for the payment that just arrived, captured on the row this
+        // transaction already holds. Without it a deposit receipt can only link to the address it
+        // was paid to, and "did my money actually land" -- the one question that sends someone to
+        // a receipt twice -- is answered by a wallet address rather than by the transaction they
+        // are looking for.
+        //
+        // Written with COALESCE so a later delivery that omits the hash cannot erase one that was
+        // already captured, and on the caller's own client because the row is held FOR UPDATE here.
+        const txHash = nowPayments.depositTxHashFrom(ipn);
+        if (txHash) {
+            await client.query(
+                'UPDATE deposits SET tx_hash = COALESCE(tx_hash, $1), updated_at = NOW() WHERE id = $2',
+                [txHash, deposit.id]
+            );
         }
 
         if (targetStatus === 'confirmed') {
@@ -1257,15 +1292,32 @@ async function nowPaymentsIpn(req, res) {
         // delivery reaches the early return above, and a redeposit cannot happen. The balance
         // is the only evidence a user has that the money arrived, and an unexplained credit is
         // as alarming as a missing one.
+        //
+        // Each of these writes two things: an email, and a durable notification row. The email is
+        // the receipt -- something to keep, something to forward to support. The notification is
+        // the live status, and it is the one that has to exist even if the reader is not signed in
+        // right now, which is the case an email does not cover and a browser-local bell never did.
         if (credited?.credited) {
             notifyDepositCredited({ depositId: deposit.id }).catch((error) => {
                 console.error(`Deposit ${deposit.id}: receipt email failed:`, error.message);
             });
-        } else if (statusChanged && targetStatus === 'failed') {
+            eventNotifications.depositCredited({
+                userId: deposit.user_id,
+                depositId: deposit.id,
+                amount: credited.amount ?? deposit.amount,
+                creditedAt: credited.credited_at ?? null
+            });
+        } else if (statusChanged && (targetStatus === 'failed' || targetStatus === 'expired')) {
             // A deposit that expired or was refused is a user who has possibly already sent
             // money and is watching for it to appear. Silence is the worst available answer.
             notifyDepositFailed({ depositId: deposit.id }).catch((error) => {
                 console.error(`Deposit ${deposit.id}: failure notice failed:`, error.message);
+            });
+            eventNotifications.depositFailed({
+                userId: deposit.user_id,
+                depositId: deposit.id,
+                amount: deposit.amount,
+                expired: targetStatus === 'expired'
             });
         }
         ipnLog.record({
@@ -1415,9 +1467,21 @@ async function stripeWebhook(req, res) {
             notifyDepositCredited({ depositId: deposit.id }).catch((error) => {
                 console.error(`Deposit ${deposit.id}: receipt email failed:`, error.message);
             });
+            eventNotifications.depositCredited({
+                userId: deposit.user_id,
+                depositId: deposit.id,
+                amount: credited.amount ?? deposit.amount,
+                creditedAt: credited.credited_at ?? null
+            });
         } else if (statusChanged && failedReason) {
             notifyDepositFailed({ depositId: deposit.id, reason: failedReason }).catch((error) => {
                 console.error(`Deposit ${deposit.id}: failure notice failed:`, error.message);
+            });
+            eventNotifications.depositFailed({
+                userId: deposit.user_id,
+                depositId: deposit.id,
+                amount: deposit.amount,
+                reason: failedReason
             });
         }
         return res.status(200).send('OK');
